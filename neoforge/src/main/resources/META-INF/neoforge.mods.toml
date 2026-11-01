@@ -1,0 +1,30 @@
+modLoader = "javafml"
+loaderVersion = "[1,)"
+license = "MIT"
+
+[[mods]]
+modId = "companionmod"
+version = "${mod_version}"
+displayName = "Companion Mod"
+description = '''A voice-controlled player companion. Summon it at a shrine, talk to it with push-to-talk (local Ollama).'''
+
+[[dependencies.companionmod]]
+modId = "neoforge"
+type = "required"
+versionRange = "[26.1.2,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.companionmod]]
+modId = "minecraft"
+type = "required"
+versionRange = "[26.1.2,26.2)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.companionmod]]
+modId = "female_gender_mod"
+type = "optional"
+versionRange = "[1,)"
+ordering = "NONE"
+side = "CLIENT"

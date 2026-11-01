@@ -1,0 +1,68 @@
+plugins {
+    id 'dev.architectury.loom-no-remap'
+    id 'architectury-plugin'
+    id 'com.gradleup.shadow' version '9.2.2'
+}
+
+architectury {
+    platformSetupLoomIde()
+    neoForge()
+}
+
+loom {
+    neoForge {
+    }
+}
+
+configurations {
+    common
+    shadowCommon
+    compileClasspath.extendsFrom common
+    runtimeClasspath.extendsFrom common
+    developmentNeoForge.extendsFrom common
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${rootProject.minecraft_version}"
+    neoForge "net.neoforged:neoforge:${rootProject.neoforge_version}"
+
+    common(project(path: ":common")) { transitive = false }
+    shadowCommon(project(path: ":common", configuration: "transformProductionNeoForge")) { transitive = false }
+}
+
+processResources {
+    from project(":common").sourceSets.main.resources
+
+    var replaceProperties = [
+            minecraft_version      : rootProject.minecraft_version,
+            minecraft_version_range: "[26.1.2,)",
+            neo_version            : rootProject.neoforge_version,
+            mod_id                 : project.mod_id,
+            mod_name               : "Companion Mod",
+            mod_license            : "MIT",
+            mod_version            : project.version,
+            version                : project.version,
+    ]
+    inputs.properties replaceProperties
+
+    filesMatching("META-INF/neoforge.mods.toml") {
+        expand replaceProperties
+    }
+}
+
+jar {
+    archiveClassifier = "raw"
+}
+
+shadowJar {
+    dependsOn(jar)
+    mainSpec.sourcePaths.clear()
+    from(zipTree(jar.archiveFile))
+    configurations = [project.configurations.shadowCommon]
+    archiveClassifier = null
+    from rootProject.file("LICENSE")
+}
+
+tasks.withType(Jar).configureEach {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}

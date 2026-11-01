@@ -1,0 +1,15 @@
+plugins {
+    id 'dev.architectury.loom-no-remap'
+    id 'architectury-plugin'
+}
+
+architectury {
+    common("fabric", "neoforge")
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${rootProject.minecraft_version}"
+    implementation "net.fabricmc:fabric-loader:${rootProject.loader_version}"
+    api "dev.architectury:architectury:${rootProject.architectury_api_version}"
+}
+

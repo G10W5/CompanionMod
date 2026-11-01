@@ -1,0 +1,8 @@
+{
+  "parent": "minecraft:block/cube_bottom_top",
+  "textures": {
+    "top": "companionmod:block/shrine_core_top",
+    "bottom": "companionmod:block/shrine_core_bottom",
+    "side": "companionmod:block/shrine_core_side"
+  }
+}

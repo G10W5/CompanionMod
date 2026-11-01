@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "companionmod",
+  "version": "${version}",
+  "name": "Companion Mod",
+  "description": "A voice-controlled player companion. Summon it at a shrine, talk to it with push-to-talk (local Ollama).",
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["com.example.companionmod.fabric.CompanionModFabric"],
+    "client": ["com.example.companionmod.fabric.CompanionModFabricClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.2",
+    "minecraft": "~26.1.2",
+    "java": ">=25",
+    "fabric-api": "*"
+  },
+  "suggests": {
+    "female_gender_mod": "*"
+  }
+}

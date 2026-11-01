@@ -1,0 +1,56 @@
+plugins {
+    id 'dev.architectury.loom-no-remap' version "${loom_version}" apply false
+    id 'architectury-plugin' version '3.5-SNAPSHOT' apply false
+    id 'maven-publish'
+}
+
+subprojects {
+    apply plugin: 'maven-publish'
+    apply plugin: 'java'
+
+    version = rootProject.mod_version
+    group = rootProject.maven_group
+
+    base {
+        archivesName = rootProject.archives_base_name
+    }
+
+    repositories {
+        maven { url "https://maven.architectury.dev/" }
+        maven { url "https://maven.terraformersmc.com/releases/" }
+        maven { url "https://maven.shedaniel.me/" }
+        maven { url "https://maven.neoforged.net/releases/" }
+        maven { url "https://libraries.minecraft.net/" }
+        mavenCentral()
+    }
+
+    tasks.withType(JavaCompile).configureEach {
+        it.options.encoding = 'UTF-8'
+        it.options.release = 25
+    }
+
+    java {
+        withSourcesJar()
+        sourceCompatibility = JavaVersion.VERSION_25
+        targetCompatibility = JavaVersion.VERSION_25
+    }
+}
+
+tasks.register("universalJar", Jar) {
+    archiveClassifier = "universal"
+    archiveBaseName.set(rootProject.archives_base_name)
+    archiveVersion.set(rootProject.mod_version)
+    destinationDirectory.set(layout.buildDirectory.dir("libs"))
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+    dependsOn(":fabric:shadowJar", ":neoforge:shadowJar")
+
+    from({
+        zipTree(project(":fabric").tasks.shadowJar.archiveFile)
+    })
+    from({
+        zipTree(project(":neoforge").tasks.shadowJar.archiveFile)
+    })
+    from(rootProject.file("LICENSE"))
+}
+

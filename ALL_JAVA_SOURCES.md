@@ -1,0 +1,8508 @@
+# All Java Sources
+
+Generated from 68 files. Paths are relative to the project root.
+
+## common\src\main\java\com\example\companionmod\block\CompanionShrineBlock.java
+
+```java
+package com.example.companionmod.block;
+
+import com.example.companionmod.world.ShrineSummoner;
+import com.mojang.serialization.MapCodec;
+import net.minecraft.core.BlockPos;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.BlockHitResult;
+
+/** Right-click to summon your companion, or call it back if it is already out there. */
+public class CompanionShrineBlock extends Block {
+    public static final MapCodec<CompanionShrineBlock> CODEC = simpleCodec(CompanionShrineBlock::new);
+
+    public CompanionShrineBlock(Properties properties) { super(properties); }
+
+    @Override
+    protected MapCodec<? extends Block> codec() { return CODEC; }
+
+    @Override
+    protected InteractionResult useWithoutItem(BlockState state, Level level, BlockPos pos, Player player, BlockHitResult hit) {
+        if (level instanceof ServerLevel sl && player instanceof ServerPlayer sp) ShrineSummoner.summon(sl, pos, sp);
+        return InteractionResult.SUCCESS;
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\ClientVoice.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.CompanionMod;
+import com.example.companionmod.command.CompanionCommand;
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.net.CommandPayload;
+import com.example.companionmod.voice.OllamaVoiceBackend;
+import com.example.companionmod.voice.PushToTalkController;
+import com.example.companionmod.voice.ReplyParser;
+import com.example.companionmod.voice.SpeechPlayer;
+import com.example.companionmod.voice.VoiceConfig;
+import com.example.companionmod.voice.VoiceReply;
+import com.example.companionmod.voice.VoiceState;
+import com.mojang.blaze3d.platform.InputConstants;
+import net.minecraft.client.DeltaTracker;
+import net.minecraft.client.KeyMapping;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.core.BlockPos;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.monster.Monster;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.state.BlockState;
+import org.lwjgl.glfw.GLFW;
+
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.function.Consumer;
+
+/**
+ * Client glue shared by both loaders. Loaders only need to: call setSender, register talkKey(), call tick() every client tick,
+ * and call renderHud() from their HUD hook.
+ */
+public final class ClientVoice {
+    private static KeyMapping talkKey;
+    private static PushToTalkController controller;
+    private static VoiceConfig cfg;
+    private static Path configFile;
+    private static boolean wasDown;
+    private static boolean radialWasDown;
+    private static boolean settingsWasDown;
+    private static int syncedEntity = -1;
+    private static int lastSpeechId = -1;
+    private static int pendingSpeechId = -1;
+    private static String pendingSpeechLine = "";
+    private static String syncedSkin = "";
+    private static String syncedName = "";
+    private static boolean syncedFeminine;
+    private static Consumer<CommandPayload> sender = p -> { };
+
+    static volatile String subtitle = "";
+    static volatile long subtitleUntil;
+
+    private static final SpeechPlayer.Listener SPEECH_LISTENER = new SpeechPlayer.Listener() {
+        @Override public void onStart(String text, long durationMillis) {
+            CompanionSubtitles.audioStarted(text, durationMillis);
+        }
+        @Override public void onProgress(String text, float progress) {
+            CompanionSubtitles.audioProgress(text, progress);
+        }
+        @Override public void onStop(String text) { CompanionSubtitles.audioStopped(text); }
+        @Override public void onUnavailable(String text) { CompanionSubtitles.fallback(text); }
+    };
+
+    private ClientVoice() {}
+
+    public static void setSender(Consumer<CommandPayload> s) { sender = s; }
+
+    public static KeyMapping talkKey() {
+        if (talkKey == null) {
+            // 26.1-CHECK: KeyMapping needs a Category since 1.21.9
+            talkKey = new KeyMapping("key.companionmod.talk", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_V,
+                    KeyMapping.Category.register(CompanionMod.id("main")));
+        }
+        return talkKey;
+    }
+
+    public static VoiceConfig config() {
+        if (cfg == null) init(Minecraft.getInstance());
+        return cfg;
+    }
+
+    public static Path configFile() {
+        if (configFile == null) init(Minecraft.getInstance());
+        return configFile;
+    }
+
+    public static void send(String action, String say, String target) {
+        CompanionCommand command = CompanionCommand.parse(action);
+        if (interruptsPlanning(command)) {
+            // Invalidate in-flight model requests before the server applies the player's newer intent.
+            CompanionAutonomy.onManualOrder();
+        }
+        // Clamp to the packet field limits so a long model/user string can never break encoding.
+        sender.accept(new CommandPayload(
+                ReplyParser.truncate(action == null ? "" : action, 32),
+                ReplyParser.truncate(say == null ? "" : say, 500),
+                ReplyParser.truncate(target == null ? "" : target, 1024)));
+    }
+
+    /** Appearance, UI, memory and revive packets do not represent a new gameplay intent. */
+    private static boolean interruptsPlanning(CompanionCommand command) {
+        return switch (command) {
+            case NONE, PLAN, INVENTORY, SET_NAME, SET_SKIN, FEMININE, MASCULINE,
+                    REMEMBER, FORGET, REVIVE -> false;
+            default -> true;
+        };
+    }
+
+    public static void tick(Minecraft mc) {
+        if (mc.player == null || mc.level == null) {
+            if (controller != null) { if (wasDown) controller.onRelease(); controller.shutdown(); controller = null; }
+            wasDown = false;
+            radialWasDown = false;
+            settingsWasDown = false;
+            syncedEntity = -1;
+            lastSpeechId = -1;
+            CompanionSubtitles.clear();
+            CompanionAutonomy.reset();
+            return;
+        }
+        if (controller == null) init(mc);
+        boolean down = mc.screen == null && talkKey().isDown();       // typing "v" in chat must not open the mic
+        if (down && !wasDown) controller.onPress();
+        else if (!down && wasDown) controller.onRelease();
+        wasDown = down;
+
+        CompanionEntity companion = findCompanion(mc);
+        if (companion != null) {
+            CompanionMemory.tick(mc, companion);
+            syncEntitySettings(mc, companion);
+            handleReviveInput(mc, companion);
+            CompanionAutonomy.tick(mc, controller == null || controller.state() == VoiceState.IDLE);
+            int sid = companion.speechId();                       // every synced line is spoken, not just subtitled
+            if (sid != lastSpeechId) {
+                lastSpeechId = sid;
+                String line = companion.speech();
+                if (!line.isBlank() && controller != null) {
+                    if (controller.state() == VoiceState.IDLE) controller.speakText(line);
+                    else { pendingSpeechId = sid; pendingSpeechLine = line; }   // don't talk over the mic
+                }
+            }
+            if (pendingSpeechId != -1 && controller != null && controller.state() == VoiceState.IDLE) {
+                controller.speakText(pendingSpeechLine);
+                pendingSpeechId = -1;
+                pendingSpeechLine = "";
+            }
+        }
+
+        if (mc.screen == null) {
+            boolean radial = InputConstants.isKeyDown(mc.getWindow(), GLFW.GLFW_KEY_R);
+            if (radial && !radialWasDown && companion != null) mc.setScreen(new CompanionRadialScreen());
+            radialWasDown = radial;
+
+            boolean settings = InputConstants.isKeyDown(mc.getWindow(), GLFW.GLFW_KEY_O);
+            if (settings && !settingsWasDown) mc.setScreen(new CompanionSettingsScreen(config(), configFile()));
+            settingsWasDown = settings;
+        } else {
+            radialWasDown = true;       // don't re-open as soon as the screen closes
+            settingsWasDown = true;
+        }
+    }
+
+    private static void init(Minecraft mc) {
+        Path dir = mc.gameDirectory.toPath().resolve("config");
+        configFile = dir.resolve("companionmod-client.json");
+        cfg = VoiceConfig.load(configFile);
+        CompanionMemory.configure(cfg, dir.resolve("companionmod-memory.json"));
+        controller = new PushToTalkController(new OllamaVoiceBackend(cfg), cfg, () -> buildContext(mc),
+                ClientVoice::onReply, ClientVoice::status, SPEECH_LISTENER);
+        CompanionAutonomy.init(cfg);
+    }
+
+    /** Worker thread -> hop to the game thread. */
+    public static void onReply(VoiceReply r) {
+        Minecraft mc = Minecraft.getInstance();
+        mc.execute(() -> {
+            if (!r.heard().isBlank()) { subtitle = "You: " + r.heard(); subtitleUntil = System.currentTimeMillis() + 4000; }
+            // Hard-stop phrases are deterministic. Safety/control must not depend on the LLM's JSON choice.
+            CompanionCommand command = isHardStopPhrase(r.heard()) ? CompanionCommand.STOP : gateCommand(r.command(), r.heard());
+            if (!r.memory().isBlank()) CompanionMemory.remember(r.memory());
+            if (command == CompanionCommand.REMEMBER)
+                CompanionMemory.remember(r.target().isBlank() ? r.say() : r.target());
+            if (command == CompanionCommand.FORGET)
+                CompanionMemory.forget(r.target().isBlank() ? r.say() : r.target());
+            if (command != CompanionCommand.NONE || !r.say().isBlank() || !r.target().isBlank())
+                send(command.name(), r.say(), r.target());
+            if (cfg.dynamicGoals && command == CompanionCommand.NONE && !r.heard().isBlank())
+                CompanionAutonomy.onVoiceHeard(r.heard());
+        });
+    }
+
+    private static boolean isHardStopPhrase(String heard) {
+        if (heard == null) return false;
+        String s = heard.toLowerCase(java.util.Locale.ROOT).replaceAll("[^a-z]+", " ").trim();
+        return switch (s) {
+            case "stop", "stop everything", "stop working", "stop mining", "cancel", "cancel that",
+                    "cancel the task", "never mind", "nevermind", "halt", "abort" -> true;
+            default -> false;
+        };
+    }
+
+    /**
+     * Deterministic backstop against a chatty small model: it sometimes invents chores ("dig diamonds",
+     * "pick up stone bricks") from greetings or garbled STT. A gameplay command only reaches the server when
+     * the player's actual words support it. Movement, modes, identity and memory commands are always allowed;
+     * anything else needs a hint word from the heard text.
+     */
+    private static CompanionCommand gateCommand(CompanionCommand command, String heard) {
+        if (command == null || command == CompanionCommand.NONE) return command;
+        String s = heard == null ? "" : heard.toLowerCase(java.util.Locale.ROOT)
+                .replaceAll("[^a-z0-9 ]+", " ").replaceAll(" +", " ").trim();
+        if (s.isEmpty()) return CompanionCommand.NONE;
+        String[] hints = hints(command);
+        if (hints == null) return command;                      // unlisted: trust the model
+        for (String hint : hints) if (s.contains(hint)) return command;
+        return CompanionCommand.NONE;                           // unsupported -> just talk, no action
+    }
+
+    /** Words that must appear in what the player said for the command to be real. Null = always allowed. */
+    private static String[] hints(CompanionCommand c) {
+        return switch (c) {
+            case NONE, FOLLOW, STAY, SIT, STAND, GUARD, DEFENSIVE, PASSIVE, DEFEND, STOP, CONTINUE,
+                    INVENTORY, SET_NAME, SET_SKIN, FEMININE, MASCULINE, REMEMBER, FORGET, REVIVE, PLAN, WAIT -> null;
+            case ATTACK -> new String[]{"attack", "kill", "fight", "hit", "smash", "destroy", "creeper", "zombie",
+                    "skeleton", "spider", "enderman", "witch", "slime", "enemy", "monster", "mob", "pillager",
+                    "ravager", "boss", "dragon", "wither"};
+            case COME -> new String[]{"come", "here", "teleport", "to me"};
+            case MINE -> new String[]{"mine", "dig", "break", "chop"};
+            case BUILD -> new String[]{"build", "construct", "place", "house", "wall", "tower", "bridge", "schematic"};
+            case FARM -> new String[]{"farm", "harvest", "crops", "plant", "wheat", "carrot", "potato", "pumpkin", "melon"};
+            case PATROL -> new String[]{"patrol", "scout", "scouting", "lookout"};
+            case HEAL -> new String[]{"heal", "healing", "health", "bandage"};
+            case EQUIP -> new String[]{"equip", "wear", "switch", "pickaxe", "axe", "sword", "shovel", "hoe",
+                    "tool", "weapon", "armor", "armour"};
+            case TRADE -> new String[]{"trade", "barter", "villager", "merchant", "buy", "sell"};
+            case LOOT -> new String[]{"loot", "collect", "gather", "sweep"};
+            case WANDER -> new String[]{"wander", "roam", "walk around"};
+            case EXPLORE -> new String[]{"explore", "exploration", "check out", "go look"};
+            case RETREAT -> new String[]{"retreat", "run away", "escape", "fall back"};
+            case SNEAK -> new String[]{"sneak", "stealth", "sneaking"};
+            case JUMP -> new String[]{"jump", "leap"};
+            case DANCE -> new String[]{"dance", "celebrate", "party"};
+            case SLEEP -> new String[]{"sleep", "nap", "bed"};
+            case WAKE -> new String[]{"wake", "awake", "wake up"};
+            case GIVE -> new String[]{"give", "hand over", "hand me"};
+            case TAKE -> new String[]{"take", "grab", "hold"};
+            case DROP -> new String[]{"drop", "throw", "toss"};
+            case PICKUP -> new String[]{"pick up", "pickup", "grab", "collect"};
+            case OPEN -> new String[]{"open"};
+            case CLOSE -> new String[]{"close", "shut"};
+            case CRAFT -> new String[]{"craft", "crafting", "recipe", "make"};
+            case SMELT -> new String[]{"smelt", "smelting", "furnace"};
+            case BREW -> new String[]{"brew", "brewing", "potion"};
+            case ENCHANT -> new String[]{"enchant", "enchanting", "enchantment"};
+            case FISH -> new String[]{"fish", "fishing", "catch fish", "rod"};
+            case COOK -> new String[]{"cook", "cooking", "food", "eat"};
+            case FIGHT -> new String[]{"fight", "fighting", "combat"};
+            case FLEE -> new String[]{"flee", "fleeing", "run away"};
+            case HIDE -> new String[]{"hide", "hiding", "conceal"};
+            case SEEK -> new String[]{"seek", "look for"};
+            case FIND -> new String[]{"find", "locate"};
+            case SEARCH -> new String[]{"search", "scan"};
+            case SEEK_BLOCK -> new String[]{"mine", "dig", "find", "seek", "search", "look for", "get",
+                    "collect", "gather", "wood", "log", "stone", "ore", "diamond", "coal", "iron", "gold",
+                    "dirt", "sand", "gravel", "clay", "brick", "block", "plank", "chop"};
+            case TRACK -> new String[]{"track", "tracks", "trail"};
+            case HUNT -> new String[]{"hunt", "hunting", "stalk", "chase"};
+            default -> null;
+        };
+    }
+
+    public static void status(String message) {
+        Minecraft mc = Minecraft.getInstance();
+        mc.execute(() -> { if (mc.player != null) mc.player.sendSystemMessage(Component.literal("[Companion] " + message)); });
+    }
+
+    /** Find the player's own companion in the currently loaded level. */
+    public static CompanionEntity findCompanion(Minecraft mc) {
+        if (mc.player == null || mc.level == null) return null;
+        String me = mc.player.getStringUUID();
+        for (Entity e : mc.level.entitiesForRendering()) {                 // 26.1-CHECK: ClientLevel.entitiesForRendering()
+            if (e instanceof CompanionEntity c && c.isOwnedBy(me)) return c;
+        }
+        return null;
+    }
+
+    /** Push config-driven appearance/identity settings to the server once per entity. */
+    private static void syncEntitySettings(Minecraft mc, CompanionEntity companion) {
+        String wanted = cfg == null ? "" : cfg.companionSkin;   // "owner" stays symbolic: the renderer resolves it synchronously
+        boolean feminine = cfg != null && cfg.feminineModel;
+        String name = cfg == null || cfg.companionName == null || cfg.companionName.isBlank() ? "" : cfg.companionName;
+        if (companion.getId() == syncedEntity && wanted.equals(syncedSkin) && feminine == syncedFeminine
+                && name.equals(syncedName)) return;
+        syncedEntity = companion.getId();
+        syncedSkin = wanted;
+        syncedFeminine = feminine;
+        syncedName = name;
+        if (!wanted.equalsIgnoreCase(companion.skin())) send("set_skin", "", wanted);
+        if (feminine != companion.isFeminine()) send(feminine ? "feminine" : "masculine", "", "");
+        if (!name.isBlank() && !name.equals(companion.getName().getString())) send("set_name", "", name);
+    }
+
+    private static long lastReviveSend;
+
+    /** Holding left click on a downed companion sends revive pulses to the server. */
+    private static void handleReviveInput(Minecraft mc, CompanionEntity companion) {
+        if (!companion.isInjured() || mc.screen != null || mc.player == null) return;
+        boolean holdingAttack = mc.options.keyAttack.isDown();
+        boolean onIt = mc.crosshairPickEntity == companion || mc.player.distanceToSqr(companion) <= 9.0;
+        if (holdingAttack && onIt && System.currentTimeMillis() - lastReviveSend > 200) {
+            lastReviveSend = System.currentTimeMillis();
+            ClientVoice.send("revive", "", "");
+        }
+    }
+
+    /** Game-thread snapshot handed to the model so replies match the situation. */
+    private static String buildContext(Minecraft mc) {
+        String context = CompanionWorldContext.build(mc, findCompanion(mc));
+        String memory = CompanionMemory.summary();
+        return memory.isBlank() ? context : context + "\nPlayer preferences and past events: " + memory;
+    }
+
+    private static String describe(Entity e) {
+        String name = e.getName().getString();
+        if (e instanceof ItemEntity item) name = item.getItem().getHoverName().getString();
+        double dist = Math.sqrt(e.distanceToSqr(Minecraft.getInstance().player));
+        int dx = e.blockPosition().getX() - Minecraft.getInstance().player.blockPosition().getX();
+        int dz = e.blockPosition().getZ() - Minecraft.getInstance().player.blockPosition().getZ();
+        return name + " " + Math.round(dist) + "m " + compass(dx, dz);
+    }
+
+    private static String compass(int dx, int dz) {
+        double angle = Math.toDegrees(Math.atan2(dz, dx));
+        if (angle < 0) angle += 360;
+        if (angle < 45 || angle >= 315) return "E";
+        if (angle < 135) return "S";
+        if (angle < 225) return "W";
+        return "N";
+    }
+
+    private static boolean isInteresting(String name) {
+        String n = name.toLowerCase();
+        return n.contains("ore") || n.contains("water") || n.contains("lava") || n.contains("chest")
+                || n.contains("crafting") || n.contains("furnace") || n.contains("bed") || n.contains("door")
+                || n.contains("log") || n.contains("leaves") || n.contains("crop") || n.contains("flower")
+                || n.contains("shrine");
+    }
+
+    public static void renderHud(GuiGraphicsExtractor g, DeltaTracker delta) {
+        VoiceHud.render(g, controller, findCompanion(Minecraft.getInstance()));
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionAutonomy.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.voice.PlanParser;
+import com.example.companionmod.voice.PlanningBackend;
+import com.example.companionmod.voice.VoiceConfig;
+import net.minecraft.client.Minecraft;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.monster.Monster;
+
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * Client-side goal planner with generation-based cancellation.
+ *
+ * <p>Every manual gameplay order advances {@link #GENERATION}. A model response is delivered only if
+ * its generation is still current, so a slow response can never restart work after STOP or replace a
+ * newer order. HTTP calls may finish in the background, but their results become harmless.</p>
+ */
+public final class CompanionAutonomy {
+    private static final ExecutorService WORKER = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "companionmod-planner");
+        t.setDaemon(true);
+        return t;
+    });
+    private static final AtomicLong GENERATION = new AtomicLong();
+
+    private static VoiceConfig cfg;
+    private static PlanningBackend backend;
+    private static volatile long nextThinkAt;
+    private static volatile boolean busy;
+    private static volatile String goal = "";
+    private static volatile long goalUntil;
+
+    private CompanionAutonomy() {}
+
+    public static void init(VoiceConfig config) {
+        cfg = config;
+        backend = new PlanningBackend(config);
+        reset();
+    }
+
+    /** Label of the plan currently running (empty when none). For the wheel hub / HUD. */
+    public static String currentGoal() {
+        return System.currentTimeMillis() < goalUntil ? goal : "";
+    }
+
+    /** Call every client tick. {@code voiceIdle} = push-to-talk pipeline is idle. */
+    public static void tick(Minecraft mc, boolean voiceIdle) {
+        if (cfg == null || backend == null || !cfg.autonomyEnabled || busy || !voiceIdle) return;
+        if (mc.player == null || mc.level == null || mc.screen != null) return;
+        long now = System.currentTimeMillis();
+        if (now < nextThinkAt) return;
+        nextThinkAt = now + Math.max(15, cfg.autonomyIntervalSeconds) * 1000L
+                + (long) (Math.random() * 5000L);
+        final String ctx = context(mc);
+        final long ticket = GENERATION.get();
+        busy = true;
+        WORKER.execute(() -> {
+            try {
+                deliver(backend.think(ctx), true, ticket);
+            } catch (Exception ignored) {
+                // Autonomy is best effort and silent.
+            } finally {
+                finish(ticket);
+            }
+        });
+    }
+
+    /** Spoken request that was not a direct order. Greetings, small talk and bare orders are NOT goals. */
+    public static void onVoiceHeard(String heard) {
+        if (cfg == null || !cfg.dynamicGoals || heard == null || heard.isBlank()) return;
+        if (!plannable(heard)) return;
+        requestGoal(heard, true);
+    }
+
+    private static final Set<String> GREETINGS = Set.of(
+            "hello", "hi", "hey", "yo", "hiya", "howdy", "thanks", "thank you", "bye", "goodbye",
+            "good night", "good morning", "good evening", "welcome", "nice to meet you",
+            "how are you", "how are u", "whats up", "what is up", "sup");
+
+    /** Words the command parser already owns: a bare one is an order, not a request to plan around. */
+    private static final Set<String> ORDER_WORDS = Set.of(
+            "stay", "stop", "come", "follow", "sit", "stand", "wait", "hold", "defend", "guard",
+            "attack", "fight", "hunt", "wander", "patrol", "explore", "scout", "loot", "mine", "dig",
+            "farm", "fish", "build", "equip", "drop", "give", "store", "heal", "revive", "continue",
+            "cancel", "halt", "abort", "leave", "dismiss", "call", "summon", "pick", "get", "bring",
+            "take", "collect", "seek", "find", "search");
+
+    /** Particles that glue bare orders together: "come to me", "stay with me", "follow me". */
+    private static final Set<String> ORDER_PARTICLES = Set.of(
+            "me", "my", "with", "to", "here", "there", "up", "down", "out", "it", "please", "now", "back", "along");
+
+    /** Cheap client-side intent filter so chitchat and misheard orders never reach the planner. */
+    private static boolean plannable(String heard) {
+        String s = heard.toLowerCase(java.util.Locale.ROOT)
+                .replaceAll("[^a-z0-9 ]+", " ").replaceAll(" +", " ").trim();
+        if (s.length() < 5) return false;                                  // "hi", "ok", "no"
+        if (GREETINGS.contains(s)) return false;
+        String[] words = s.split(" ");
+        boolean allOrderish = true;
+        for (String w : words) {
+            if (!ORDER_WORDS.contains(w) && !ORDER_PARTICLES.contains(w)) { allOrderish = false; break; }
+        }
+        if (allOrderish) return false;                                     // "come to me" is an order, not a goal
+        if (words.length <= 2 && ORDER_WORDS.contains(words[0])) return false;  // bare "stay", "come here"
+        return true;
+    }
+
+    public static void requestGoal(String text) {
+        requestGoal(text, false);
+    }
+
+    public static void requestGoal(String text, boolean quiet) {
+        Minecraft mc = Minecraft.getInstance();
+        if (cfg == null || backend == null || mc.player == null || mc.level == null) return;
+        if (busy) {
+            if (!quiet) chat(mc, "Still thinking about the last one.");
+            return;
+        }
+        final String ctx = context(mc);
+        final long ticket = GENERATION.incrementAndGet();
+        busy = true;
+        nextThinkAt = System.currentTimeMillis() + 60_000L;
+        WORKER.execute(() -> {
+            try {
+                PlanParser.Plan plan = backend.planGoal(text, ctx);
+                if (plan.isEmpty()) {
+                    if (!quiet && isCurrent(ticket)) {
+                        mc.execute(() -> {
+                            if (isCurrent(ticket)) chat(mc, "I'm not sure how to do that.");
+                        });
+                    }
+                } else {
+                    deliver(plan, false, ticket);
+                }
+            } catch (Exception e) {
+                if (!quiet && isCurrent(ticket)) {
+                    String message = e.getMessage() == null ? "unknown error" : e.getMessage();
+                    mc.execute(() -> {
+                        if (isCurrent(ticket)) chat(mc, "Planning failed: " + message);
+                    });
+                }
+            } finally {
+                finish(ticket);
+            }
+        });
+    }
+
+    /**
+     * Invalidate pending requests and suppress autonomous thinking after a direct player order.
+     * Called centrally by ClientVoice.send for gameplay commands, including radial-menu orders.
+     */
+    public static void onManualOrder() {
+        GENERATION.incrementAndGet();
+        busy = false;
+        goal = "";
+        goalUntil = 0;
+        nextThinkAt = System.currentTimeMillis() + 60_000L;
+    }
+
+    /** The wheel's Cancel Plan action is a real stop, not merely an empty planner packet. */
+    public static void cancelPlan() {
+        ClientVoice.send("stop", "", "");
+    }
+
+    /** Drop all client planning state on logout/world change. */
+    public static void reset() {
+        GENERATION.incrementAndGet();
+        busy = false;
+        goal = "";
+        goalUntil = 0;
+        nextThinkAt = System.currentTimeMillis() + 20_000L;
+    }
+
+    private static boolean isCurrent(long ticket) {
+        return GENERATION.get() == ticket;
+    }
+
+    private static void finish(long ticket) {
+        // A stale worker must not clear the busy flag belonging to a newer request.
+        if (isCurrent(ticket)) busy = false;
+    }
+
+    private static void deliver(PlanParser.Plan plan, boolean auto, long ticket) {
+        if (plan.isEmpty() || !isCurrent(ticket)) return;
+        Minecraft mc = Minecraft.getInstance();
+        final String json = PlanParser.toJson(plan, auto);
+        mc.execute(() -> {
+            // Check again on the game thread: STOP may have arrived while this task was queued.
+            if (!isCurrent(ticket) || mc.player == null || mc.level == null) return;
+            goal = plan.goal();
+            goalUntil = System.currentTimeMillis() + PlanParser.totalSeconds(plan) * 1000L + 4000L;
+            ClientVoice.send("plan", "", json);
+            if (!auto && !plan.goal().isBlank()) {
+                mc.player.sendSystemMessage(Component.literal("[Companion] Goal: " + plan.goal()));
+            }
+        });
+    }
+
+    private static void chat(Minecraft mc, String msg) {
+        if (mc.player != null) mc.player.sendSystemMessage(Component.literal("[Companion] " + msg));
+    }
+
+    /** Game-thread snapshot for the model. */
+    private static String context(Minecraft mc) {
+        CompanionEntity mine = null;
+        String me = mc.player.getStringUUID();
+        for (Entity e : mc.level.entitiesForRendering()) {
+            if (e instanceof CompanionEntity c && c.isOwnedBy(me)) {
+                mine = c;
+                break;
+            }
+        }
+        return CompanionWorldContext.build(mc, mine) + "\nMemory: " + CompanionMemory.summary();
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionConnectionScreen.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.voice.VoiceConfig;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.AbstractSliderButton;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.network.chat.Component;
+
+import java.nio.file.Path;
+
+/** AI connection settings: Ollama host, chat/STT/speech models and temperature. */
+public class CompanionConnectionScreen extends Screen {
+    private final VoiceConfig config;
+    private final Path configFile;
+    private final Screen parent;
+
+    private EditBox hostField;
+    private EditBox chatField;
+    private EditBox sttField;
+    private EditBox speechField;
+    private EditBox voiceField;
+    private float temperature;
+
+    public CompanionConnectionScreen(VoiceConfig config, Path configFile, Screen parent) {
+        super(Component.literal("AI Connection"));
+        this.config = config;
+        this.configFile = configFile;
+        this.parent = parent;
+        this.temperature = config.temperature;
+    }
+
+    @Override
+    protected void init() {
+        super.init();
+        int cx = this.width / 2;
+        int w = 300;
+        int y = 64;
+
+        this.hostField = field(cx, y, w, config.host, "http://127.0.0.1:11434");
+        y += 34;
+        this.chatField = field(cx, y, w, config.chatModel, "Chat model (e.g. qwen3:8b)");
+        y += 34;
+        this.sttField = field(cx, y, w, config.sttModel, "STT model (optional, e.g. whisper)");
+        y += 34;
+        this.speechField = field(cx, y, w, config.speechModel, "Speech model (empty = auto)");
+        y += 34;
+        this.voiceField = field(cx, y, w, config.speechVoice, "Voice (optional)");
+        y += 38;
+
+        this.addRenderableWidget(new AbstractSliderButton(cx - w / 2, y, w, 20,
+                Component.literal("Temperature: " + String.format("%.2f", temperature)), temperature / 1.5) {
+            @Override protected void updateMessage() {
+                temperature = (float) (this.value * 1.5);
+                setMessage(Component.literal("Temperature: " + String.format("%.2f", temperature)));
+            }
+            @Override protected void applyValue() { }
+        });
+        y += 28;
+
+        this.addRenderableWidget(Button.builder(Component.literal("Load models from server"), b -> loadModels())
+                .pos(cx - w / 2, y).size(w, 20).build());
+        y += 24;
+
+        this.addRenderableWidget(Button.builder(Component.literal("Save"), b -> save())
+                .pos(cx - w / 2, y).size(w, 20).build());
+        y += 24;
+        this.addRenderableWidget(Button.builder(Component.literal("Back"), b -> back())
+                .pos(cx - w / 2, y).size(w, 20).build());
+    }
+
+    private EditBox field(int cx, int y, int w, String value, String hint) {
+        EditBox box = new EditBox(this.font, cx - w / 2, y, w, 20, Component.literal(hint));
+        box.setValue(value == null ? "" : value);
+        box.setHint(Component.literal(hint));
+        box.setMaxLength(240);
+        this.addRenderableWidget(box);
+        return box;
+    }
+
+    private void loadModels() {
+        String h = hostField.getValue() == null ? "" : hostField.getValue().trim();
+        CompanionModelScreen.open(this.minecraft, h, this,
+                v -> chatField.setValue(v),
+                v -> speechField.setValue(v),
+                v -> sttField.setValue(v));
+    }
+
+    private void save() {
+        config.host = trim(hostField.getValue(), "http://127.0.0.1:11434");
+        config.chatModel = trim(chatField.getValue(), "lfm3-audio:latest");
+        config.sttModel = sttField.getValue() == null ? "" : sttField.getValue().trim();
+        config.speechModel = speechField.getValue() == null ? "" : speechField.getValue().trim();
+        config.speechVoice = voiceField.getValue() == null ? "" : voiceField.getValue().trim();
+        config.temperature = Math.max(0f, Math.min(1.5f, temperature));
+        config.save(configFile);
+        back();
+    }
+
+    private void back() {
+        if (this.minecraft != null) this.minecraft.setScreen(parent);
+    }
+
+    private static String trim(String value, String fallback) {
+        return value == null || value.isBlank() ? fallback : value.trim();
+    }
+
+    @Override
+    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        this.extractMenuBackground(g);
+        int cx = this.width / 2;
+        int w = 300;
+        g.fill(cx - w / 2 - 12, 34, cx + w / 2 + 12, this.height - 28, 0xCC101216);
+        g.fill(cx - w / 2 - 12, 34, cx + w / 2 + 12, 35, 0xFF3D7BB8);
+        super.extractRenderState(g, mouseX, mouseY, partialTick);
+
+        g.centeredText(this.font, "AI Connection", cx, 42, 0xFFFFFFFF);
+        g.centeredText(this.font, "Ollama or any OpenAI-compatible server", cx, 54, 0xFF9AA6B2);
+        int y = 64;
+        label(g, "Server URL", cx - w / 2, y - 11);
+        label(g, "Chat model (hears or reads)", cx - w / 2, y + 23);
+        label(g, "Speech-to-text model", cx - w / 2, y + 57);
+        label(g, "Text-to-speech model", cx - w / 2, y + 91);
+        label(g, "Voice", cx - w / 2, y + 125);
+    }
+
+    private void label(GuiGraphicsExtractor g, String text, int x, int y) {
+        g.text(this.font, text, x, y, 0xFFB8C2CC, true);
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionFindBlockScreen.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.voice.VoiceConfig;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.network.chat.Component;
+
+import java.nio.file.Path;
+
+/** Small chooser for "go and find/mine this block" orders. */
+public class CompanionFindBlockScreen extends Screen {
+    private static final String[][] QUICK = {
+            {"Diamond", "diamond_ore"}, {"Coal", "coal_ore"}, {"Iron", "iron_ore"},
+            {"Gold", "gold_ore"}, {"Redstone", "redstone_ore"}, {"Lapis", "lapis_ore"},
+            {"Emerald", "emerald_ore"}, {"Copper", "copper_ore"}, {"Ancient Debris", "ancient_debris"},
+            {"Wood", "log"}, {"Stone", "stone"}, {"Dirt", "dirt"}, {"Planks", "oak_planks"},
+    };
+
+    private final VoiceConfig config;
+    private final Path configFile;
+    private EditBox blockField;
+    private String status = "";
+
+    public CompanionFindBlockScreen(VoiceConfig config, Path configFile) {
+        super(Component.literal("Find & Mine"));
+        this.config = config;
+        this.configFile = configFile;
+    }
+
+    @Override
+    protected void init() {
+        super.init();
+        int cx = this.width / 2;
+        int y = 72;
+
+        this.blockField = new EditBox(this.font, cx - 150, y, 300, 20, Component.literal("Block"));
+        this.blockField.setHint(Component.literal("Block id or name (diamond_ore, coal, iron...)"));
+        this.blockField.setMaxLength(60);
+        this.addRenderableWidget(this.blockField);
+        y += 26;
+
+        int col = 0;
+        for (String[] entry : QUICK) {
+            int bw = 96;
+            int bx = cx - 150 + col * 102;
+            this.addRenderableWidget(Button.builder(Component.literal(entry[0]), b -> {
+                blockField.setValue(entry[1]);
+                status = "";
+            }).pos(bx, y).size(bw, 20).build());
+            col++;
+            if (col == 3) { col = 0; y += 24; }
+        }
+        y += 8;
+
+        this.addRenderableWidget(Button.builder(Component.literal("Find & Mine"), b -> find())
+                .pos(cx - 150, y).size(300, 20).build());
+        y += 24;
+        this.addRenderableWidget(Button.builder(Component.literal("Back"), b -> {
+            if (this.minecraft != null) this.minecraft.setScreen(new CompanionRadialScreen());
+        }).pos(cx - 150, y).size(300, 20).build());
+    }
+
+    private void find() {
+        String id = CompanionEntity.normalizeBlockId(blockField.getValue());
+        if (id.isBlank()) {
+            status = "Unknown block. Try diamond, coal, iron, gold, emerald...";
+            return;
+        }
+        ClientVoice.send("seek_block", "", id);
+        if (this.minecraft != null) this.minecraft.setScreen(null);
+    }
+
+    @Override
+    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        this.extractMenuBackground(g);
+        int cx = this.width / 2;
+        g.fill(cx - 162, 34, cx + 162, this.height - 28, 0xCC101216);
+        g.fill(cx - 162, 34, cx + 162, 35, 0xFF3D7BB8);
+        super.extractRenderState(g, mouseX, mouseY, partialTick);
+
+        g.centeredText(this.font, "Find & Mine", cx, 42, 0xFFFFFFFF);
+        g.centeredText(this.font, "The companion walks to the nearest matching block and mines it.", cx, 54, 0xFF9AA6B2);
+        if (!status.isBlank()) g.centeredText(this.font, status, cx, this.height - 46, 0xFFFF7777);
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionGoalScreen.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.voice.VoiceConfig;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.input.KeyEvent;
+import net.minecraft.network.chat.CommonComponents;
+import net.minecraft.network.chat.Component;
+import org.lwjgl.glfw.GLFW;
+
+/** Type any goal in plain words; the AI turns it into a plan. Vanilla layout: title, one field, Done/Cancel in the footer. */
+public class CompanionGoalScreen extends Screen {
+    private static final String[] IDEAS = {"Collect some wood", "Guard this area", "Find coal and come back", "Look around nearby",
+            "Continue what you were doing", "Farm the crops", "Go fishing"};
+    private final Screen parent;
+    private EditBox field;
+
+    public CompanionGoalScreen(Screen parent) {
+        super(Component.literal("Give a Goal"));
+        this.parent = parent;
+    }
+
+    @Override
+    protected void init() {
+        int cx = this.width / 2;
+        field = new EditBox(this.font, cx - 154, 58, 308, 20, Component.literal("Goal"));
+        field.setHint(Component.literal("e.g. gather 2 stacks of wood, then come back"));
+        field.setMaxLength(160);
+        this.addRenderableWidget(field);
+        this.setInitialFocus(field);
+
+        for (int i = 0; i < IDEAS.length; i++) {
+            final String idea = IDEAS[i];
+            this.addRenderableWidget(Button.builder(Component.literal(idea), b -> field.setValue(idea))
+                    .pos(cx - 154 + (i % 2) * 158, 88 + (i / 2) * 24).size(150, 20).build());
+        }
+        this.addRenderableWidget(Button.builder(Component.literal("Plan It"), b -> submit())
+                .pos(cx - 154, this.height - 27).size(150, 20).build());
+        this.addRenderableWidget(Button.builder(CommonComponents.GUI_CANCEL, b -> onClose())
+                .pos(cx + 4, this.height - 27).size(150, 20).build());
+    }
+
+    private void submit() {
+        String text = field.getValue().trim();
+        if (!text.isEmpty()) CompanionAutonomy.requestGoal(text);
+        if (this.minecraft != null) this.minecraft.setScreen(null);
+    }
+
+    @Override
+    public boolean keyPressed(KeyEvent event) {
+        if (event.key() == GLFW.GLFW_KEY_ENTER || event.key() == GLFW.GLFW_KEY_KP_ENTER) { submit(); return true; }
+        return super.keyPressed(event);
+    }
+
+    @Override
+    public void onClose() {
+        if (this.minecraft != null) this.minecraft.setScreen(parent);
+    }
+
+    @Override
+    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        this.extractMenuBackground(g);
+        super.extractRenderState(g, mouseX, mouseY, partialTick);
+        g.centeredText(this.font, this.title, this.width / 2, 12, 0xFFFFFFFF);
+        g.centeredText(this.font, "Describe what you want. The AI picks the steps.", this.width / 2, 24, 0xFFA0A0A0);
+        g.fill(0, 32, this.width, 33, 0xFF000000);
+        g.fill(0, 33, this.width, 34, 0xFF373737);
+        g.fill(0, this.height - 33, this.width, this.height - 32, 0xFF000000);
+        g.fill(0, this.height - 32, this.width, this.height - 31, 0xFF373737);
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionHumanoidModel.java
+
+```java
+package com.example.companionmod.client;
+
+import net.minecraft.client.model.HumanoidModel;
+import net.minecraft.client.model.geom.ModelPart;
+import net.minecraft.client.model.geom.PartPose;
+import net.minecraft.client.model.geom.builders.CubeDeformation;
+import net.minecraft.client.model.geom.builders.CubeListBuilder;
+import net.minecraft.client.model.geom.builders.MeshDefinition;
+import net.minecraft.client.model.geom.builders.PartDefinition;
+
+/**
+ * Player-shaped model with <b>both</b> arm widths baked in, so classic/slim can be switched per frame
+ * without replacing the renderer's model instance.
+ *
+ * <p>Why not two models and a swap? {@code AgeableMobRenderer.submit()} overwrites
+ * {@code this.model = state.isBaby ? babyModel : adultModel} right before {@code LivingEntityRenderer.submit()},
+ * which silently undid every slim swap (the render state said SLIM but the wide model was drawn). Keeping one
+ * model instance and hiding the inactive arm pair is immune to that, and it is also correct with 26.1's deferred
+ * model submission because {@code setupAnim(state)} runs per submitted entity at draw time.</p>
+ *
+ * <p>The slim arm boxes and pivots are identical to {@code PlayerModel.createMesh(..., true)}:
+ * right arm {@code texOffs(40,16) box(-2,-2,-2, 3,12,4)} at {@code (-5,2,0)}, left arm
+ * {@code texOffs(32,48) box(-1,-2,-2, 3,12,4)} at {@code (5,2,0)}.</p>
+ */
+public final class CompanionHumanoidModel extends HumanoidModel<CompanionRenderState> {
+    private final ModelPart slimRightArm;
+    private final ModelPart slimLeftArm;
+
+    public CompanionHumanoidModel() {
+        this(buildRoot());
+    }
+
+    private CompanionHumanoidModel(ModelPart root) {
+        super(root);
+        this.slimRightArm = root.getChild("right_arm_slim");
+        this.slimLeftArm = root.getChild("left_arm_slim");
+    }
+
+    private static ModelPart buildRoot() {
+        MeshDefinition mesh = HumanoidModel.createMesh(CubeDeformation.NONE, 0.0f);
+        PartDefinition root = mesh.getRoot();
+        root.addOrReplaceChild("right_arm_slim", CubeListBuilder.create()
+                        .texOffs(40, 16).addBox(-2.0f, -2.0f, -2.0f, 3.0f, 12.0f, 4.0f),
+                PartPose.offset(-5.0f, 2.0f, 0.0f));
+        root.addOrReplaceChild("left_arm_slim", CubeListBuilder.create()
+                        .texOffs(32, 48).addBox(-1.0f, -2.0f, -2.0f, 3.0f, 12.0f, 4.0f),
+                PartPose.offset(5.0f, 2.0f, 0.0f));
+        return root.bake(64, 64);
+    }
+
+    @Override
+    public void setupAnim(CompanionRenderState state) {
+        super.setupAnim(state);
+        boolean slim = state.slim;
+        this.rightArm.visible = !slim;
+        this.leftArm.visible = !slim;
+        this.slimRightArm.visible = slim;
+        this.slimLeftArm.visible = slim;
+        copyPose(this.rightArm, this.slimRightArm);
+        copyPose(this.leftArm, this.slimLeftArm);
+    }
+
+    private static void copyPose(ModelPart from, ModelPart to) {
+        to.x = from.x;
+        to.y = from.y;
+        to.z = from.z;
+        to.xRot = from.xRot;
+        to.yRot = from.yRot;
+        to.zRot = from.zRot;
+        to.xScale = from.xScale;
+        to.yScale = from.yScale;
+        to.zScale = from.zScale;
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionInventoryScreen.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.inventory.CompanionInventoryMenu;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.entity.player.Inventory;
+
+/**
+ * The companion's bag: top row = 4 armor slots + 4 tool slots, below that 18 storage slots,
+ * then the player's own inventory. Slot rendering, tooltips and click handling come from
+ * {@link AbstractContainerScreen}; we only paint the panel and the section labels.
+ */
+public class CompanionInventoryScreen extends AbstractContainerScreen<CompanionInventoryMenu> {
+    public CompanionInventoryScreen(CompanionInventoryMenu menu, Inventory playerInventory, Component title) {
+        super(menu, playerInventory, title, 176, 196);
+        this.titleLabelX = 8;
+        this.titleLabelY = 6;
+        this.inventoryLabelX = 8;
+        this.inventoryLabelY = 104;
+    }
+
+    @Override
+    public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        int x = leftPos, y = topPos;
+        g.fill(x - 4, y - 4, x + imageWidth + 4, y + imageHeight + 4, 0xB4101010);
+        g.fill(x, y, x + imageWidth, y + imageHeight, 0xE6181818);
+        g.fill(x, y, x + imageWidth, y + 1, 0xFFFFFFFF);
+        g.fill(x + 4, y + 23, x + imageWidth - 4, y + 47, 0x33383838);
+        g.fill(x + 4, y + 51, x + imageWidth - 4, y + 93, 0x22383838);
+        g.fill(x + 4, y + 108, x + imageWidth - 4, y + 192, 0x22383838);
+    }
+
+    @Override
+    protected void extractLabels(GuiGraphicsExtractor g, int mouseX, int mouseY) {
+        g.text(this.font, this.title, this.titleLabelX, this.titleLabelY, 0xFFE8EEF4, true);
+        g.text(this.font, Component.literal("Armor"), 8, 16, 0xFF9AA6B2, true);
+        String[] tools = {"Pick", "Axe", "Shov", "Swrd"};
+        for (int i = 0; i < tools.length; i++) {
+            g.pose().pushMatrix();
+            g.pose().translate(107 + i * 18, 17);
+            g.pose().scale(0.68f, 0.68f);
+            g.centeredText(this.font, tools[i], 0, 0, 0xFFC8C8C8);
+            g.pose().popMatrix();
+        }
+        g.text(this.font, Component.literal("Storage"), 8, 47, 0xFF9AA6B2, true);
+        g.text(this.font, this.playerInventoryTitle, this.inventoryLabelX, this.inventoryLabelY, 0xFF9AA6B2, true);
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionMemory.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.voice.VoiceConfig;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import net.minecraft.client.Minecraft;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.item.ItemStack;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Lightweight long-term memory + world observer for the companion.
+ * Remembers facts the player asks it to keep and a rolling log of things the companion "saw" the
+ * player do (attacks, pickups, damage, dimension changes). Stored in config/companionmod-memory.json.
+ */
+public final class CompanionMemory {
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final ArrayDeque<String> EVENTS = new ArrayDeque<>();
+    private static final List<String> FACTS = new ArrayList<>();
+    private static final Map<String, Integer> LAST_ITEMS = new HashMap<>();
+
+    private static Path file;
+    private static VoiceConfig cfg;
+    private static int tickCounter;
+    private static String lastDimension = "";
+    private static float lastHealth = 20f;
+    private static int lastFood = 20;
+    private static String lastHurtMob = "";
+    private static boolean lastDead;
+    private static boolean lastNight;
+
+    private CompanionMemory() {}
+
+    public static void configure(VoiceConfig config, Path memoryFile) {
+        cfg = config;
+        file = memoryFile;
+        load();
+    }
+
+    public static void tick(Minecraft mc, CompanionEntity companion) {
+        if (cfg == null || !cfg.memoryEnabled || mc.player == null || mc.level == null) return;
+        if (++tickCounter % 20 != 0) return;
+
+        String dimension = mc.level.dimension().identifier().toString();
+        if (!dimension.equals(lastDimension)) {
+            if (!lastDimension.isEmpty()) addEvent("entered " + dimension);
+            lastDimension = dimension;
+            LAST_ITEMS.clear();
+            lastHealth = mc.player.getHealth();
+            lastFood = mc.player.getFoodData().getFoodLevel();
+        }
+
+        if (mc.player.getHealth() + 0.5f < lastHealth)
+            addEvent("player took damage (health " + Math.round(mc.player.getHealth()) + "/20)");
+        lastHealth = mc.player.getHealth();
+
+        int food = mc.player.getFoodData().getFoodLevel();
+        if (food + 1 < lastFood) addEvent("player is getting hungry");
+        lastFood = food;
+
+        LivingEntity hurt = mc.player.getLastHurtMob();
+        if (hurt != null && hurt.isAlive() && mc.player.tickCount - mc.player.getLastHurtMobTimestamp() < 30) {
+            String name = hurt.getName().getString();
+            if (!name.equals(lastHurtMob)) {
+                addEvent("player attacked " + name);
+                lastHurtMob = name;
+            }
+        }
+
+        boolean dead = mc.player.isDeadOrDying();
+        if (dead && !lastDead) addEvent("player died");
+        lastDead = dead;
+
+        long time = mc.level.getOverworldClockTime() % 24000;
+        boolean night = time >= 13000 && time < 23000;
+        if (night != lastNight) {
+            if (night) addEvent("night fell");
+            lastNight = night;
+        }
+
+        diffInventory(mc);
+
+        if (companion != null) {
+            // keep the memory file fresh without writing every tick
+            if (tickCounter % 600 == 0) save();
+        }
+    }
+
+    public static void remember(String fact) {
+        if (fact == null) return;
+        String clean = fact.trim();
+        if (clean.isEmpty() || FACTS.stream().anyMatch(f -> f.equalsIgnoreCase(clean))) return;
+        FACTS.add(clean);
+        while (FACTS.size() > 40) FACTS.remove(0);
+        save();
+    }
+
+    public static void forget(String fact) {
+        if (fact == null || fact.isBlank()) return;
+        FACTS.removeIf(f -> f.toLowerCase().contains(fact.toLowerCase().trim()));
+        save();
+    }
+
+    public static List<String> facts() {
+        return List.copyOf(FACTS);
+    }
+
+    public static String summary() {
+        if (cfg == null || !cfg.memoryEnabled) return "";
+        StringBuilder sb = new StringBuilder();
+        if (!FACTS.isEmpty()) {
+            sb.append("Remembered: ");
+            int start = Math.max(0, FACTS.size() - 8);
+            for (int i = start; i < FACTS.size(); i++) {
+                if (i > start) sb.append("; ");
+                sb.append(FACTS.get(i));
+            }
+            sb.append(". ");
+        }
+        if (!EVENTS.isEmpty()) {
+            sb.append("Recent events: ");
+            int count = 0;
+            for (String event : EVENTS) {
+                if (count++ > 0) sb.append("; ");
+                sb.append(event);
+            }
+            sb.append('.');
+        }
+        return sb.toString();
+    }
+
+    private static void addEvent(String event) {
+        EVENTS.addLast(event);
+        int max = cfg == null ? 30 : Math.max(5, cfg.memoryMaxEvents);
+        while (EVENTS.size() > max) EVENTS.removeFirst();
+    }
+
+    private static void diffInventory(Minecraft mc) {
+        Map<String, Integer> now = new HashMap<>();
+        for (int i = 0; i < mc.player.getInventory().getContainerSize(); i++) {
+            ItemStack stack = mc.player.getInventory().getItem(i);
+            if (stack.isEmpty()) continue;
+            String id = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+            now.merge(id, stack.getCount(), Integer::sum);
+        }
+        for (Map.Entry<String, Integer> entry : now.entrySet()) {
+            int before = LAST_ITEMS.getOrDefault(entry.getKey(), 0);
+            if (entry.getValue() > before) {
+                String name = entry.getKey().substring(entry.getKey().indexOf(':') + 1).replace('_', ' ');
+                addEvent("player picked up " + name);
+            }
+        }
+        LAST_ITEMS.clear();
+        LAST_ITEMS.putAll(now);
+    }
+
+    // ---------------------------------------------------------------- persistence
+
+    private static final class Data {
+        List<String> facts = new ArrayList<>();
+        List<String> events = new ArrayList<>();
+    }
+
+    private static void load() {
+        if (file == null || !Files.exists(file)) return;
+        try {
+            Data data = GSON.fromJson(Files.readString(file), Data.class);
+            if (data == null) return;
+            FACTS.clear();
+            EVENTS.clear();
+            if (data.facts != null) FACTS.addAll(data.facts);
+            if (data.events != null) EVENTS.addAll(data.events);
+        } catch (Exception ignored) { }
+    }
+
+    private static void save() {
+        if (file == null) return;
+        try {
+            Files.createDirectories(file.getParent());
+            Data data = new Data();
+            data.facts = new ArrayList<>(FACTS);
+            data.events = new ArrayList<>(EVENTS);
+            Files.writeString(file, GSON.toJson(data));
+        } catch (IOException ignored) { }
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionModelScreen.java
+
+```java
+package com.example.companionmod.client;
+
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.Style;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Consumer;
+
+/**
+ * Selection menu for the models exposed by the Ollama server (GET /api/tags). The host and one
+ * {@code Consumer<String>} per role (Chat / Speech / STT) are passed in; click a model row to assign it
+ * to the currently-selected role. Models are pre-fetched on a worker thread.
+ */
+public final class CompanionModelScreen extends Screen {
+    private static final int ROW = 22;
+    private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
+
+    private final String host;
+    private final Map<String, Consumer<String>> assigners;   // role -> what to do with the chosen model
+    private final Screen parent;
+    private final List<String> models;
+    private final String status;
+    private int selected = 0;
+    private Component roleLabel = Component.literal("Assigning to: " + "Chat");
+
+    private CompanionModelScreen(String host, Map<String, Consumer<String>> assigners, List<String> models,
+                                 String status, int selected, Screen parent) {
+        super(Component.literal(models.isEmpty() ? "Pick a Model" : "Pick a Model (" + models.size() + ")"));
+        this.host = host;
+        this.assigners = assigners;
+        this.models = models;
+        this.status = status == null ? "" : status;
+        this.selected = Math.max(0, Math.min(selected, assigners.size() - 1));
+        this.parent = parent;
+    }
+
+    /** Opens the picker. {@code host} may be blank (defaults to the local Ollama URL). */
+    static void open(Minecraft mc, String host, Screen parent,
+                     Consumer<String> pickChat, Consumer<String> pickSpeech, Consumer<String> pickStt) {
+        String url = (host == null || host.isBlank()) ? "http://127.0.0.1:11434" : host;
+        new Thread(() -> {
+            List<String> fetched = fetch(url);
+            mc.execute(() -> {
+                String st = fetched.isEmpty() ? "No models found at " + url : "";
+                Map<String, Consumer<String>> m = new LinkedHashMap<>();
+                m.put("Chat", pickChat); m.put("Speech", pickSpeech); m.put("STT", pickStt);
+                mc.setScreen(new CompanionModelScreen(url, m, fetched, st, 0, parent));
+            });
+        }, "companionmod-models").start();
+    }
+
+    private static List<String> fetch(String host) {
+        try {
+            HttpResponse<String> r = HTTP.send(HttpRequest.newBuilder(URI.create(host + "/api/tags"))
+                    .timeout(Duration.ofSeconds(5)).GET().build(), HttpResponse.BodyHandlers.ofString());
+            if (r.statusCode() != 200) return List.of();
+            JsonObject o = JsonParser.parseString(r.body()).getAsJsonObject();
+            JsonElement arr = o.get("models");
+            if (arr == null || !arr.isJsonArray()) return List.of();
+            List<String> out = new ArrayList<>();
+            for (JsonElement e : arr.getAsJsonArray()) {
+                if (e.isJsonObject()) {
+                    String n = e.getAsJsonObject().has("name") ? e.getAsJsonObject().get("name").getAsString() : "";
+                    if (n != null && !n.isBlank()) out.add(n);
+                }
+            }
+            return out;
+        } catch (IOException | RuntimeException | InterruptedException e) {
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+            return List.of();
+        }
+    }
+
+    private String[] roleKeys() { return assigners.keySet().toArray(String[]::new); }
+
+    @Override
+    protected void init() {
+        super.init();
+        int cx = this.width / 2;
+        int y = 46;
+        String[] keys = roleKeys();
+        int bw = 72, gap = 6;
+        int baseX = cx - (keys.length * bw + (keys.length - 1) * gap) / 2;
+        for (int i = 0; i < keys.length; i++) {
+            final int idx = i;
+            this.addRenderableWidget(Button.builder(Component.literal(keys[i]), b -> {
+                selected = idx;
+                roleLabel = Component.literal("Assigning to: " + keys[idx]);
+            }).pos(baseX + i * (bw + gap), y).size(bw, 20).build());
+        }
+        y += 28;
+
+        int listW = 190, colGap = 14;
+        int cols = models.size() > 12 ? 2 : 1;
+        int rows = (models.size() + cols - 1) / cols;
+        int leftX = cx - (cols * listW + (cols - 1) * colGap) / 2;
+        for (int i = 0; i < models.size(); i++) {
+            int c = i % cols, r = i / cols;
+            int bx = leftX + c * (listW + colGap);
+            int by = y + r * ROW;
+            if (by + ROW > this.height - 80) break;            // keep above the footer
+            final String model = models.get(i);
+            this.addRenderableWidget(Button.builder(Component.literal(model), b -> {
+                assigners.get(roleKeys()[selected]).accept(model);
+                if (this.minecraft != null) this.minecraft.setScreen(parent);
+            }).pos(bx, by).size(listW, 20).build());
+        }
+        y += Math.max(1, rows) * ROW;
+
+        if (models.isEmpty()) {
+            this.addRenderableWidget(Button.builder(Component.literal("Retry"), b -> {
+                if (this.minecraft != null) CompanionModelScreen.open(
+                        this.minecraft, host, parent,
+                        assigners.get("Chat"), assigners.get("Speech"), assigners.get("STT"));
+            }).pos(cx - 40, y).size(80, 20).build());
+            y += ROW;
+        }
+
+        this.addRenderableWidget(Button.builder(Component.literal("Back"), b -> onClose())
+                .pos(cx - 50, Math.max(y + 6, this.height - 30)).size(100, 20).build());
+    }
+
+    @Override
+    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        this.extractMenuBackground(g);
+        super.extractRenderState(g, mouseX, mouseY, partialTick);
+        int cx = this.width / 2;
+        g.centeredText(this.font, this.title, cx, 30, 0xFFFFFFFF);
+        if (!status.isBlank()) g.centeredText(this.font, status, cx, 44, 0xFFFF7777);
+        g.centeredText(this.font, roleLabel, cx, 56, 0xFF9AA6B2);
+        g.centeredText(this.font, "Click a model to assign it to " + roleKeys()[selected] + ".", cx, this.height - 24, 0xFF666666);
+    }
+
+    @Override
+    public void onClose() {
+        if (this.minecraft != null) this.minecraft.setScreen(parent);
+    }
+
+    @Override
+    public boolean isPauseScreen() { return false; }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionProfileScreen.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.voice.VoiceConfig;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.network.chat.Component;
+
+import java.nio.file.Path;
+
+/**
+ * "Who is my companion?" editor: name, backstory, personality and traits.
+ * Everything is saved to the client config and immediately sent to the server (name).
+ */
+public class CompanionProfileScreen extends Screen {
+    private final VoiceConfig config;
+    private final Path configFile;
+    private final Screen parent;
+
+    private EditBox nameField;
+    private EditBox descriptionField;
+    private EditBox personalityField;
+    private EditBox traitsField;
+
+    public CompanionProfileScreen(VoiceConfig config, Path configFile, Screen parent) {
+        super(Component.literal("Personalize Companion"));
+        this.config = config;
+        this.configFile = configFile;
+        this.parent = parent;
+    }
+
+    @Override
+    protected void init() {
+        super.init();
+        int cx = this.width / 2;
+        int w = 300;
+        int y = 64;
+
+        this.nameField = field(cx, y, w, config.companionName, "Name (e.g. Aria)");
+        y += 34;
+        this.descriptionField = field(cx, y, w, config.companionDescription,
+                "Who are they? Backstory, role, quirks...");
+        y += 34;
+        this.personalityField = field(cx, y, w, config.companionPersonality,
+                "Personality (friendly, sarcastic, brave...)");
+        y += 34;
+        this.traitsField = field(cx, y, w, config.companionTraits,
+                "Traits, comma separated (loyal, curious, protective)");
+        y += 40;
+
+        this.addRenderableWidget(Button.builder(Component.literal("Save"), b -> save())
+                .pos(cx - w / 2, y).size(w, 20).build());
+        y += 24;
+        this.addRenderableWidget(Button.builder(Component.literal("Reset to defaults"), b -> {
+            nameField.setValue("Companion");
+            descriptionField.setValue("A loyal companion fighting beside you.");
+            personalityField.setValue("Friendly and helpful");
+            traitsField.setValue("loyal, curious, protective");
+        }).pos(cx - w / 2, y).size(w, 20).build());
+        y += 24;
+        this.addRenderableWidget(Button.builder(Component.literal("Back"), b -> back())
+                .pos(cx - w / 2, y).size(w, 20).build());
+    }
+
+    private EditBox field(int cx, int y, int w, String value, String hint) {
+        EditBox box = new EditBox(this.font, cx - w / 2, y, w, 20, Component.literal(hint));
+        box.setValue(value == null ? "" : value);
+        box.setHint(Component.literal(hint));
+        box.setMaxLength(240);
+        this.addRenderableWidget(box);
+        return box;
+    }
+
+    private void save() {
+        config.companionName = blankTo(nameField.getValue(), "Companion");
+        config.companionDescription = blankTo(descriptionField.getValue(), "A loyal companion fighting beside you.");
+        config.companionPersonality = blankTo(personalityField.getValue(), "Friendly and helpful");
+        config.companionTraits = blankTo(traitsField.getValue(), "loyal, curious, protective");
+        config.save(configFile);
+        ClientVoice.send("set_name", "", config.companionName);
+        back();
+    }
+
+    private void back() {
+        if (this.minecraft != null) this.minecraft.setScreen(parent);
+    }
+
+    private static String blankTo(String value, String fallback) {
+        return value == null || value.isBlank() ? fallback : value.trim();
+    }
+
+    @Override
+    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        this.extractMenuBackground(g);
+        int cx = this.width / 2;
+        int w = 300;
+        g.fill(cx - w / 2 - 12, 34, cx + w / 2 + 12, this.height - 28, 0xCC101216);
+        g.fill(cx - w / 2 - 12, 34, cx + w / 2 + 12, 35, 0xFF3D7BB8);
+        super.extractRenderState(g, mouseX, mouseY, partialTick);
+
+        g.centeredText(this.font, "Personalize Companion", cx, 42, 0xFFFFFFFF);
+        g.centeredText(this.font, "This is who your companion is. It shapes every reply.", cx, 54, 0xFF9AA6B2);
+
+        int y = 64;
+        label(g, "Name", cx - w / 2, y - 11);
+        label(g, "Who they are", cx - w / 2, y + 23);
+        label(g, "Personality", cx - w / 2, y + 57);
+        label(g, "Traits", cx - w / 2, y + 91);
+    }
+
+    private void label(GuiGraphicsExtractor g, String text, int x, int y) {
+        g.text(this.font, text, x, y, 0xFFB8C2CC, true);
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionRadialScreen.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.voice.VoiceConfig;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.input.KeyEvent;
+import net.minecraft.client.input.MouseButtonEvent;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import org.lwjgl.glfw.GLFW;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.List;
+
+/**
+ * Radial wheel, overhaul.
+ *  - Smooth ring segments with gaps, a vanilla-grey palette and a white outline + pop-out on the hovered segment.
+ *  - Hold R and release on a segment to pick it (ARK style), or tap R and click. Right-click / Backspace = back, 1-8 = quick select.
+ *  - Centre hub shows what is hovered, the breadcrumb and the AI's current goal.
+ *  - Fixes the old half-segment offset between what was drawn and what was hit-tested.
+ *  Geometry is rasterised once per segment count into horizontal runs, so drawing is just a few thousand fills.
+ */
+public final class CompanionRadialScreen extends Screen {
+    private static final int INNER = 40, OUTER = 122, POP = 7, GAP = 3;
+    private static final int C = OUTER + POP, SIZE = 2 * C + 1;
+    private static final double ICON_R = (INNER + OUTER) / 2.0;
+
+    private static final int FILL = 0xB4101010, EDGE = 0xC8383838, HOT_FILL = 0xDC5C5C5C, HOT_EDGE = 0xFFFFFFFF;
+
+    // ------------------------------------------------------------------ geometry cache
+
+    private record Run(int x, int y, int len, int seg, int flags) {}   // flags: 1 = pop-out zone, 2 = segment edge, 4 = base rim
+    private static int cachedN = -1;
+    private static List<Run> cachedRuns = List.of();
+
+    private static List<Run> runsFor(int n) {
+        if (n == cachedN) return cachedRuns;
+        double step = 360.0 / n;
+        int[] seg = new int[SIZE * SIZE];
+        for (int y = 0; y < SIZE; y++) {
+            for (int x = 0; x < SIZE; x++) {
+                double dx = x - C, dy = y - C, r = Math.hypot(dx, dy);
+                int i = y * SIZE + x;
+                if (r < INNER || r > OUTER + POP) { seg[i] = -1; continue; }
+                double a = (Math.toDegrees(Math.atan2(dy, dx)) + 450.0) % 360.0;   // 0 = up, clockwise
+                int idx = Math.min(n - 1, (int) (a / step));
+                double off = a - idx * step;
+                seg[i] = Math.toRadians(Math.min(off, step - off)) * r < GAP / 2.0 ? -1 : idx;
+            }
+        }
+        List<Run> runs = new ArrayList<>();
+        for (int y = 0; y < SIZE; y++) {
+            int runStart = -1, runKey = -1;
+            for (int x = 0; x <= SIZE; x++) {
+                int key = -1;
+                if (x < SIZE) {
+                    int s = seg[y * SIZE + x];
+                    if (s >= 0) {
+                        double r = Math.hypot(x - C, y - C);
+                        int f = 0;
+                        if (r > OUTER) f |= 1;
+                        if (x == 0 || y == 0 || x == SIZE - 1 || y == SIZE - 1
+                                || seg[y * SIZE + x - 1] != s || seg[y * SIZE + x + 1] != s
+                                || seg[(y - 1) * SIZE + x] != s || seg[(y + 1) * SIZE + x] != s) f |= 2;
+                        if (r > OUTER - 1.5 && r <= OUTER) f |= 4;
+                        key = (s << 3) | f;
+                    }
+                }
+                if (key != runKey) {
+                    if (runKey >= 0) runs.add(new Run(runStart, y, x - runStart, runKey >> 3, runKey & 7));
+                    runStart = x;
+                    runKey = key;
+                }
+            }
+        }
+        cachedN = n;
+        cachedRuns = runs;
+        return runs;
+    }
+
+    // ------------------------------------------------------------------ entries
+
+    private static final class Entry {
+        final String label, hint, action, target;
+        final ItemStack icon;
+        final List<Entry> children;
+        final Runnable custom;
+
+        Entry(String label, String hint, String action, String target, ItemStack icon, List<Entry> children, Runnable custom) {
+            this.label = label; this.hint = hint; this.action = action; this.target = target;
+            this.icon = icon; this.children = children; this.custom = custom;
+        }
+        boolean isSubmenu() { return children != null && !children.isEmpty(); }
+    }
+
+    private record Frame(List<Entry> entries, String title) {}
+
+    private final Deque<Frame> stack = new ArrayDeque<>();
+    private List<Entry> current;
+    private String currentTitle = "Companion";
+    private int hovered = -1;
+    private int lastHovered = -1;
+    private double lastDistance = Double.MAX_VALUE;
+    private final long openedAt = System.currentTimeMillis();
+    private boolean holdMode;
+
+    public CompanionRadialScreen() {
+        super(Component.literal("Companion"));
+        this.current = buildRoot();
+        this.holdMode = rDown();
+    }
+
+    @Override public boolean isPauseScreen() { return false; }
+
+    private static boolean rDown() {
+        return GLFW.glfwGetKey(Minecraft.getInstance().getWindow().handle(), GLFW.GLFW_KEY_R) == GLFW.GLFW_PRESS;
+    }
+
+    private List<Entry> buildRoot() {
+        VoiceConfig cfg = ClientVoice.config();
+        List<Entry> e = new ArrayList<>();
+        e.add(order("Follow", "Walk with me", "follow", Items.COMPASS));
+        e.add(order("Stay", "Hold this spot", "stay", Items.SHIELD));
+        e.add(order("Sit", "Rest here", "sit", Items.OAK_STAIRS));
+        e.add(sub("Movement", "Come, patrol, wander", Items.ENDER_PEARL, List.of(
+                order("Come", "Teleport to me", "come", Items.ENDER_PEARL),
+                order("Patrol", "Walk a patrol ring", "patrol", Items.SPYGLASS),
+                order("Wander", "Roam nearby", "wander", Items.OAK_SAPLING),
+                order("Explore", "Explore the area", "explore", Items.MAP))));
+        e.add(sub("Behavior", "How to fight", Items.DIAMOND_SWORD, List.of(
+                order("Aggressive", "Attack nearby hostiles", "guard", Items.DIAMOND_SWORD),
+                order("Defensive", "Only fight back", "defensive", Items.SHIELD),
+                order("Passive", "Never start a fight", "passive", Items.WHITE_WOOL),
+                order("Attack", "Fight what I aim at", "attack", Items.IRON_SWORD))));
+        e.add(sub("Work", "Items and mining", Items.CHEST, List.of(
+                order("Pick up", "Grab a dropped item", "pickup", Items.HOPPER),
+                custom("Find & Mine", "Go mine a block", Items.DIAMOND_PICKAXE,
+                        () -> open(new CompanionFindBlockScreen(cfg, ClientVoice.configFile()))),
+                order("Inventory", "Open its bag", "inventory", Items.CHEST),
+                order("Drop item", "Drop one item", "drop", Items.BONE),
+                order("Farm", "Harvest crops for 30s", "farm", Items.WHEAT),
+                order("Fish", "Fish for 30s", "fish", Items.FISHING_ROD))));
+        e.add(sub("AI", "Goals and autonomy", Items.ENDER_EYE, List.of(
+                custom("Give Goal", "Describe a goal in words", Items.WRITABLE_BOOK, () -> open(new CompanionGoalScreen(null))),
+                custom("Think Now", "Let the AI decide", Items.EXPERIENCE_BOTTLE,
+                        () -> CompanionAutonomy.requestGoal("Decide something useful to do right now.")),
+                order("Continue", "Resume interrupted work", "continue", Items.CLOCK),
+                custom("Auto: " + (cfg.autonomyEnabled ? "ON" : "OFF"), "Act without being asked",
+                        cfg.autonomyEnabled ? Items.LIME_DYE : Items.GRAY_DYE, () -> {
+                            cfg.autonomyEnabled = !cfg.autonomyEnabled;
+                            cfg.save(ClientVoice.configFile());
+                        }),
+                custom("Cancel Plan", "Stop the current goal", Items.BARRIER, CompanionAutonomy::cancelPlan))));
+        e.add(sub("More", "Skin, persona, settings", Items.NAME_TAG, List.of(
+                custom("Skin Library", "Wear a player skin", Items.LEATHER_HELMET,
+                        () -> open(new CompanionSkinScreen(cfg, ClientVoice.configFile()))),
+                custom("Personalize", "Who your companion is", Items.NAME_TAG,
+                        () -> open(new CompanionProfileScreen(cfg, ClientVoice.configFile(), null))),
+                custom("Settings", "Voice, memory, AI", Items.REDSTONE,
+                        () -> open(new CompanionSettingsScreen(cfg, ClientVoice.configFile()))),
+                order("Inventory", "Open its bag", "inventory", Items.CHEST))));
+        return List.copyOf(e);
+    }
+
+    private static Entry order(String label, String hint, String action, Item icon) {
+        return new Entry(label, hint, action, "", new ItemStack(icon), null, null);
+    }
+    private static Entry sub(String label, String hint, Item icon, List<Entry> children) {
+        return new Entry(label, hint, "", "", new ItemStack(icon), children, null);
+    }
+    private static Entry custom(String label, String hint, Item icon, Runnable run) {
+        return new Entry(label, hint, "", "", new ItemStack(icon), null, run);
+    }
+    private void open(Screen s) { if (this.minecraft != null) this.minecraft.setScreen(s); }
+
+    // ------------------------------------------------------------------ rendering
+
+    private static int fade(int argb, float alpha) {
+        int a = (int) (((argb >>> 24) & 0xFF) * alpha);
+        return (a << 24) | (argb & 0xFFFFFF);
+    }
+
+    @Override
+    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        int cx = this.width / 2, cy = this.height / 2;
+        int n = current.size();
+        double step = 360.0 / n;
+        float t = Math.min(1f, (System.currentTimeMillis() - openedAt) / 140f);
+        float alpha = 1f - (1f - t) * (1f - t) * (1f - t);
+
+        g.fill(0, 0, this.width, this.height, fade(0x78000000, alpha));
+
+        double dx = mouseX - cx, dy = mouseY - cy;
+        lastDistance = Math.hypot(dx, dy);
+        hovered = -1;
+        if (lastDistance >= INNER && lastDistance <= OUTER + POP) {
+            double a = (Math.toDegrees(Math.atan2(dy, dx)) + 450.0) % 360.0;
+            int idx = Math.min(n - 1, (int) (a / step));
+            if (lastDistance <= OUTER || idx == lastHovered) hovered = idx;
+        }
+        lastHovered = hovered;
+
+        int ox = cx - C, oy = cy - C;
+        List<Run> runs = runsFor(n);
+        for (int pass = 0; pass < 2; pass++) {                  // idle segments first, hovered one on top
+            for (Run r : runs) {
+                boolean hot = r.seg() == hovered;
+                if ((pass == 1) != hot) continue;
+                int f = r.flags();
+                if ((f & 1) != 0 && !hot) continue;             // pop-out zone belongs to the hovered segment only
+                boolean edge = (f & 2) != 0 || ((f & 4) != 0 && !hot);
+                int col = hot ? (edge ? HOT_EDGE : HOT_FILL) : (edge ? EDGE : FILL);
+                g.fill(ox + r.x(), oy + r.y(), ox + r.x() + r.len(), oy + r.y() + 1, fade(col, alpha));
+            }
+        }
+
+        for (int i = 0; i < n; i++) {
+            Entry en = current.get(i);
+            boolean hot = i == hovered;
+            double ang = Math.toRadians((i + 0.5) * step);
+            double rad = ICON_R + (hot ? 4 : 0);
+            int ix = cx + (int) Math.round(Math.sin(ang) * rad);
+            int iy = cy - (int) Math.round(Math.cos(ang) * rad);
+            g.item(en.icon, ix - 8, iy - 12);
+            String label = en.label + (en.isSubmenu() ? " >" : "");
+            g.centeredText(this.font, label, ix, iy + 7, fade(hot ? 0xFFFFFFFF : 0xFFC8C8C8, alpha));
+        }
+
+        for (int y = -34; y <= 34; y++) {                       // centre hub
+            int w = (int) Math.sqrt(34.0 * 34.0 - y * y);
+            g.fill(cx - w, cy + y, cx + w, cy + y + 1, fade(0xE6101010, alpha));
+        }
+        String title, hint;
+        if (hovered >= 0) { title = current.get(hovered).label; hint = current.get(hovered).hint; }
+        else if (!stack.isEmpty() && lastDistance < INNER) { title = "Back"; hint = "Click the centre"; }
+        else { title = currentTitle; hint = "Choose an order"; }
+        g.centeredText(this.font, title, cx, cy - 12, fade(0xFFFFFFFF, alpha));
+        g.centeredText(this.font, hint.length() > 16 ? hint.substring(0, 15) + "…" : hint, cx, cy - 1, fade(0xFFA0A0A0, alpha));
+        String goal = CompanionAutonomy.currentGoal();
+        if (!goal.isBlank()) {
+            String s = "Goal: " + (goal.length() > 14 ? goal.substring(0, 13) + "…" : goal);
+            g.centeredText(this.font, s, cx, cy + 12, fade(0xFF7FD7FF, alpha));
+        }
+
+        StringBuilder crumb = new StringBuilder("Companion");
+        List<Frame> frames = new ArrayList<>(stack);
+        for (int i = frames.size() - 2; i >= 0; i--) crumb.append("  >  ").append(frames.get(i).title());
+        if (!stack.isEmpty()) crumb.append("  >  ").append(currentTitle);
+        g.centeredText(this.font, crumb.toString(), cx, cy - OUTER - POP - 14, fade(0xFFE0E0E0, alpha));
+        g.centeredText(this.font, "Hold R and release to pick  •  click  •  1-8 quick select  •  right-click back",
+                cx, this.height - 20, fade(0xFFA0A0A0, alpha));
+    }
+
+    // ------------------------------------------------------------------ input
+
+    @Override
+    public void tick() {
+        if (holdMode && !rDown()) {                            // released R: pick what is under the cursor
+            holdMode = false;
+            if (System.currentTimeMillis() - openedAt > 220 && hovered >= 0) activate(current.get(hovered));
+        }
+    }
+
+    @Override
+    public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+        holdMode = false;
+        if (event.button() == 1) { backOrClose(); return true; }
+        if (event.button() != 0) { onClose(); return true; }
+        if (hovered >= 0) { activate(current.get(hovered)); return true; }
+        if (lastDistance < INNER) backOrClose(); else onClose();
+        return true;
+    }
+
+    @Override
+    public boolean keyPressed(KeyEvent event) {
+        int k = event.key();
+        if (k == GLFW.GLFW_KEY_ESCAPE) { onClose(); return true; }
+        if (k == GLFW.GLFW_KEY_R) {                             // ignore key-repeat while R is still held from opening
+            if (!holdMode && System.currentTimeMillis() - openedAt > 300) onClose();
+            return true;
+        }
+        if (k == GLFW.GLFW_KEY_BACKSPACE) { backOrClose(); return true; }
+        if (k >= GLFW.GLFW_KEY_1 && k <= GLFW.GLFW_KEY_9 && k - GLFW.GLFW_KEY_1 < current.size()) {
+            holdMode = false;
+            activate(current.get(k - GLFW.GLFW_KEY_1));
+            return true;
+        }
+        return super.keyPressed(event);
+    }
+
+    private void activate(Entry en) {
+        if (en.isSubmenu()) {
+            stack.push(new Frame(current, currentTitle));
+            current = en.children;
+            currentTitle = en.label;
+            hovered = lastHovered = -1;
+            return;
+        }
+        if (en.custom != null) {
+            en.custom.run();
+            if (this.minecraft != null && this.minecraft.screen == this) this.minecraft.setScreen(null);
+            return;
+        }
+        ClientVoice.send(en.action, "", en.target);
+        if (this.minecraft != null) this.minecraft.setScreen(null);
+    }
+
+    private void backOrClose() {
+        if (stack.isEmpty()) { onClose(); return; }
+        Frame f = stack.pop();
+        current = f.entries();
+        currentTitle = f.title();
+        hovered = lastHovered = -1;
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionRenderer.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.voice.FemaleGenderCompat;
+import com.mojang.blaze3d.vertex.PoseStack;
+import com.mojang.math.Axis;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.Font;
+import net.minecraft.client.model.HumanoidModel;
+import net.minecraft.client.model.geom.ModelLayers;
+import net.minecraft.client.renderer.PlayerSkinRenderCache;
+import net.minecraft.client.renderer.SubmitNodeCollector;
+import net.minecraft.client.renderer.entity.ArmorModelSet;
+import net.minecraft.client.renderer.entity.EntityRendererProvider;
+import net.minecraft.client.renderer.entity.HumanoidMobRenderer;
+import net.minecraft.client.renderer.entity.layers.HumanoidArmorLayer;
+import net.minecraft.client.renderer.entity.layers.RenderLayer;
+import net.minecraft.client.renderer.rendertype.RenderType;
+import net.minecraft.client.renderer.state.level.CameraRenderState;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.util.FormattedCharSequence;
+import net.minecraft.util.Mth;
+import net.minecraft.world.entity.player.PlayerModelType;
+import net.minecraft.world.item.component.ResolvableProfile;
+
+import java.util.List;
+
+/**
+ * Draws the companion at the same height as a player (the {@code 0.9375} body scale the avatar
+ * renderer uses), with the classic or slim model resolved from the skin, armor + held tool layered
+ * on top, a floating stream of word bubbles, and the downed crawl (Mojang's swim pose, which
+ * only the player renderer flattens — we replicate that transform here).
+ *
+ * <p>Slim/classic is a per-frame toggle inside {@link CompanionHumanoidModel}, never a model swap:
+ * {@code AgeableMobRenderer.submit()} resets {@code this.model} to the adult model before every draw,
+ * which silently discarded swapped models.</p>
+ */
+public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, CompanionRenderState, HumanoidModel<CompanionRenderState>> {
+    private static final float AVATAR_SCALE = 0.9375f;   // matches AvatarRenderer so the companion is player-height
+    private static final float SUBTITLE_SCALE = 0.025f;
+
+    private final PlayerSkinRenderCache skinCache;
+    private String lastDiag = "";               // body-model diagnostic transition guard
+    private boolean genderLayerTried;           // Wildfire layer is attached lazily on the first draw
+
+    public CompanionRenderer(EntityRendererProvider.Context ctx) {
+        super(ctx, new CompanionHumanoidModel(), 0.5f);
+        this.skinCache = ctx.getPlayerSkinRenderCache();
+        ArmorModelSet<HumanoidModel<CompanionRenderState>> wideArmor =
+                ArmorModelSet.bake(ModelLayers.PLAYER_ARMOR, ctx.getModelSet(), HumanoidModel::new);
+        ArmorModelSet<HumanoidModel<CompanionRenderState>> slimArmor =
+                ArmorModelSet.bake(ModelLayers.PLAYER_SLIM_ARMOR, ctx.getModelSet(), HumanoidModel::new);
+        // Both armor layers are registered, but only the one matching the current body model submits,
+        // so slim arms get slim armor sleeves instead of wide sleeves clipping through.
+        addLayer(new SelectableArmorLayer(this, wideArmor, ctx, false));
+        addLayer(new SelectableArmorLayer(this, slimArmor, ctx, true));
+        addLayer(new FeminineChestLayer(this));
+    }
+
+    /**
+     * Attaches Wildfire's real chest layer on the first draw instead of in the constructor, so the mod's
+     * client services (render-state key, player config cache) are guaranteed to be initialised.
+     */
+    private void attachGenderLayer() {
+        if (genderLayerTried) return;
+        genderLayerTried = true;
+        // Wildfire's 5.x GenderLayer is generic over HumanoidRenderState, so it fits this renderer.
+        RenderLayer<CompanionRenderState, HumanoidModel<CompanionRenderState>> gender =
+                FemaleGenderCompat.createLayer(this);
+        if (gender != null) addLayer(gender);
+    }
+
+    /** Armor layer that only submits when the companion's body model matches its geometry (wide vs slim arms). */
+    private static final class SelectableArmorLayer extends HumanoidArmorLayer<
+            CompanionRenderState, HumanoidModel<CompanionRenderState>, HumanoidModel<CompanionRenderState>> {
+        private final boolean slim;
+
+        private SelectableArmorLayer(CompanionRenderer parent,
+                                     ArmorModelSet<HumanoidModel<CompanionRenderState>> models,
+                                     EntityRendererProvider.Context ctx, boolean slim) {
+            super(parent, models, ctx.getEquipmentRenderer());
+            this.slim = slim;
+        }
+
+        @Override
+        public void submit(PoseStack poseStack, SubmitNodeCollector collector, int light,
+                           CompanionRenderState state, float limbSwing, float limbSwingAmount) {
+            if (state.slim == slim) super.submit(poseStack, collector, light, state, limbSwing, limbSwingAmount);
+        }
+    }
+
+    @Override
+    public CompanionRenderState createRenderState() { return new CompanionRenderState(); }
+
+    @Override
+    public Identifier getTextureLocation(CompanionRenderState state) { return state.texture; }
+
+    @Override
+    protected RenderType getRenderType(CompanionRenderState state, boolean visible, boolean visibleToSpectator, boolean glowing) {
+        if (state.renderType != null) return state.renderType;
+        return super.getRenderType(state, visible, visibleToSpectator, glowing);
+    }
+
+    @Override
+    public void extractRenderState(CompanionEntity entity, CompanionRenderState state, float partialTick) {
+        super.extractRenderState(entity, state, partialTick);
+        state.isPassenger = entity.isSitting();
+        state.feminine = entity.isFeminine();
+        state.skin = entity.skin();
+        state.speech = entity.speech();
+        state.speechId = entity.speechId();
+        state.speechStart = CompanionSubtitles.startFor(entity.getId(), state.speechId, state.speech);
+        state.entityId = entity.getId();
+        state.speechSpeaker = entity.getName().getString();
+        state.injured = entity.isInjured();
+        state.reviveProgress = entity.reviveProgress();
+        state.injuredLeft = entity.injuredLeftTicks();
+        resolveSkin(state, entity.skin());
+        // Wildfire's layer reads its data from the render state. The mod only fills it for players,
+        // so we build it from the owner's config; false means the fallback overlay should draw instead.
+        state.wildfireChest = FemaleGenderCompat.populateRenderState(state, entity, entity.getOwnerUuid(), partialTick);
+    }
+
+    private void resolveSkin(CompanionRenderState state, String name) {
+        // 1) Resolve the skin texture. "owner" goes through the local player's RESOLVED profile:
+        //    synchronous, and it picks up Quick Skin local skins with the real model type. A raw name
+        //    resolves asynchronously and shows Steve (wide) until it completes, which is what made
+        //    slim auto-detection unreliable.
+        if (name == null || name.isBlank() || "default".equalsIgnoreCase(name)) {
+            applyInfo(state, null);
+        } else if ("owner".equalsIgnoreCase(name) && Minecraft.getInstance().player != null) {
+            applyInfo(state, skinCache.getOrDefault(ResolvableProfile.createResolved(
+                    Minecraft.getInstance().player.getGameProfile())));
+        } else {
+            applyInfo(state, skinCache.getOrDefault(ResolvableProfile.createUnresolved(name)));
+        }
+        // 2) Body model: explicit slim/classic config wins; "auto" follows the resolved skin (Alex = slim).
+        String body = ClientVoice.config().companionBody;
+        if ("slim".equals(body)) state.slim = true;
+        else if ("classic".equals(body)) state.slim = false;
+        else state.slim = state.slimSkin;
+        // 3) Diagnostic: announce the resolved body model in chat whenever it changes, so it is visible
+        //    immediately whether slim/classic/auto actually applied (and what the skin resolved to).
+        String diag = "Companion body: " + (state.slim ? "SLIM" : "CLASSIC")
+                + "  [config=" + (body == null ? "auto" : body)
+                + ", skin=" + (name == null || name.isBlank() || "default".equalsIgnoreCase(name) ? "bundled" : name)
+                + ", skinModel=" + (state.slimSkin ? "slim" : "classic") + "]";
+        if (!diag.equals(lastDiag)) {
+            lastDiag = diag;
+            ClientVoice.status(diag);
+        }
+    }
+
+    private static void applyInfo(CompanionRenderState state, PlayerSkinRenderCache.RenderInfo info) {
+        if (info == null) {
+            state.texture = CompanionRenderState.DEFAULT;
+            state.renderType = null;
+            state.slimSkin = false;
+        } else {
+            state.renderType = info.renderType();
+            state.texture = info.playerSkin().body().texturePath();
+            state.slimSkin = info.playerSkin().model() == PlayerModelType.SLIM;
+        }
+    }
+
+    /** Lays the companion flat while it is crawling (downed), exactly like AvatarRenderer does for swimming players. */
+    @Override
+    protected void setupRotations(CompanionRenderState state, PoseStack poseStack, float age, float yHeadRot) {
+        super.setupRotations(state, poseStack, age, yHeadRot);
+        float swim = state.swimAmount;
+        if (swim > 0.001f) {
+            poseStack.mulPose(Axis.XP.rotationDegrees(Mth.lerp(swim, 0f, -90f)));
+            if (state.isVisuallySwimming) poseStack.translate(0.0f, -1.0f, 0.3f);
+        }
+    }
+
+    @Override
+    public void submit(CompanionRenderState state, PoseStack poseStack, SubmitNodeCollector collector, CameraRenderState camera) {
+        attachGenderLayer();
+        super.submit(state, poseStack, collector, camera);
+        if (state.injured) submitInjured(state, poseStack, collector, camera);
+        else submitSubtitle(state, poseStack, collector, camera);
+    }
+
+    @Override
+    protected void scale(CompanionRenderState state, PoseStack poseStack) {
+        poseStack.scale(AVATAR_SCALE, AVATAR_SCALE, AVATAR_SCALE);     // match player height
+        if (state.isPassenger) poseStack.translate(0.0f, 0.5f, 0.0f); // sit pose offset (already scaled)
+    }
+
+    /** Name tag only while the player is aiming at the companion. */
+    @Override
+    protected boolean shouldShowName(CompanionEntity entity, double distance) {
+        return this.entityRenderDispatcher.crosshairPickEntity == entity;
+    }
+
+    // ------------------------------------------------------------------ floating subtitle (each word its own bubble)
+
+    private void submitSubtitle(CompanionRenderState state, PoseStack poseStack,
+                                SubmitNodeCollector collector, CameraRenderState camera) {
+        if (state.speech == null || state.speech.isBlank()) return;
+        Font font = this.getFont();
+        List<CompanionSubtitles.Word> words = CompanionSubtitles.layout(
+                state.entityId, state.speechId, state.speech);
+        if (words.isEmpty()) return;
+
+        poseStack.pushPose();
+        poseStack.translate(0.0, state.boundingBoxHeight + 0.45f, 0.0);   // just above the head, not floating mid-air
+        poseStack.mulPose(camera.orientation);
+        poseStack.scale(SUBTITLE_SCALE, -SUBTITLE_SCALE, SUBTITLE_SCALE);
+
+        for (CompanionSubtitles.Word w : words) {
+            FormattedCharSequence seq = font.split(Component.literal(w.text()), 220).get(0);
+            float wordW = font.width(seq);
+            float s = w.scale();
+            int a = (w.argb() >>> 24) & 0xFF;
+            int bubble = (Math.min(255, a * 200 / 255) << 24) | 0x14181E;   // each word gets its own bubble
+            poseStack.pushPose();
+            poseStack.translate(w.x(), -w.y(), 0.0);                       // positive lift = upward
+            if (Math.abs(w.rotDeg()) > 0.01f) poseStack.mulPose(Axis.ZP.rotationDegrees(w.rotDeg()));
+            poseStack.scale(s, s, 1.0f);
+            collector.submitText(poseStack, -wordW / 2.0f, 0.0f, seq, false,
+                    Font.DisplayMode.SEE_THROUGH, state.lightCoords, w.argb(), bubble, 0);
+            poseStack.popPose();
+        }
+        poseStack.popPose();
+    }
+
+    /** Downed state: red countdown + revive progress (depth-tested so they can't be seen through walls). */
+    private void submitInjured(CompanionRenderState state, PoseStack poseStack, SubmitNodeCollector collector, CameraRenderState camera) {
+        if (state.injuredLeft <= 0) return;
+        int seconds = (state.injuredLeft + 19) / 20;
+        FormattedCharSequence seq = getFont().split(Component.literal("REVIVE ME  " + seconds + "s"), 220).get(0);
+        int color = seconds <= 10 ? 0xFFFF4444 : 0xFFFF8888;
+        renderBillboardText(poseStack, collector, camera, state, seq,
+                state.boundingBoxHeight + 0.35f, false, color, 0x33000000, seconds <= 10 ? 0xFFFF0000 : 0xFF880000);
+        if (state.reviveProgress > 0.01f) {
+            FormattedCharSequence rev = getFont().split(
+                    Component.literal("Reviving... " + Math.round(state.reviveProgress * 100) + "%"), 220).get(0);
+            renderBillboardText(poseStack, collector, camera, state, rev,
+                    state.boundingBoxHeight + 0.05f, false, 0xFF7CFC7C, 0x33000000, 0xFF2E8B2E);
+        }
+    }
+
+    private void renderBillboardText(PoseStack poseStack, SubmitNodeCollector collector, CameraRenderState camera,
+                                     CompanionRenderState state, FormattedCharSequence line,
+                                     float worldY, boolean seeThrough, int color, int background, int outline) {
+        poseStack.pushPose();
+        poseStack.translate(0.0, worldY, 0.0);
+        poseStack.mulPose(camera.orientation);
+        poseStack.scale(SUBTITLE_SCALE, -SUBTITLE_SCALE, SUBTITLE_SCALE);
+        Font.DisplayMode mode = seeThrough ? Font.DisplayMode.SEE_THROUGH : Font.DisplayMode.NORMAL;
+        float width = this.getFont().width(line);
+        collector.submitText(poseStack, -width / 2.0f, 0.0f, line, false, mode,
+                state.lightCoords, color, background, outline);
+        poseStack.popPose();
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionRenderState.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.CompanionMod;
+import net.minecraft.client.renderer.entity.state.HumanoidRenderState;
+import net.minecraft.client.renderer.rendertype.RenderType;
+import net.minecraft.resources.Identifier;
+
+/**
+ * Extra render data carried from the entity to the renderer (skin + optional feminine/slim model +
+ * injury state + subtitle). The resolved texture/render-type lives here, not in the renderer,
+ * because 26.1 extracts every entity before submitting any of them — a field on the renderer would be
+ * shared between companions.
+ */
+public class CompanionRenderState extends HumanoidRenderState {
+    public static final Identifier DEFAULT = CompanionMod.id("textures/entity/companion.png");
+
+    public String skin = "";
+    public boolean feminine;
+    public boolean slim;
+    public boolean slimSkin;             // auto-detected from the resolved skin (Alex model)
+    public Identifier texture = DEFAULT;
+    public RenderType renderType;         // null = use the model texture (bundled skin), non-null = live player skin
+    public boolean wildfireChest;         // true = Wildfire's own layer supplies the chest, skip the fallback overlay
+
+    /** Current floating line and the local animation clock (milliseconds). */
+    public String speech = "";
+    public String speechSpeaker = "";
+    public int speechId;
+    public long speechStart;
+
+    /** Downed state + synced revive progress / timer for the world HUD. */
+    public int entityId;
+    public boolean injured;
+    public float reviveProgress;
+    public int injuredLeft;
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionSettingsScreen.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.voice.VoiceConfig;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.AbstractSliderButton;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.CycleButton;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.network.chat.CommonComponents;
+import net.minecraft.network.chat.Component;
+
+import java.nio.file.Path;
+import java.util.function.Consumer;
+
+/**
+ * Vanilla-style options screen: centred title, two columns of 150x20 buttons ("Name: Value" cycle buttons and sliders),
+ * separator lines, one 200px Done button. Changes apply live and are saved when the screen closes (Done or Esc), like vanilla options.
+ * Fields used on VoiceConfig: feminineModel, memoryEnabled, speechVolume, speakReplies, dynamicGoals,
+ * autonomyEnabled, autonomyIntervalSeconds, companionBody, companionName, companionSkin.
+ */
+public class CompanionSettingsScreen extends Screen {
+    private static final int COL_W = 150, GAP = 8;
+
+    private final VoiceConfig config;
+    private final Path configFile;
+    private final Screen parent;
+    private final boolean initialFeminine;
+    private boolean feminine;
+
+    public CompanionSettingsScreen(VoiceConfig config, Path configFile) { this(config, configFile, null); }
+
+    public CompanionSettingsScreen(VoiceConfig config, Path configFile, Screen parent) {
+        super(Component.literal("Companion Settings"));
+        this.config = config;
+        this.configFile = configFile;
+        this.parent = parent;
+        this.initialFeminine = config.feminineModel;
+        this.feminine = initialFeminine;
+    }
+
+    @Override
+    protected void init() {
+        int cx = this.width / 2;
+        int lx = cx - COL_W - GAP / 2, rx = cx + GAP / 2;
+        int top = 42, rows = 6;
+        int pitch = Math.max(22, Math.min(24, (this.height - 36 - top - 4) / rows));
+        int y = top;
+
+        nav(lx, y, "Personalize Companion...", () -> new CompanionProfileScreen(config, configFile, this));
+        nav(rx, y, "Appearance & Skins...", () -> new CompanionSkinScreen(config, configFile));
+        y += pitch;
+
+        nav(lx, y, "AI Connection...", () -> new CompanionConnectionScreen(config, configFile, this));
+        toggle(rx, y, "Dynamic Goals", config.dynamicGoals, v -> config.dynamicGoals = v);
+        y += pitch;
+
+        toggle(lx, y, "Feminine Model", feminine, v -> feminine = v);
+        // 26.1-CHECK: CycleButton.builder signature
+        this.addRenderableWidget(CycleButton.<String>builder(CompanionSettingsScreen::bodyName, config.companionBody == null ? "auto" : config.companionBody)
+                .withValues("auto", "slim", "classic")
+                .create(rx, y, COL_W, 20, Component.literal("Body Type"), (b, v) -> {
+                    config.companionBody = v;
+                    ClientVoice.status("Body type: " + bodyName(v).getString());   // live confirmation in chat
+                }));
+        y += pitch;
+
+        toggle(lx, y, "Memory", config.memoryEnabled, v -> config.memoryEnabled = v);
+        toggle(rx, y, "Spoken Replies", config.speakReplies, v -> config.speakReplies = v);
+        y += pitch;
+
+        toggle(lx, y, "Autonomy", config.autonomyEnabled, v -> config.autonomyEnabled = v);
+        this.addRenderableWidget(new Slider(rx, y, COL_W, "Think Every", 15, 180, config.autonomyIntervalSeconds, "s",
+                v -> config.autonomyIntervalSeconds = Math.round(v)));
+        y += pitch;
+
+        this.addRenderableWidget(new Slider(lx, y, COL_W * 2 + GAP, "Reply Volume", 0, 100, config.speechVolume * 100f, "%",
+                v -> config.speechVolume = Math.max(0f, Math.min(1f, v / 100f))));
+
+        this.addRenderableWidget(Button.builder(CommonComponents.GUI_DONE, b -> onClose())
+                .pos(cx - 100, this.height - 27).size(200, 20).build());
+    }
+
+    private static Component bodyName(String v) {
+        return Component.literal(switch (v) { case "slim" -> "Slim"; case "classic" -> "Classic"; default -> "Auto (skin)"; });
+    }
+
+    private void nav(int x, int y, String label, java.util.function.Supplier<Screen> target) {
+        this.addRenderableWidget(Button.builder(Component.literal(label), b -> {
+            if (this.minecraft != null) this.minecraft.setScreen(target.get());
+        }).pos(x, y).size(COL_W, 20).build());
+    }
+
+    private void toggle(int x, int y, String name, boolean value, Consumer<Boolean> apply) {
+        this.addRenderableWidget(CycleButton.onOffBuilder(value)
+                .create(x, y, COL_W, 20, Component.literal(name), (b, v) -> apply.accept(v)));
+    }
+
+    /** Vanilla-looking slider with a "Name: value" label. */
+    private static final class Slider extends AbstractSliderButton {
+        private final String label, unit;
+        private final float min, max;
+        private final Consumer<Float> apply;
+
+        Slider(int x, int y, int w, String label, float min, float max, float cur, String unit, Consumer<Float> apply) {
+            super(x, y, w, 20, Component.empty(), max > min ? Math.max(0, Math.min(1, (cur - min) / (max - min))) : 0);
+            this.label = label; this.unit = unit; this.min = min; this.max = max; this.apply = apply;
+            updateMessage();
+        }
+
+        private float val() { return min + (float) this.value * (max - min); }
+
+        @Override protected void updateMessage() {
+            if (label == null) return;                       // super() calls this before our fields exist
+            setMessage(Component.literal(label + ": " + Math.round(val()) + unit));
+        }
+
+        @Override protected void applyValue() { apply.accept(val()); }
+    }
+
+    @Override
+    public void onClose() {
+        if (this.minecraft != null) this.minecraft.setScreen(parent);
+    }
+
+    /** Runs on Done, Esc and when a sub-screen opens: persist and push changes to the server. */
+    @Override
+    public void removed() {
+        config.feminineModel = feminine;
+        config.speechVolume = Math.max(0f, Math.min(1f, config.speechVolume));
+        config.save(configFile);
+        ClientVoice.send("set_name", "", config.companionName);
+        if (config.companionSkin != null && !config.companionSkin.isBlank()) ClientVoice.send("set_skin", "", config.companionSkin);
+        if (feminine != initialFeminine) ClientVoice.send(feminine ? "feminine" : "masculine", "", "");
+    }
+
+    @Override
+    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        this.extractMenuBackground(g);
+        super.extractRenderState(g, mouseX, mouseY, partialTick);
+        int cx = this.width / 2;
+        g.centeredText(this.font, this.title, cx, 10, 0xFFFFFFFF);
+        g.centeredText(this.font, "V = talk   R = wheel   O = settings", cx, 22, 0xFFA0A0A0);
+        g.fill(0, 32, this.width, 33, 0xFF000000);                       // header separator
+        g.fill(0, 33, this.width, 34, 0xFF373737);
+        g.fill(0, this.height - 33, this.width, this.height - 32, 0xFF000000);      // footer separator
+        g.fill(0, this.height - 32, this.width, this.height - 31, 0xFF373737);
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionSkinScreen.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.voice.VoiceConfig;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.network.chat.Component;
+
+import java.nio.file.Path;
+
+/**
+ * Skin library: type any Minecraft player name and the companion wears that skin.
+ * The renderer downloads/caches it through the vanilla SkinManager, so it also works with
+ * skins from NameMC-style player names.
+ *
+ * <p>Body type and the feminine model live only in {@link CompanionSettingsScreen}; this screen used to
+ * duplicate them, which produced two places to edit the same value.</p>
+ */
+public final class CompanionSkinScreen extends Screen {
+    private final VoiceConfig config;
+    private final Path configFile;
+    private EditBox nameField;
+
+    public CompanionSkinScreen(VoiceConfig config, Path configFile) {
+        super(Component.literal("Companion Skin Library"));
+        this.config = config;
+        this.configFile = configFile;
+    }
+
+    @Override
+    protected void init() {
+        int cx = this.width / 2;
+        int y = this.height / 2 - 60;
+
+        this.nameField = new EditBox(this.font, cx - 110, y, 220, 20, Component.literal("Player name"));
+        this.nameField.setValue(config.companionSkin == null ? "" : config.companionSkin);
+        this.nameField.setHint(Component.literal("Minecraft player name (e.g. Notch)"));
+        this.addRenderableWidget(this.nameField);
+        y += 30;
+
+        this.addRenderableWidget(Button.builder(Component.literal("Use my skin"), b -> {
+            // "owner" resolves synchronously from the local player (and picks up Quick Skin local skins
+            // plus the real slim/classic model); a raw name resolves asynchronously via Mojang and
+            // falls back to Steve meanwhile, which is exactly what made slim detection unreliable.
+            nameField.setValue("owner");
+        }).pos(cx - 110, y).size(105, 20).build());
+
+        this.addRenderableWidget(Button.builder(Component.literal("Apply"), b -> apply()).pos(cx + 5, y).size(105, 20).build());
+        y += 26;
+
+        this.addRenderableWidget(Button.builder(Component.literal("Back"), b -> {
+            if (this.minecraft != null) this.minecraft.setScreen(new CompanionRadialScreen());
+        }).pos(cx - 110, y).size(220, 20).build());
+    }
+
+    private void apply() {
+        String name = nameField.getValue() == null ? "" : nameField.getValue().trim();
+        config.companionSkin = name;
+        config.save(configFile);
+        if (!name.isBlank()) ClientVoice.send("set_skin", "", name);
+        if (this.minecraft != null) this.minecraft.setScreen(null);
+    }
+
+    @Override
+    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        this.extractMenuBackground(g);
+        super.extractRenderState(g, mouseX, mouseY, partialTick);
+        int cx = this.width / 2;
+        g.centeredText(this.font, "Companion Skin Library", cx, 30, 0xFFFFFFFF);
+        g.centeredText(this.font, "The companion downloads the skin once and caches it.", cx, 44, 0xFF9AA6B2);
+        g.centeredText(this.font, "Tip: type \"owner\" to copy your own skin automatically.", cx, 56, 0xFF9AA6B2);
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionSubtitles.java
+
+```java
+package com.example.companionmod.client;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Audio-clocked, independent word bubbles with a playful feel. Every word is revealed at the same anchor
+ * above the speaker and then floats up on its own, but each word gets its own personality: a random size,
+ * a slight tilt, sideways drift (left or right), and a pastel color of its own. Words pop in from tiny to
+ * full size with a little overshoot bounce. The audio clock arrives in coarse chunks, so it is smoothed
+ * exponentially every rendered frame to keep the motion fluid at screen refresh rate.
+ */
+final class CompanionSubtitles {
+    /** {@code y} is the upward lift in local pixels (the renderer translates by {@code -y}). */
+    record Word(String text, float x, float y, float scale, float rotDeg, int argb) {}
+
+    private static final long LIFE_MS = 1500;
+    private static final long POP_MS = 260;
+    private static final float RISE_PX = 64f;
+    private static final long FADE_MS = 450;
+    /** Extra smoothing factor: how much of the audio-clock's coarse jump we accept per rendered frame. */
+    private static final float CLOCK_EASE = 0.45f;
+
+    /** Pastel bubbles: one color per word, cycling. */
+    private static final int[] PALETTE = {
+            0xFFC9DBFF,   // sky blue
+            0xFFFFC2E0,   // pink
+            0xFFFFE3B3,   // amber
+            0xFFC9F5C8,   // mint
+            0xFFE5C8FF,   // lavender
+            0xFFFFBFBD,   // rose
+            0xFFBFF2F4,   // cyan
+            0xFFF6F3B8,   // lemon
+    };
+
+    private static final class Anim {
+        final int id;
+        final String text;
+        String[] words;
+        float[] reveal;
+        float[] sizeMul;     // playful: some words big, some small
+        float[] rotDeg;      // per-word tilt
+        float[] driftX;      // sideways drift over the lifetime
+        float[] liftMul;     // vertical pace variance
+        float[] phase;       // wobble phase (rotation over time)
+        Anim(int id, String text) { this.id = id; this.text = text; }
+    }
+
+    private static final Map<Integer, Anim> ANIMS = new ConcurrentHashMap<>();
+    private static String clockText = "";
+    private static long durationMs, startedAt, finishedAt;
+    private static float progress;
+    private static boolean fallback;
+    private static long smoothedMs;      // per-frame eased view of the (chunky) audio clock
+
+    private CompanionSubtitles() {}
+
+    static synchronized void audioStarted(String text, long duration) {
+        if (text == null || text.isBlank()) return;
+        clockText = text;
+        durationMs = Math.max(1, duration);
+        startedAt = System.currentTimeMillis();
+        finishedAt = 0;
+        progress = 0;
+        fallback = false;
+        smoothedMs = 0;
+    }
+
+    static synchronized void audioProgress(String text, float value) {
+        if (text != null && text.equals(clockText)) progress = Math.max(0, Math.min(1, value));
+    }
+
+    static synchronized void audioStopped(String text) {
+        if (text == null || !text.equals(clockText)) return;
+        progress = 1;
+        finishedAt = System.currentTimeMillis();
+    }
+
+    static synchronized void fallback(String text) {
+        if (text == null || text.isBlank()) return;
+        clockText = text;
+        durationMs = estimateDuration(text);
+        startedAt = System.currentTimeMillis();
+        finishedAt = 0;
+        progress = 0;
+        fallback = true;
+        smoothedMs = 0;
+    }
+
+    /** Text arrival no longer starts an animation; audioStarted/fallback does. */
+    static long startFor(int entityId, int speechId, String text) { return 0L; }
+
+    static List<Word> layout(int entityId, int speechId, String text) {
+        if (text == null || text.isBlank()) {
+            ANIMS.remove(entityId);
+            return List.of();
+        }
+        long raw = elapsed(text);
+        if (raw < 0) {                        // no audio clock for this line on this client (not the owner,
+            fallback(text);                   // or TTS off): reveal on a timed estimate so bubbles still show
+            raw = elapsed(text);
+        }
+        long elapsed = smoothClock(raw);      // coarse audio ticks -> fluid motion between frames
+        Anim a = ANIMS.computeIfAbsent(entityId, ignored -> new Anim(speechId, text));
+        if (a.id != speechId || !a.text.equals(text)) {
+            a = new Anim(speechId, text);
+            ANIMS.put(entityId, a);
+        }
+        if (a.words == null) build(entityId, a);
+
+        List<Word> out = new ArrayList<>(a.words.length);
+        for (int i = 0; i < a.words.length; i++) {
+            long age = elapsed - (long) (a.reveal[i] * durationMs);
+            if (age < 0) break;
+            if (age >= LIFE_MS) continue;
+            float life = age / (float) LIFE_MS;
+            float travel = (age / (float) POP_MS) * 1.6f;
+            travel = Math.min(1, travel);
+            float walk = (1 - (1 - travel) * (1 - travel));                 // eased rise/drift fraction
+            float lift = RISE_PX * a.liftMul[i] * walk;
+            float pop = Math.min(1, age / (float) POP_MS);
+            float scale = (0.2f + 0.8f * popIn(pop)) * a.sizeMul[i];        // small -> big with a bounce
+            scale = Math.max(0.16f, scale);
+            float wobble = (float) Math.sin(age * 0.0045 + a.phase[i]) * 1.6f;
+            float fade = age > LIFE_MS - FADE_MS
+                    ? 1 - (age - (LIFE_MS - FADE_MS)) / (float) FADE_MS : 1;
+            float alpha = Math.min(1, age / 70f) * fade;
+            float flash = Math.max(0, 1 - age / 150f);                      // bright right at the pop
+            int argb = blend(((int) (alpha * 255) << 24) | (PALETTE[i % PALETTE.length] & 0xFFFFFF), flash);
+            float rot = a.rotDeg[i] + wobble;
+            out.add(new Word(a.words[i], a.driftX[i] * walk, lift, scale, rot, argb));
+        }
+        return out;
+    }
+
+    /** easeOutBack: starts tiny, shoots past full size and settles - the playful pop. */
+    private static float popIn(float p) {
+        float c = 1.70158f, c3 = c + 1;
+        float q = p - 1;
+        return 1 + c3 * q * q * q + c * q * q;
+    }
+
+    /** Pushes the base color toward white during the first moments of a word. */
+    private static int blend(int base, float flash) {
+        if (flash <= 0) return base;
+        int r = (base >> 16) & 0xFF, g = (base >> 8) & 0xFF, b = base & 0xFF;
+        r += (int) ((255 - r) * flash);
+        g += (int) ((255 - g) * flash);
+        b += (int) ((255 - b) * flash);
+        return (base & 0xFF000000) | (r << 16) | (g << 8) | b;
+    }
+
+    static synchronized void clear() {
+        ANIMS.clear();
+        clockText = "";
+        finishedAt = 0;
+        smoothedMs = 0;
+    }
+
+    private static synchronized long elapsed(String text) {
+        if (text == null || !text.equals(clockText) || clockText.isBlank()) return -1;
+        long now = System.currentTimeMillis();
+        if (finishedAt != 0) return durationMs + now - finishedAt;
+        if (fallback) return Math.min(durationMs, now - startedAt);
+        return (long) (progress * durationMs);
+    }
+
+    /** Exponential approach to the raw audio clock; snaps on any backward jump (new line / rewind). */
+    private static synchronized long smoothClock(long target) {
+        if (target < smoothedMs) {
+            smoothedMs = target;
+        } else {
+            smoothedMs = Math.round(smoothedMs + (target - smoothedMs) * CLOCK_EASE);
+        }
+        return smoothedMs;
+    }
+
+    private static long estimateDuration(String text) {
+        long total = 250;
+        for (String word : text.trim().split("\\s+")) total += weight(word) * 28;
+        return Math.max(800, total);
+    }
+
+    private static float weight(String word) {
+        float value = Math.max(2, word.length());
+        if (word.matches(".*[.!?]$")) value += 5;
+        else if (word.matches(".*[,;:]$")) value += 2.5f;
+        return value;
+    }
+
+    /** Splits the line into words, spreads reveal times across the duration and rolls per-word personality. */
+    private static void build(int entityId, Anim a) {
+        Random rng = new Random(a.id * 88172645463325252L + entityId + 1);
+        String[] words = a.text.trim().split("\\s+");
+        int n = words.length;
+        a.words = words;
+        a.reveal = new float[n];
+        a.sizeMul = new float[n];
+        a.rotDeg = new float[n];
+        a.driftX = new float[n];
+        a.liftMul = new float[n];
+        a.phase = new float[n];
+        float totalWeight = 0;
+        for (String word : words) totalWeight += weight(word);
+        float at = 0;
+        for (int i = 0; i < n; i++) {
+            a.reveal[i] = totalWeight == 0 ? 0 : at / totalWeight;
+            at += weight(words[i]);
+            float kind = rng.nextFloat();                 // short words get to be bouncy and big more often
+            a.sizeMul[i] = words[i].length() <= 3 && kind < 0.55f
+                    ? 1.15f + rng.nextFloat() * 0.5f      // 1.15 - 1.65
+                    : 0.75f + rng.nextFloat() * 0.5f;     // 0.75 - 1.25
+            a.rotDeg[i] = (rng.nextBoolean() ? 1 : -1) * (2.5f + rng.nextFloat() * 9.5f);  // 2.5..x tilt
+            a.driftX[i] = (rng.nextBoolean() ? 1 : -1) * (7f + rng.nextFloat() * 16f);     // sideways drift
+            a.liftMul[i] = 0.72f + rng.nextFloat() * 0.4f;
+            a.phase[i] = rng.nextFloat() * 6.283f;
+        }
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionWorldContext.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.entity.CompanionEntity;
+import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.animal.Animal;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.monster.Monster;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.state.BlockState;
+
+import java.util.Locale;
+
+/** A bounded, real client-world observation snapshot for the language model. */
+final class CompanionWorldContext {
+    private CompanionWorldContext() {}
+
+    static String build(Minecraft mc, CompanionEntity companion) {
+        if (mc.player == null || mc.level == null) return "World unavailable.";
+        StringBuilder out = new StringBuilder(5000);
+        out.append("LIVE MINECRAFT OBSERVATIONS (not suggestions or memories).\n");
+        out.append("Dimension=").append(mc.level.dimension())
+                .append(" dayTime=").append(mc.level.getOverworldClockTime() % 24000)
+                .append(" night=").append(mc.level.isDarkOutside())
+                .append(" raining=").append(mc.level.isRaining()).append('\n');
+        out.append("Owner name=").append(mc.player.getName().getString())
+                .append(" pos=").append(pos(mc.player.blockPosition()))
+                .append(" health=").append(Math.round(mc.player.getHealth()))
+                .append('/').append(Math.round(mc.player.getMaxHealth()))
+                .append(" hunger=").append(mc.player.getFoodData().getFoodLevel())
+                .append(" held=").append(item(mc.player.getMainHandItem())).append('\n');
+        if (companion == null) {
+            out.append("No owned companion is currently loaded.\n");
+            return out.toString();
+        }
+        out.append("Companion name=").append(companion.getName().getString())
+                .append(" pos=").append(pos(companion.blockPosition()))
+                .append(" health=").append(Math.round(companion.getHealth()))
+                .append('/').append(Math.round(companion.getMaxHealth()))
+                .append(" moveMode=").append(companion.moveMode())
+                .append(" stance=").append(companion.stance())
+                .append(" injured=").append(companion.isInjured())
+                .append(" sitting=").append(companion.isSitting())
+                .append(" light=").append(mc.level.getMaxLocalRawBrightness(companion.blockPosition()))
+                .append(" held=").append(item(companion.getMainHandItem())).append('\n');
+        out.append("Current tasks: mine=").append(companion.seekBlock())
+                .append(" pickupRequested=").append(companion.isPickupRequested())
+                .append(" pickupEnabled=").append(companion.isPickupEnabled())
+                .append(" farmUntil=").append(companion.farmUntil())
+                .append(" fishUntil=").append(companion.fishUntil())
+                .append(" build=").append(companion.buildSchematic())
+                .append(" gameTime=").append(mc.level.getGameTime()).append('\n');
+
+        out.append("Companion inventory:\n");
+        for (int i = 0; i < companion.storage().getContainerSize(); i++) {
+            ItemStack stack = companion.storage().getItem(i);
+            if (!stack.isEmpty()) out.append(" slot ").append(i).append(' ').append(item(stack)).append('\n');
+        }
+
+        out.append("Nearby entities (absolute positions):\n");
+        int entityCount = 0;
+        for (Entity entity : mc.level.getEntitiesOfClass(Entity.class,
+                companion.getBoundingBox().inflate(24), e -> e != companion && e != mc.player)) {
+            if (++entityCount > 28) break;
+            String category = entity instanceof Monster ? "hostile"
+                    : entity instanceof Animal ? "animal"
+                    : entity instanceof ItemEntity ? "drop" : "other";
+            out.append(' ').append(category).append(' ')
+                    .append(EntityType.getKey(entity.getType()))
+                    .append(" pos=").append(pos(entity.blockPosition()));
+            if (entity instanceof ItemEntity drop) out.append(" item=").append(item(drop.getItem()));
+            out.append('\n');
+        }
+        if (entityCount == 0) out.append(" none within 24 blocks\n");
+
+        out.append("Useful nearby blocks (absolute positions):\n");
+        int blockCount = 0;
+        BlockPos centre = companion.blockPosition();
+        for (BlockPos p : BlockPos.betweenClosed(centre.offset(-16, -7, -16), centre.offset(16, 7, 16))) {
+            BlockState state = mc.level.getBlockState(p);
+            String id = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+            if (!interesting(id)) continue;
+            out.append(' ').append(id).append(" pos=").append(pos(p)).append('\n');
+            if (++blockCount >= 36) {
+                out.append(" block list truncated; explore or move for more observations\n");
+                break;
+            }
+        }
+        if (blockCount == 0) out.append(" none detected in the 33x15x33 scan\n");
+        out.append("Use only observed IDs and supported plan operations. Never invent items, blocks, entities or capabilities.\n");
+        return out.toString();
+    }
+
+    private static boolean interesting(String id) {
+        String path = id.toLowerCase(Locale.ROOT);
+        return path.contains("_ore") || path.endsWith("_log") || path.endsWith("_wood")
+                || path.contains("leaves") || path.contains("farmland")
+                || path.equals("minecraft:wheat") || path.equals("minecraft:carrots")
+                || path.equals("minecraft:potatoes") || path.equals("minecraft:beetroots")
+                || path.equals("minecraft:water") || path.equals("minecraft:lava")
+                || path.contains("chest") || path.contains("furnace")
+                || path.equals("minecraft:crafting_table");
+    }
+
+    private static String item(ItemStack stack) {
+        return stack.isEmpty() ? "empty" : BuiltInRegistries.ITEM.getKey(stack.getItem()) + " x" + stack.getCount();
+    }
+
+    private static String pos(BlockPos p) {
+        return p.getX() + "," + p.getY() + "," + p.getZ();
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\FeminineChestLayer.java
+
+```java
+package com.example.companionmod.client;
+
+import com.mojang.blaze3d.vertex.PoseStack;
+import net.minecraft.client.model.HumanoidModel;
+import net.minecraft.client.model.geom.ModelPart;
+import net.minecraft.client.model.geom.PartPose;
+import net.minecraft.client.model.geom.builders.CubeDeformation;
+import net.minecraft.client.model.geom.builders.CubeListBuilder;
+import net.minecraft.client.model.geom.builders.MeshDefinition;
+import net.minecraft.client.renderer.SubmitNodeCollector;
+import net.minecraft.client.renderer.entity.RenderLayerParent;
+import net.minecraft.client.renderer.entity.layers.RenderLayer;
+import net.minecraft.client.renderer.rendertype.RenderType;
+import net.minecraft.client.renderer.rendertype.RenderTypes;
+import net.minecraft.client.renderer.texture.OverlayTexture;
+
+/**
+ * Fallback chest overlay on the vanilla player model, used when Wildfire's Female Gender Mod is not
+ * driving the chest. With the mod installed and the owner configured as female, the mod's own
+ * {@code GenderLayer} is attached instead and this layer stays hidden.
+ *
+ * <p>Model space (26.1 player model): the body part pivot sits at the shoulders, the torso cube spans
+ * local y 0..12 (shoulders to waist) and z -2..+2, front = -z. Cups are baked around their own centres.</p>
+ */
+public class FeminineChestLayer extends RenderLayer<CompanionRenderState, HumanoidModel<CompanionRenderState>> {
+    private static final float CUP_GAP = 0.2f;      // inner-edge distance from the centre line
+    private final ModelPart cupL, cupR;
+
+    public FeminineChestLayer(RenderLayerParent<CompanionRenderState, HumanoidModel<CompanionRenderState>> parent) {
+        super(parent);
+        this.cupL = bake(-2.05f);
+        this.cupR = bake(2.05f);
+    }
+
+    /** One cup centred on {@code centreX} (body-local). */
+    private static ModelPart bake(float centreX) {
+        MeshDefinition mesh = new MeshDefinition();
+        CubeListBuilder box = CubeListBuilder.create()
+                .texOffs(20, 20).addBox(-1.65f, -1.7f, -0.55f, 3.3f, 3.4f, 1.1f, new CubeDeformation(0.15f));
+        mesh.getRoot().addOrReplaceChild("cup", box, PartPose.offset(centreX, 3.3f, -2.55f));
+        return mesh.getRoot().bake(64, 64);
+    }
+
+    @Override
+    public void submit(PoseStack poseStack, SubmitNodeCollector collector, int light, CompanionRenderState state,
+                       float limbSwing, float limbSwingAmount) {
+        if (!state.feminine || state.isInvisible || state.wildfireChest) return;
+        RenderType type = state.renderType != null ? state.renderType : RenderTypes.entityCutout(state.texture);
+        poseStack.pushPose();
+        getParentModel().body.translateAndRotate(poseStack);
+        poseStack.pushPose();
+        poseStack.translate(-CUP_GAP, 0, 0);
+        collector.submitModelPart(cupL, poseStack, type, light, OverlayTexture.NO_OVERLAY, null);
+        poseStack.popPose();
+        poseStack.pushPose();
+        poseStack.translate(CUP_GAP, 0, 0);
+        collector.submitModelPart(cupR, poseStack, type, light, OverlayTexture.NO_OVERLAY, null);
+        poseStack.popPose();
+        poseStack.popPose();
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\PcmStreamSound.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.CompanionMod;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.resources.sounds.AbstractSoundInstance;
+import net.minecraft.client.resources.sounds.Sound;
+import net.minecraft.client.resources.sounds.SoundInstance;
+import net.minecraft.client.sounds.AudioStream;
+import net.minecraft.client.sounds.SoundBufferLibrary;
+import net.minecraft.client.sounds.SoundEngine;
+import net.minecraft.client.sounds.SoundManager;
+import net.minecraft.client.sounds.WeighedSoundEvents;
+import net.minecraft.resources.Identifier;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.util.valueproviders.ConstantFloat;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.sound.sampled.AudioFormat;
+import java.io.IOException;
+import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
+
+/**
+ * Plays decoded TTS PCM through Minecraft's own sound engine (OpenAL) instead of a raw Java
+ * {@code SourceDataLine}. Because the audio runs on real engine channels, it obeys the game's audio
+ * sliders, automatically pauses with the game (Esc), and mods like Sound Physics Remastered can add
+ * their room echo/reverb to the companion's voice like any other in-world sound.
+ *
+ * <p>The instance claims an invented sound event id and resolves it by handing back a single synthetic
+ * {@link Sound} marked {@code stream=true}. NeoForge's patched {@link SoundInstance} interface declares
+ * {@code getStream(SoundBufferLibrary, Sound, boolean)}; when that hook is present (NeoForge runtime) the
+ * engine calls it and we feed the pre-decoded 16-bit little-endian PCM straight from memory. On a vanilla
+ * runtime the hook is absent (detected by reflection), so the caller falls back to the {@code SourceDataLine}
+ * path instead. Playback is relative and un-attenuated so the voice is always audible at the player, while
+ * still flowing through an engine channel that mods can process.</p>
+ */
+public class PcmStreamSound extends AbstractSoundInstance {
+    private static final Logger LOGGER = LoggerFactory.getLogger("CompanionMod/Tts");
+    private static final Identifier EVENT_ID = CompanionMod.id("spoken_voice");
+
+    /** True on runtimes whose sound engine streams per-instance PCM (NeoForge's SoundInstance patch). */
+    private static final boolean ENGINE_STREAM_HOOK = probeStreamHook();
+
+    /** Bridges engine-side playback events back to SpeechPlayer (called from engine threads). */
+    public interface Listener {
+        void onProgress(float progress);                       // 0..1 through the PCM data
+        void onLevel(byte[] data, int offset, int length);     // raw chunk for the loudness meter
+        void onStop();                                         // exactly once, whatever the exit path
+    }
+
+    private final byte[] pcm;                                  // 16-bit LE interleaved frames
+    private final int sampleRate, channels;
+    private final BooleanSupplier stopFlag;
+    private final Listener listen;
+    private final AtomicBoolean reported = new AtomicBoolean();
+    private final AtomicBoolean stopSent = new AtomicBoolean();
+    private final CompletableFuture<Void> done = new CompletableFuture<>();
+    private volatile boolean reading;                          // engine has consumed at least one chunk
+    private int consumed;
+
+    private PcmStreamSound(byte[] pcm, int sampleRate, int channels, float volume,
+                           BooleanSupplier stopFlag, Listener listen) {
+        super(EVENT_ID, SoundSource.VOICE, SoundInstance.createUnseededRandom());
+        this.pcm = pcm;
+        this.sampleRate = Math.max(4000, sampleRate);
+        this.channels = Math.max(1, Math.min(2, channels));
+        this.stopFlag = stopFlag;
+        this.listen = listen;
+        this.volume = Math.max(0.01f, Math.min(1f, volume));   // engine multiplies instance volume; keep Sound at 1.0
+        this.pitch = 1.0f;
+        this.relative = true;                                  // voice follows the listener; always audible
+        this.attenuation = SoundInstance.Attenuation.NONE;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player != null) {                               // anchor at the player so SPR hears an in-room source
+            this.x = mc.player.getX();
+            this.y = mc.player.getY();
+            this.z = mc.player.getZ();
+        }
+        this.sound = new Sound(EVENT_ID, ConstantFloat.of(1.0f), ConstantFloat.of(1.0f), 1,
+                Sound.Type.FILE, true /* stream */, false /* preload */, 16);
+    }
+
+    private static boolean probeStreamHook() {
+        try {
+            Method m = SoundInstance.class.getMethod("getStream", SoundBufferLibrary.class, Sound.class, boolean.class);
+            return m != null;
+        } catch (Throwable t) {
+            return false;                                      // vanilla runtime: engine streams by file location only
+        }
+    }
+
+    /** Whether this runtime can stream PCM through the engine at all. */
+    public static boolean engineStreamingSupported() { return ENGINE_STREAM_HOOK; }
+
+    /**
+     * Tries the engine; returns false (nothing played, caller should fall back) if the runtime lacks the
+     * hook, the engine wouldn't start, or the engine never actually reads the stream. Blocks the calling
+     * thread until the line finishes, is stopped, or times out.
+     */
+    public static boolean play(byte[] pcm, int sampleRate, int channels, float volume, long durationMs,
+                               BooleanSupplier stopFlag, Listener listen) {
+        if (!ENGINE_STREAM_HOOK) return false;
+        Minecraft mc = Minecraft.getInstance();
+        SoundManager manager = mc == null ? null : mc.getSoundManager();
+        if (manager == null) return false;
+        PcmStreamSound instance = new PcmStreamSound(pcm, sampleRate, channels, volume, stopFlag, listen);
+        SoundEngine.PlayResult result;
+        try {
+            result = manager.play(instance);
+        } catch (Throwable t) {
+            LOGGER.debug("Engine playback rejected TTS: {}", t.toString());
+            return false;
+        }
+        if (result != SoundEngine.PlayResult.STARTED) {
+            LOGGER.debug("Engine playback NOT started ({})", result);
+            return false;
+        }
+        // Watchdog: if the engine never consumes a single chunk (bad device, unsupported format, vanilla
+        // runtime without the hook), give up quickly so the caller can fall back to the SourceDataLine path.
+        long noDataDeadline = System.currentTimeMillis() + 2500;
+        while (!instance.reading && !instance.done.isDone() && System.currentTimeMillis() < noDataDeadline) {
+            if (stopFlag.getAsBoolean()) { instance.requestEngineStop(); return false; }
+            try {
+                instance.done.get(100, TimeUnit.MILLISECONDS);
+            } catch (Exception ignored) { }
+        }
+        if (!instance.reading) {
+            instance.requestEngineStop();
+            instance.reportStop();
+            return false;
+        }
+        long deadline = System.currentTimeMillis() + durationMs + 8000;
+        while (!instance.done.isDone() && System.currentTimeMillis() < deadline) {
+            try {
+                instance.done.get(100, TimeUnit.MILLISECONDS);
+            } catch (Exception ignored) { }
+            if (stopFlag.getAsBoolean()) instance.requestEngineStop();
+        }
+        instance.reportStop();                                 // idempotent: subtitle clock finishes either way
+        return true;                                           // started and handled; no fallback replay
+    }
+
+    @Override
+    public WeighedSoundEvents resolve(SoundManager manager) {
+        // The engine needs a resolved event before it will play; provide our synthetic single sound.
+        WeighedSoundEvents event = new WeighedSoundEvents(getIdentifier(), null);
+        event.addSound(this.sound);
+        return event;
+    }
+
+    // No @Override: the method only exists on NeoForge's patched SoundInstance. It compiles against the
+    // vanilla interface as a plain method and is dispatched virtually at runtime on NeoForge.
+    @SuppressWarnings("unused")
+    public CompletableFuture<AudioStream> getStream(SoundBufferLibrary buffers, Sound sound, boolean looping) {
+        return CompletableFuture.completedFuture(new MemoryAudioStream());
+    }
+
+    /** Reads the held PCM in engine-sized chunks, reporting progress and loudness as it goes. */
+    private class MemoryAudioStream implements AudioStream {
+        private final AudioFormat format = new AudioFormat(sampleRate, 16, channels, true, false);
+
+        @Override
+        public AudioFormat getFormat() { return format; }
+
+        @Override
+        public ByteBuffer read(int capacity) throws IOException {
+            reading = true;
+            if (stopFlag.getAsBoolean()) requestEngineStop();
+            if (consumed >= pcm.length) {
+                reportStop();                                  // engine stops the channel and closes the stream
+                return null;                                   // null = EOF, exactly what pumpBuffers checks for
+            }
+            int len = (int) Math.min(capacity <= 0 ? 4096 : capacity, (long) pcm.length - consumed);
+            int offset = consumed;
+            consumed += len;
+            try {
+                listen.onProgress(consumed / (float) pcm.length);
+                listen.onLevel(pcm, offset, len);
+            } catch (Throwable ignored) { }
+            // Direct buffer, like every vanilla stream: heap buffers crash alBufferData on some OpenAL builds.
+            ByteBuffer out = ByteBuffer.allocateDirect(len).order(ByteOrder.LITTLE_ENDIAN);
+            out.put(pcm, offset, len).flip();
+            return out;
+        }
+
+        @Override
+        public void close() { reportStop(); }
+    }
+
+    /** Asks the game thread to stop the channel; the engine then closes the stream -> reportStop(). */
+    private void requestEngineStop() {
+        if (stopSent.compareAndSet(false, true)) {
+            Minecraft mc = Minecraft.getInstance();
+            if (mc != null) mc.execute(() -> mc.getSoundManager().stop(this));
+        }
+    }
+
+    /** Exactly-once tail of playback: informs the subtitle clock and releases the blocking wait. */
+    private void reportStop() {
+        if (!reported.compareAndSet(false, true)) return;
+        try {
+            listen.onStop();
+        } catch (Throwable ignored) { }
+        done.complete(null);
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\VoiceHud.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.voice.PushToTalkController;
+import com.example.companionmod.voice.VoiceState;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.Font;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+
+/** Microphone panel + a small downed-companion revive panel. Only draws when relevant. */
+final class VoiceHud {
+    private static final int W = 184, H = 36, SEGS = 24, SEG_W = 5, SEG_GAP = 1;
+    private static float fade;                                           // 0..1, eased so the panel slides in and out
+    private static VoiceState lastState = VoiceState.IDLE;
+
+    private VoiceHud() {}
+
+    static void render(GuiGraphicsExtractor g, PushToTalkController c, CompanionEntity companion) {
+        Minecraft mc = Minecraft.getInstance();
+        Font font = mc.font;
+        if (c == null) { fade = 0f; lastState = VoiceState.IDLE; }         // left the world while the panel was showing
+        VoiceState state = c == null ? VoiceState.IDLE : c.state();
+        if (state != VoiceState.IDLE) lastState = state;
+        fade += ((state == VoiceState.IDLE ? 0f : 1f) - fade) * 0.25f;
+        boolean subtitleOn = System.currentTimeMillis() < ClientVoice.subtitleUntil;
+        boolean injured = companion != null && companion.isInjured();
+        boolean reviveHint = injured || (companion != null && companion.reviveProgress() > 0);
+        if (fade < 0.02f && !subtitleOn && !reviveHint) return;
+
+        int sw = mc.getWindow().getGuiScaledWidth(), sh = mc.getWindow().getGuiScaledHeight();
+        int x = (sw - W) / 2;
+
+        if (subtitleOn) {
+            String s = ClientVoice.subtitle;
+            text(g, font, s, (sw - font.width(s)) / 2, sh - 84 - H, argb(230, 255, 255, 255));
+        }
+        if (injured) renderInjured(g, font, sw, sh, companion);
+        if (c == null || fade < 0.02f) return;
+
+        int y = sh - 84;
+        int a = (int) (fade * 255);
+        int accent = switch (lastState) {
+            case LISTENING -> argb(a, 235, 70, 70);
+            case THINKING -> argb(a, 240, 200, 80);
+            default -> argb(a, 240, 240, 240);
+        };
+        long t = System.currentTimeMillis();
+
+        g.fill(x, y, x + W, y + H, argb((int) (fade * 196), 16, 16, 16));
+        g.fill(x, y, x + W, y + 1, accent);
+        g.fill(x, y + H - 1, x + W, y + H, argb((int) (fade * 200), 56, 56, 56));
+        g.fill(x, y, x + 1, y + H, argb((int) (fade * 200), 56, 56, 56));
+        g.fill(x + W - 1, y, x + W, y + H, argb((int) (fade * 200), 56, 56, 56));
+
+        // microphone icon, pulsing while recording
+        int ix = x + 10, iy = y + 9;
+        int pulse = lastState == VoiceState.LISTENING ? (int) (35 * (0.5 + 0.5 * Math.sin(t / 180.0))) : 0;
+        int ic = argb(a, 225 + Math.min(30, pulse), 225 - pulse, 225 - pulse);
+        g.fill(ix + 3, iy, ix + 7, iy + 8, ic);
+        g.fill(ix + 1, iy + 5, ix + 2, iy + 10, ic);
+        g.fill(ix + 8, iy + 5, ix + 9, iy + 10, ic);
+        g.fill(ix + 1, iy + 10, ix + 9, iy + 11, ic);
+        g.fill(ix + 4, iy + 11, ix + 6, iy + 14, ic);
+
+        String label = switch (lastState) {
+            case LISTENING -> String.format("Listening  %.1fs", c.listeningMillis() / 1000.0);
+            case THINKING -> "Thinking" + ".".repeat((int) (t / 300 % 4));
+            default -> "Speaking";
+        };
+        text(g, font, label, x + 28, y + 7, argb(a, 235, 235, 240));
+
+        float level = c == null ? 0f : c.level(), peak = c == null ? 0f : c.peak();
+        int bx = x + 28, by = y + 21;
+        int peakIdx = Math.min(SEGS - 1, (int) (peak * SEGS));
+        int scan = (int) (t / 70 % (SEGS + 6));                                       // "thinking" scanner position
+        for (int i = 0; i < SEGS; i++) {
+            int sx = bx + i * (SEG_W + SEG_GAP);
+            boolean lit;
+            if (lastState == VoiceState.THINKING) lit = Math.abs(i - (scan - 3)) <= 1;
+            else lit = (i + 0.5f) / SEGS <= level;
+            int col;
+            if (lastState == VoiceState.SPEAKING) col = argb(a, 235, 235, 235);
+            else if (lastState == VoiceState.THINKING) col = argb(a, 240, 200, 80);
+            else col = i < 14 ? argb(a, 80, 220, 120) : i < 20 ? argb(a, 240, 210, 80) : argb(a, 240, 80, 70);
+            g.fill(sx, by, sx + SEG_W, by + 9, lit ? col : argb((int) (fade * 40), 255, 255, 255));
+            if (lastState != VoiceState.THINKING && i == peakIdx && peak > level + 0.03f)
+                g.fill(sx, by, sx + SEG_W, by + 2, argb(a, 255, 255, 255));            // peak-hold tick
+        }
+    }
+
+    private static void renderInjured(GuiGraphicsExtractor g, Font font, int sw, int sh, CompanionEntity companion) {
+        int seconds = (companion.injuredLeftTicks() + 19) / 20;
+        String hint = companion.reviveProgress() > 0.02f
+                ? "Reviving... " + Math.round(companion.reviveProgress() * 100) + "%"
+                : "Your companion is down — hold LEFT CLICK on it to revive (" + seconds + "s)";
+        int w = font.width(hint);
+        int x = (sw - w) / 2, y = sh - 108;
+        g.fill(x - 8, y - 4, x + w + 8, y + 12, 0xC4101010);
+        g.fill(x - 8, y - 4, x + w + 8, y - 3, 0xFFC85A5A);
+        g.fill(x - 8, y + 11, x + w + 8, y + 12, 0xC8383838);
+        g.fill(x - 8, y - 4, x - 7, y + 12, 0xC8383838);
+        g.fill(x + w + 7, y - 4, x + w + 8, y + 12, 0xC8383838);
+        g.text(font, hint, x, y, 0xFFFFD0D0, true);
+    }
+
+    private static int argb(int a, int r, int gr, int b) {
+        return (Math.max(0, Math.min(255, a)) << 24) | (clamp(r) << 16) | (clamp(gr) << 8) | clamp(b);
+    }
+    private static int clamp(int v) { return Math.max(0, Math.min(255, v)); }
+
+    /** Single text call site. 26.1-CHECK: GuiGraphics.drawString became GuiGraphicsExtractor.text(...) in the 26.1 rendering rewrite. */
+    private static void text(GuiGraphicsExtractor g, Font font, String s, int x, int y, int color) {
+        g.text(font, s, x, y, color, true);
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\command\CompanionCommand.java
+
+```java
+package com.example.companionmod.command;
+
+import java.util.Locale;
+
+/** Everything the player can order the companion to do. Minecraft-free so the voice layer can use it. */
+public enum CompanionCommand {
+    NONE, FOLLOW, STAY, SIT, STAND, ATTACK, GUARD, DEFENSIVE, PASSIVE, COME, STOP, CONTINUE,
+    INVENTORY, MINE, BUILD, FARM, PATROL, HEAL, EQUIP, TRADE, LOOT, SCOUT,
+    WANDER, EXPLORE, DEFEND, RETREAT, WAIT, SNEAK, JUMP, DANCE, SLEEP, WAKE,
+    GIVE, TAKE, DROP, PICKUP, OPEN, CLOSE, CRAFT, SMELT, BREW, ENCHANT,
+    FISH, COOK, FIGHT, FLEE, HIDE, SEEK, FIND, SEARCH, TRACK, HUNT,
+    SEEK_BLOCK, SET_NAME, REVIVE, PLAN,
+    REMEMBER, FORGET, SET_SKIN, FEMININE, MASCULINE;
+
+    /** Lenient parser: accepts the enum name plus common synonyms the model might produce. */
+    public static CompanionCommand parse(String raw) {
+        if (raw == null) return NONE;
+        String s = raw.trim().toLowerCase(Locale.ROOT).replace('-', '_').replace(' ', '_');
+        switch (s) {
+            case "follow": case "follow_me": case "come_along": return FOLLOW;
+            case "stay": case "wait": case "hold": case "hold_position": case "stand_ground": return STAY;
+            case "sit": case "rest": case "sit_down": return SIT;
+            case "stand": case "stand_up": case "get_up": return STAND;
+            case "attack": case "kill": case "engage": return ATTACK;
+            case "guard": case "protect": case "aggressive": return GUARD;
+            case "defensive": case "defend": case "defend_me": case "protect_me": return DEFENSIVE;
+            case "passive": case "peaceful": case "dont_fight": case "stand_down": return PASSIVE;
+            case "come": case "come_here": case "teleport": case "here": return COME;
+            case "stop": case "cancel": case "cease": case "abort": case "halt":
+            case "nevermind": case "never_mind": case "stop_everything": case "stop_working":
+            case "stop_mining": case "cancel_task": case "cancel_plan": case "stop_attacking": return STOP;
+            case "continue": case "resume": case "keep_going": case "carry_on": case "unpause": return CONTINUE;
+            case "inventory": case "inv": case "items": case "bag": case "open_inventory": return INVENTORY;
+            case "mine": case "dig": case "break": case "harvest": return MINE;
+            case "build": case "construct": case "place": case "build_structure": return BUILD;
+            case "farm": case "farming": case "harvest_crops": return FARM;
+            case "patrol": case "scout": case "scouting": case "lookout": return PATROL;
+            case "heal": case "healing": case "rest_heal": return HEAL;
+            case "equip": case "equipment": case "gear": case "armor": return EQUIP;
+            case "trade": case "trading": case "barter": return TRADE;
+            case "loot": case "collect": case "gather": return LOOT;
+            case "explore": case "explore_area": return EXPLORE;
+            case "wander": case "wander_around": case "roam": return WANDER;
+            case "defense": return DEFEND;
+            case "retreat": case "run_away": case "escape": return RETREAT;
+            case "hold_on": case "pause": return WAIT;
+            case "sneak": case "sneaking": case "stealth": return SNEAK;
+            case "jump": case "jumping": case "leap": return JUMP;
+            case "dance": case "celebrate": case "party": return DANCE;
+            case "sleep": case "sleeping": case "rest_sleep": return SLEEP;
+            case "wake": case "wake_up": case "awake": return WAKE;
+            case "give": case "hand": case "hand_over": return GIVE;
+            case "take": case "grab": case "hold_item": return TAKE;
+            case "drop": case "drop_item": case "throw": return DROP;
+            case "pickup": case "pick_up": case "grab_item": return PICKUP;
+            case "open": case "open_door": case "open_chest": return OPEN;
+            case "close": case "close_door": case "close_chest": return CLOSE;
+            case "craft": case "crafting": case "make": return CRAFT;
+            case "smelt": case "smelting": return SMELT;
+            case "brew": case "brewing": case "potion": return BREW;
+            case "enchant": case "enchanting": case "enchant_item": return ENCHANT;
+            case "fish": case "fishing": case "catch_fish": return FISH;
+            case "cook": case "cooking": case "prepare_food": return COOK;
+            case "fight": case "fighting": case "combat": return FIGHT;
+            case "flee": case "fleeing": case "run": return FLEE;
+            case "hide": case "hiding": case "conceal": return HIDE;
+            case "seek": case "seeking": case "look_for": return SEEK;
+            case "find": case "finding": case "locate": return FIND;
+            case "search": case "searching": case "scan": return SEARCH;
+            case "seek_block": case "find_block": case "look_for_block": case "go_find": case "dig_for": return SEEK_BLOCK;
+            case "track": case "tracking": case "follow_track": return TRACK;
+            case "hunt": case "hunting": case "stalk": return HUNT;
+            case "remember": case "memorize": case "remember_that": return REMEMBER;
+            case "forget": case "forget_that": return FORGET;
+            case "set_name": case "rename": case "name": case "call_you": return SET_NAME;
+            case "set_skin": case "skin": case "change_skin": case "appearance": return SET_SKIN;
+            case "feminine": case "female": case "feminine_model": return FEMININE;
+            case "masculine": case "male": case "masculine_model": return MASCULINE;
+            case "revive": case "revive_me": case "rescue": case "help_me": return REVIVE;
+            case "plan": case "goal": case "autonomy": return PLAN;
+            default: return NONE;
+        }
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\CompanionMod.java
+
+```java
+package com.example.companionmod;
+
+import net.minecraft.resources.Identifier;
+
+public final class CompanionMod {
+    public static final String MOD_ID = "companionmod";
+    private CompanionMod() {}
+
+    public static Identifier id(String path) {
+        return Identifier.fromNamespaceAndPath(MOD_ID, path); // 26.1-CHECK: was ResourceLocation before 26.1
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\ai\CompanionBuildGoal.java
+
+```java
+package com.example.companionmod.entity.ai;
+
+import com.example.companionmod.entity.CompanionEntity;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.ai.goal.Goal;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.EnumSet;
+import java.util.List;
+
+/**
+ * "Build &lt;name&gt;": places a schematic from {@code config/companionmod/schematics/<name>.json} one block
+ * at a time, consuming matching items from the bag. Steps are relative to the anchor (where the order was
+ * given). When a needed block is not in the bag the companion waits at that spot and tells the player what
+ * it needs - refilling the bag resumes the build automatically, so a palette bigger than the bag just
+ * becomes a "fetch me more cobblestone" loop instead of a failure.
+ *
+ * <p>File format: {@code [{"x":0,"y":0,"z":0,"block":"minecraft:cobblestone"}, ...]} (a bare array, or an
+ * object with a "blocks" array). Already-correct blocks are skipped, so re-running continues where it left
+ * off after a crash or relog.</p>
+ */
+public class CompanionBuildGoal extends Goal {
+    private record Step(int dx, int dy, int dz, Block block) {}
+
+    private final CompanionEntity mob;
+    private final List<Step> steps = new ArrayList<>();
+    private BlockPos base;
+    private int index;
+    private int scanCooldown, speakCooldown;
+    private boolean loaded;
+
+    public CompanionBuildGoal(CompanionEntity mob) {
+        this.mob = mob;
+        setFlags(EnumSet.of(Flag.MOVE, Flag.LOOK));
+    }
+
+    @Override public boolean canUse() {
+        return !mob.buildSchematic().isBlank() && !mob.isSitting() && !mob.isInjured() && mob.getTarget() == null;
+    }
+
+    @Override public boolean canContinueToUse() { return canUse(); }
+
+    @Override
+    public void start() {
+        steps.clear();
+        index = 0;
+        base = mob.anchor().immutable();
+        loaded = false;
+        speakCooldown = 0;
+        scanCooldown = 0;
+        mob.speak("Starting the build.");
+    }
+
+    @Override
+    public void stop() {
+        mob.getNavigation().stop();
+    }
+
+    @Override
+    public void tick() {
+        if (!(mob.level() instanceof ServerLevel level)) return;
+        if (!loaded) {
+            if (!loadSchematic(level)) return;
+            loaded = true;
+            if (steps.isEmpty()) { mob.clearBuild(); return; }   // loadSchematic already explained why
+        }
+        while (index < steps.size()) {
+            Step s = steps.get(index);
+            BlockPos pos = base.offset(s.dx, s.dy, s.dz);
+            BlockState there = level.getBlockState(pos);
+            if (there.getBlock() == s.block() || !there.isAir()) { index++; continue; }   // done, or occupied: skip
+            if (pos.closerToCenterThan(mob.position(), 0.9)) { index++; continue; }  // never entomb ourselves
+            if (mob.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5) > 4.5 * 4.5) {
+                mob.getNavigation().moveTo(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5, 1.1);
+                return;
+            }
+            if (takeFromBag(s.block().asItem()).isEmpty()) {
+                // Out of material: hold position, tell the player (throttled), retry once the bag is refilled.
+                mob.getNavigation().stop();
+                if (--speakCooldown <= 0) {
+                    speakCooldown = 120;
+                    mob.speak("I need more " + s.block().getName().getString() + " to finish the build.");
+                }
+                return;
+            }
+            mob.getNavigation().stop();
+            mob.swing(InteractionHand.MAIN_HAND);
+            level.setBlock(pos, s.block().defaultBlockState(), 3);
+            index++;
+            if (mob.getRandom().nextInt(12) == 0) mob.speak("Building...");
+        }
+        mob.speak("Build finished!");
+        mob.clearBuild();
+    }
+
+    /** Reads the schematic file. Returns false when it does not exist (retried, throttled). */
+    private boolean loadSchematic(ServerLevel level) {
+        String name = mob.buildSchematic();
+        Path file = Path.of("config", "companionmod", "schematics", name + ".json");
+        if (!Files.isRegularFile(file)) {
+            if (--speakCooldown <= 0) {
+                speakCooldown = 120;
+                mob.speak("I cannot find a schematic called " + name
+                        + ". Put a JSON file in config/companionmod/schematics.");
+            }
+            return false;
+        }
+        try {
+            JsonElement el = JsonParser.parseString(Files.readString(file));
+            JsonArray arr = null;
+            if (el.isJsonArray()) arr = el.getAsJsonArray();
+            else if (el.isJsonObject() && el.getAsJsonObject().has("blocks")) arr = el.getAsJsonObject().getAsJsonArray("blocks");
+            if (arr == null) {
+                mob.speak("That schematic file has no blocks in it.");
+                return true;
+            }
+            for (JsonElement e : arr) {
+                if (!e.isJsonObject()) continue;
+                JsonObject o = e.getAsJsonObject();
+                int dx = o.has("x") ? o.get("x").getAsInt() : 0;
+                int dy = o.has("y") ? o.get("y").getAsInt() : 0;
+                int dz = o.has("z") ? o.get("z").getAsInt() : 0;
+                String id = o.has("block") ? o.get("block").getAsString() : "";
+                Identifier loc = Identifier.tryParse(id.startsWith("minecraft:") ? id : "minecraft:" + id);
+                Block b = loc == null ? null : BuiltInRegistries.BLOCK.getOptional(loc).orElse(null);
+                if (b == null || b == Blocks.AIR) continue;
+                steps.add(new Step(dx, dy, dz, b));
+            }
+            if (steps.isEmpty()) mob.speak("That schematic has no placeable blocks.");
+            return true;
+        } catch (IOException | RuntimeException ex) {
+            mob.speak("I could not read that schematic file.");
+            return true;
+        }
+    }
+
+    private ItemStack takeFromBag(net.minecraft.world.item.Item item) {
+        for (int i = CompanionEntity.MAIN_START; i < CompanionEntity.MAIN_START + CompanionEntity.MAIN_SIZE; i++) {
+            ItemStack s = mob.storage().getItem(i);
+            if (s.getItem() == item) {
+                mob.storage().removeItem(i, 1);
+                return s;
+            }
+        }
+        return ItemStack.EMPTY;
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\ai\CompanionFarmGoal.java
+
+```java
+package com.example.companionmod.entity.ai;
+
+import com.example.companionmod.entity.CompanionEntity;
+import net.minecraft.core.BlockPos;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.ai.goal.Goal;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.CropBlock;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.Vec3;
+
+import java.util.EnumSet;
+import java.util.Map;
+
+/**
+ * "Farm for a while": harvests mature crops near the anchor, sweeps the produce into the bag and replants
+ * from the bag when seeds are available. Time-boxed by {@code farmUntil} so it never runs forever, and it
+ * yields to combat and mining (they are higher-priority goals).
+ */
+public class CompanionFarmGoal extends Goal {
+    private static final int RADIUS = 14;
+
+    /** Crop block -> what replants it (wheat needs seeds, carrots replant with carrots...). */
+    private static final Map<Block, Item> SEEDS = Map.of(
+            Blocks.WHEAT, Items.WHEAT_SEEDS,
+            Blocks.CARROTS, Items.CARROT,
+            Blocks.POTATOES, Items.POTATO,
+            Blocks.BEETROOTS, Items.BEETROOT_SEEDS,
+            Blocks.NETHER_WART, Items.NETHER_WART);
+
+    private final CompanionEntity mob;
+    private BlockPos target;
+    private int scanCooldown, speakCooldown;
+    private boolean reportedDone;
+
+    public CompanionFarmGoal(CompanionEntity mob) {
+        this.mob = mob;
+        setFlags(EnumSet.of(Flag.MOVE, Flag.LOOK));
+    }
+
+    private boolean jobRunning() {
+        return mob.farmUntil() > mob.level().getGameTime();
+    }
+
+    @Override public boolean canUse() {
+        return jobRunning() && !mob.isSitting() && !mob.isInjured() && mob.getTarget() == null;
+    }
+
+    @Override public boolean canContinueToUse() { return canUse(); }
+
+    @Override
+    public void start() {
+        scanCooldown = 0;
+        speakCooldown = 0;
+        reportedDone = false;
+        target = null;
+    }
+
+    @Override
+    public void stop() {
+        mob.getNavigation().stop();
+        if (!reportedDone && !jobRunning()) {
+            reportedDone = true;
+            mob.speak("Done farming.");
+        }
+    }
+
+    @Override
+    public void tick() {
+        if (!(mob.level() instanceof ServerLevel level)) return;
+        if (target == null || !mature(level, target)) {
+            if (--scanCooldown > 0) return;
+            scanCooldown = 20;
+            target = findCrop(level);
+            if (target == null) {
+                if (--speakCooldown <= 0) {
+                    speakCooldown = 100;
+                    mob.speak("No ripe crops around here.");
+                }
+                return;
+            }
+        }
+        if (mob.distanceToSqr(Vec3.atCenterOf(target)) > 4.5 * 4.5) {
+            mob.getNavigation().moveTo(target.getX() + 0.5, target.getY(), target.getZ() + 0.5, 1.1);
+            return;
+        }
+        mob.getNavigation().stop();
+        mob.getLookControl().setLookAt(target.getX() + 0.5, target.getY() + 0.5, target.getZ() + 0.5, 30f, mob.getMaxHeadXRot());
+        BlockState state = level.getBlockState(target);
+        BlockPos pos = target;
+        target = null;
+        if (!(state.getBlock() instanceof CropBlock)) return;
+        mob.swing(InteractionHand.MAIN_HAND);
+        level.destroyBlock(pos, true, mob, 512);
+        mob.collectNearbyItems();
+        replant(level, pos, state);
+        if (--speakCooldown <= 0) {
+            speakCooldown = 60;
+            mob.speak(new String[]{"Harvesting crops.", "These fields are looking good.", "Nice and ripe."}[mob.getRandom().nextInt(3)]);
+        }
+    }
+
+    private boolean mature(ServerLevel level, BlockPos p) {
+        BlockState s = level.getBlockState(p);
+        return s.getBlock() instanceof CropBlock c && c.isMaxAge(s);
+    }
+
+    private BlockPos findCrop(ServerLevel level) {
+        BlockPos centre = mob.anchor();
+        BlockPos best = null;
+        double bestD = Double.MAX_VALUE;
+        for (BlockPos p : BlockPos.betweenClosed(centre.offset(-RADIUS, -3, -RADIUS), centre.offset(RADIUS, 3, RADIUS))) {
+            if (!mature(level, p)) continue;
+            double d = mob.distanceToSqr(p.getX() + 0.5, p.getY(), p.getZ() + 0.5);
+            if (d < bestD) { bestD = d; best = p.immutable(); }
+        }
+        return best;
+    }
+
+    /** Replants a just-harvested crop when the matching seed is in the bag. */
+    private void replant(ServerLevel level, BlockPos pos, BlockState oldState) {
+        Item seed = SEEDS.get(oldState.getBlock());
+        if (seed == null) return;
+        for (int i = CompanionEntity.MAIN_START; i < CompanionEntity.MAIN_START + CompanionEntity.MAIN_SIZE; i++) {
+            if (mob.storage().getItem(i).getItem() == seed) {
+                mob.storage().removeItem(i, 1);
+                level.setBlock(pos, oldState.getBlock().defaultBlockState(), 3);
+                return;
+            }
+        }
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\ai\CompanionFishGoal.java
+
+```java
+package com.example.companionmod.entity.ai;
+
+import com.example.companionmod.entity.CompanionEntity;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.tags.FluidTags;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.ai.goal.Goal;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.material.FluidState;
+
+import java.util.EnumSet;
+
+/**
+ * "Go fishing": walks to the nearest water edge, casts, waits, retrieves and stores the catch.
+ * Time-boxed by {@code fishUntil}. There is no real bobber entity - cast/retrieve are sounds plus timing,
+ * which keeps it deterministic and multiplayer-safe.
+ */
+public class CompanionFishGoal extends Goal {
+    private static final int CAST_TICKS = 30, MIN_WAIT = 50, MAX_WAIT = 140;
+
+    private final CompanionEntity mob;
+    private BlockPos standAt, waterAt;
+    private int phase;          // 0 idle, 1 cast, 2 waiting for a bite, 3 retrieve
+    private int phaseTicks, scanCooldown, speakCooldown;
+
+    public CompanionFishGoal(CompanionEntity mob) {
+        this.mob = mob;
+        setFlags(EnumSet.of(Flag.MOVE, Flag.LOOK));
+    }
+
+    private boolean jobRunning() {
+        return mob.fishUntil() > mob.level().getGameTime();
+    }
+
+    @Override public boolean canUse() {
+        return jobRunning() && !mob.isSitting() && !mob.isInjured() && mob.getTarget() == null;
+    }
+
+    @Override public boolean canContinueToUse() { return canUse(); }
+
+    @Override
+    public void start() {
+        phase = 0;
+        phaseTicks = 20;
+        standAt = waterAt = null;
+        scanCooldown = 0;
+        speakCooldown = 0;
+    }
+
+    @Override
+    public void stop() {
+        mob.getNavigation().stop();
+        if (!jobRunning()) mob.speak("Done fishing.");
+    }
+
+    @Override
+    public void tick() {
+        if (!(mob.level() instanceof ServerLevel level)) return;
+        if (waterAt == null || level.getFluidState(waterAt).isEmpty()) {
+            if (--scanCooldown > 0) return;
+            scanCooldown = 40;
+            waterAt = findWater(level);
+            if (waterAt == null) {
+                if (--speakCooldown <= 0) {
+                    speakCooldown = 120;
+                    mob.speak("I need to be near water to fish.");
+                }
+                return;
+            }
+            standAt = findStand(level, waterAt);
+            if (standAt == null) { waterAt = null; return; }
+        }
+        if (mob.distanceToSqr(standAt.getX() + 0.5, standAt.getY(), standAt.getZ() + 0.5) > 2.5 * 2.5) {
+            mob.getNavigation().moveTo(standAt.getX() + 0.5, standAt.getY(), standAt.getZ() + 0.5, 1.1);
+            return;
+        }
+        mob.getNavigation().stop();
+        mob.getLookControl().setLookAt(waterAt.getX() + 0.5, waterAt.getY() + 0.5, waterAt.getZ() + 0.5, 30f, mob.getMaxHeadXRot());
+
+        if (--phaseTicks > 0) return;
+        switch (phase) {
+            case 0 -> {                                   // idle between casts
+                phase = 1;
+                phaseTicks = CAST_TICKS;
+                mob.swing(InteractionHand.MAIN_HAND);
+                mob.playSound(SoundEvents.FISHING_BOBBER_THROW, 1.0f, 1.0f);
+            }
+            case 1 -> {                                   // bobber is out there
+                phase = 2;
+                phaseTicks = MIN_WAIT + mob.getRandom().nextInt(MAX_WAIT - MIN_WAIT);
+            }
+            case 2 -> {                                   // bite!
+                phase = 3;
+                phaseTicks = 1;
+            }
+            default -> {                                  // retrieve + catch
+                phase = 0;
+                phaseTicks = 25 + mob.getRandom().nextInt(20);
+                mob.playSound(SoundEvents.FISHING_BOBBER_RETRIEVE, 1.0f, 1.0f);
+                catchSomething(level);
+            }
+        }
+    }
+
+    /** A standing cell next to surface water: air here and above, solid floor, water beside. */
+    private BlockPos findWater(ServerLevel level) {
+        BlockPos centre = mob.anchor();
+        BlockPos best = null;
+        double bestD = Double.MAX_VALUE;
+        for (BlockPos s : BlockPos.betweenClosed(centre.offset(-16, -4, -16), centre.offset(16, 4, 16))) {
+            if (!level.getBlockState(s).isAir() || !level.getBlockState(s.above()).isAir()) continue;
+            if (!level.getBlockState(s.below()).isFaceSturdy(level, s.below(), Direction.UP)) continue;
+            if (!nextToSurfaceWater(level, s)) continue;
+            double d = mob.distanceToSqr(s.getX() + 0.5, s.getY(), s.getZ() + 0.5);
+            if (d < bestD) { bestD = d; best = s.immutable(); }
+        }
+        return best;
+    }
+
+    private boolean nextToSurfaceWater(ServerLevel level, BlockPos s) {
+        for (Direction d : Direction.values()) {
+            if (!d.getAxis().isHorizontal()) continue;
+            BlockPos w = s.relative(d);
+            FluidState f = level.getFluidState(w);
+            if (!f.isEmpty() && f.typeHolder().is(FluidTags.WATER) && level.getFluidState(w.above()).isEmpty()) {
+                waterAt = w.immutable();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private BlockPos findStand(ServerLevel level, BlockPos water) {
+        for (Direction d : Direction.values()) {
+            if (!d.getAxis().isHorizontal()) continue;
+            BlockPos s = water.relative(d);
+            if (level.getBlockState(s).isAir() && level.getBlockState(s.above()).isAir()
+                    && level.getBlockState(s.below()).isFaceSturdy(level, s.below(), Direction.UP)) {
+                return s.immutable();
+            }
+        }
+        return null;
+    }
+
+    private void catchSomething(ServerLevel level) {
+        ItemStack caught;
+        String what;
+        float r = mob.getRandom().nextFloat();
+        if (r < 0.06) { caught = new ItemStack(Items.NAME_TAG); what = "a name tag"; }
+        else if (r < 0.10) { caught = new ItemStack(Items.SADDLE); what = "a saddle"; }
+        else if (r < 0.13) { caught = new ItemStack(Items.BOWL); what = "an old bowl"; }
+        else if (r < 0.48) { caught = new ItemStack(Items.COD); what = "a cod"; }
+        else if (r < 0.78) { caught = new ItemStack(Items.SALMON); what = "a salmon"; }
+        else if (r < 0.92) { caught = new ItemStack(Items.TROPICAL_FISH); what = "a tropical fish"; }
+        else { caught = new ItemStack(Items.PUFFERFISH); what = "a pufferfish"; }
+        mob.storeItem(new ItemEntity(level, mob.getX(), mob.getY() + 0.5, mob.getZ(), caught));
+        if (--speakCooldown <= 0) {
+            speakCooldown = 40;
+            String[] lines = {"Caught " + what + "!", "Nice - " + what + "!", "The fish are biting!", "Got " + what + "."};
+            mob.speak(lines[mob.getRandom().nextInt(lines.length)]);
+        }
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\ai\CompanionFollowGoal.java
+
+```java
+package com.example.companionmod.entity.ai;
+
+import com.example.companionmod.entity.CompanionEntity;
+import net.minecraft.world.entity.ai.goal.Goal;
+import net.minecraft.world.entity.player.Player;
+
+import java.util.EnumSet;
+
+/** Walk to the owner when farther than startDist, stop at stopDist, sprint when far. Never teleports: only an explicit "come" order does. */
+public class CompanionFollowGoal extends Goal {
+    private final CompanionEntity mob;
+    private final double speed, startSq, stopSq;
+    private Player owner;
+    private int recalc, stuck;
+
+    public CompanionFollowGoal(CompanionEntity mob, double speed, double startDist, double stopDist, double teleportDist) {
+        this.mob = mob;
+        this.speed = speed;
+        this.startSq = startDist * startDist;
+        this.stopSq = stopDist * stopDist;   // teleportDist kept for callers; teleporting on follow is disabled
+        setFlags(EnumSet.of(Flag.MOVE, Flag.LOOK));
+    }
+
+    @Override
+    public boolean canUse() {
+        if (mob.isInjured() || mob.moveMode() != CompanionEntity.MoveMode.FOLLOW) return false;
+        Player o = mob.getOwner();
+        if (o == null || o.isSpectator() || o.level() != mob.level()) return false; // cross-dimension follow: phase 2
+        owner = o;
+        return mob.distanceToSqr(o) >= startSq;
+    }
+
+    @Override
+    public boolean canContinueToUse() {
+        return !mob.isInjured() && mob.moveMode() == CompanionEntity.MoveMode.FOLLOW && owner != null && owner.isAlive()
+                && owner.level() == mob.level() && mob.distanceToSqr(owner) > stopSq;
+    }
+
+    @Override public void start() { recalc = 0; stuck = 0; }
+    @Override public void stop() { mob.getNavigation().stop(); owner = null; }
+
+    @Override
+    public void tick() {
+        mob.getLookControl().setLookAt(owner, 10.0f, mob.getMaxHeadXRot());
+        if (--recalc > 0) return;
+        recalc = adjustedTickDelay(5);              // repath more often; it keeps walking, never warps
+        double d = mob.distanceToSqr(owner);
+        mob.getNavigation().moveTo(owner, d > 144 ? speed * 1.35 : speed);
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\ai\CompanionPatrolGoal.java
+
+```java
+package com.example.companionmod.entity.ai;
+
+import com.example.companionmod.entity.CompanionEntity;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.entity.ai.goal.Goal;
+import net.minecraft.world.level.levelgen.Heightmap;
+
+import java.util.EnumSet;
+
+/** Walks a ring of waypoints around the anchor while in PATROL mode. */
+public class CompanionPatrolGoal extends Goal {
+    private final CompanionEntity mob;
+    private int cooldown;
+
+    public CompanionPatrolGoal(CompanionEntity mob) {
+        this.mob = mob;
+        setFlags(EnumSet.of(Flag.MOVE, Flag.LOOK));
+    }
+
+    @Override
+    public boolean canUse() {
+        return mob.moveMode() == CompanionEntity.MoveMode.PATROL && !mob.isSitting() && !mob.isInjured();
+    }
+
+    @Override
+    public boolean canContinueToUse() {
+        return canUse();
+    }
+
+    @Override
+    public void start() {
+        mob.setPatrolIndex(0);
+        cooldown = 0;
+    }
+
+    @Override
+    public void stop() {
+        mob.getNavigation().stop();
+    }
+
+    @Override
+    public void tick() {
+        if (--cooldown > 0) return;
+        cooldown = 10;
+        BlockPos anchor = mob.anchor();
+        int index = mob.patrolIndex();
+        double angle = index * Math.PI / 4.0;
+        int x = anchor.getX() + (int) Math.round(Math.cos(angle) * 9.0);
+        int z = anchor.getZ() + (int) Math.round(Math.sin(angle) * 9.0);
+        int y = mob.level().getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+        boolean moved = mob.getNavigation().moveTo(x + 0.5, y, z + 0.5, 1.0);
+        if (!moved || mob.getNavigation().isDone()) {
+            mob.setPatrolIndex((index + 1) % 8);
+        } else if (mob.distanceToSqr(x + 0.5, y, z + 0.5) < 6.0) {
+            mob.setPatrolIndex((index + 1) % 8);
+        }
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\ai\CompanionPickupGoal.java
+
+```java
+package com.example.companionmod.entity.ai;
+
+import com.example.companionmod.entity.CompanionEntity;
+import net.minecraft.world.entity.ai.goal.Goal;
+import net.minecraft.world.entity.item.ItemEntity;
+
+import java.util.EnumSet;
+import java.util.List;
+
+/**
+ * Walks to dropped items and stores them in the companion inventory.
+ *
+ * <p>An explicit "pick up this bone" order sets a filter and {@code pickupRequested}. The goal then
+ * targets that exact item and walks to it — it never opens the inventory screen. With the general
+ * pickup toggle on, it hoovers up every nearby drop instead.</p>
+ */
+public class CompanionPickupGoal extends Goal {
+    private final CompanionEntity mob;
+    private ItemEntity item;
+    private int cooldown;
+    private boolean storedAny;
+
+    public CompanionPickupGoal(CompanionEntity mob) {
+        this.mob = mob;
+        setFlags(EnumSet.of(Flag.MOVE, Flag.LOOK));
+    }
+
+    @Override
+    public boolean canUse() {
+        if (mob.isInjured() || mob.isSitting()) return false;
+        if (!mob.isPickupEnabled() && !mob.isPickupRequested()) return false;
+        if (--cooldown > 0) return false;
+        cooldown = 10;
+        item = nearestItem();
+        return item != null;
+    }
+
+    @Override
+    public boolean canContinueToUse() {
+        if (mob.isInjured() || mob.isSitting()) return false;
+        if (!mob.isPickupEnabled() && !mob.isPickupRequested()) return false;
+        if (item == null || !item.isAlive() || item.getItem().isEmpty()) {
+            item = nearestItem();
+        }
+        return item != null;
+    }
+
+    @Override
+    public void start() {
+        storedAny = false;
+        if (item != null) mob.getNavigation().moveTo(item, 1.15);
+    }
+
+    @Override
+    public void stop() {
+        mob.getNavigation().stop();
+        item = null;
+        if (mob.isPickupRequested()) mob.finishPickup(storedAny);
+    }
+
+    @Override
+    public void tick() {
+        if (item == null || !item.isAlive() || item.getItem().isEmpty()) {
+            item = nearestItem();
+            if (item == null) return;
+            mob.getNavigation().moveTo(item, 1.15);
+            return;
+        }
+
+        double distSq = mob.distanceToSqr(item);
+        if (distSq <= 4.0) {
+            boolean stored = mob.storeItem(item);
+            if (stored) {
+                storedAny = true;
+                mob.collectNearbyItems();          // grab the rest of the same drop pile
+            } else {
+                mob.speak("My bag is full.");
+                mob.finishPickup(true);
+                item = null;
+                return;
+            }
+            item = null;
+            if (mob.isPickupRequested() && nearestItem() == null) mob.finishPickup(storedAny);
+            return;
+        }
+        if (mob.getNavigation().isDone()) mob.getNavigation().moveTo(item, 1.15);
+        mob.getLookControl().setLookAt(item, 10f, mob.getMaxHeadXRot());
+    }
+
+    private ItemEntity nearestItem() {
+        double radius = mob.isPickupRequested() ? 12.0 : 10.0;
+        List<ItemEntity> items = mob.level().getEntitiesOfClass(ItemEntity.class,
+                mob.getBoundingBox().inflate(radius),
+                e -> e.isAlive() && !e.getItem().isEmpty() && mob.matchesPickup(e));
+        ItemEntity best = null;
+        double bestD = Double.MAX_VALUE;
+        for (ItemEntity e : items) {
+            double d = mob.distanceToSqr(e);
+            if (d < bestD) { bestD = d; best = e; }
+        }
+        return best;
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\ai\CompanionSeekBlockGoal.java
+
+```java
+package com.example.companionmod.entity.ai;
+
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.entity.task.MineTask;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.tags.FluidTags;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.ai.goal.Goal;
+import net.minecraft.world.entity.ai.navigation.PathNavigation;
+import net.minecraft.world.level.block.FallingBlock;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.pathfinder.Path;
+import net.minecraft.world.phys.Vec3;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.EnumSet;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * Player-style "find and mine X".
+ *
+ * <p>Surface: look for exposed matches, walk there if a path exists, otherwise tunnel to them.
+ * Deep ores: walk down a 2-high staircase (never a bare shaft) to the best Y level, then strip-mine in parallel
+ * branches, spotting exposed ore (or any ore within 2 blocks of the tunnel) and vein-mining whatever touches it.
+ * Every block is broken the way a player does: look at it, swing the arm, crack animation, time based on hardness and tool.
+ * Tunnels refuse lava, water, falling blocks overhead and holes underfoot and turn away instead.
+ *
+ * <p>All progress lives in {@link MineTask} (saved with the entity), so interruptions never reset anything; only
+ * the transient per-block state in this goal is rebuilt. No global timeout: if no progress is made for 25 s the
+ * companion re-plans, and after four failed re-plans it pauses and asks to be told to continue.</p>
+ */
+public class CompanionSeekBlockGoal extends Goal {
+    private static final double REACH_SQ = 4.5 * 4.5;
+    private static final int LEG_LEN = 36, SIDE_LEN = 3, MAX_LEGS = 8;
+    private static final int WALK_STAND = 0, WALK_REACH = 1, WALK_FREE = 2;
+
+    private final CompanionEntity mob;
+    private final Deque<BlockPos> pending = new ArrayDeque<>();   // cells to clear before the next step
+    private final Deque<BlockPos> vein = new ArrayDeque<>();
+    private final Set<BlockPos> unreachable = new HashSet<>();
+    private BlockPos breaking, walkTo, oreTarget, stepStand;
+    private int walkMode, breakProgress, breakNeed, walkTicks, scanCooldown, stuck, wanderTries, torchCooldown;
+    private long lastProgress, lastSpeak;
+
+    public CompanionSeekBlockGoal(CompanionEntity mob) {
+        this.mob = mob;
+        setFlags(EnumSet.of(Flag.MOVE, Flag.LOOK));
+    }
+
+    // ------------------------------------------------------------------ lifecycle
+
+    private boolean ready() {
+        return mob.mineTask().running() && !mob.isSitting() && !mob.isInjured() && mob.getTarget() == null;
+    }
+
+    @Override public boolean canUse() { return ready(); }
+    @Override public boolean canContinueToUse() { return ready(); }
+
+    @Override
+    public void start() {
+        resetTransient();
+        lastProgress = mob.level().getGameTime();
+    }
+
+    @Override
+    public void stop() {
+        if (mob.level() instanceof ServerLevel level) cancelBreak(level);
+        resetTransient();
+        mob.getNavigation().stop();
+    }
+
+    private void resetTransient() {
+        pending.clear();
+        vein.clear();
+        breaking = walkTo = oreTarget = stepStand = null;
+        breakProgress = walkTicks = scanCooldown = stuck = wanderTries = 0;
+        if (unreachable.size() > 200) unreachable.clear();
+    }
+
+    // ------------------------------------------------------------------ main loop
+
+    @Override
+    public void tick() {
+        if (!(mob.level() instanceof ServerLevel level)) return;
+        MineTask t = mob.mineTask();
+        long now = level.getGameTime();
+
+        if (now - lastProgress > 500) {                           // 25 s without progress: re-plan, then give up politely
+            lastProgress = now;
+            cancelBreak(level);
+            pending.clear();
+            stepStand = walkTo = oreTarget = null;
+            if (++stuck >= 4) {
+                t.pause();
+                say(level, "I'm stuck. Say 'continue' and I'll try again.", true);
+                return;
+            }
+            t.dirData = Direction.from2DDataValue(t.dirData).getClockWise().get2DDataValue();
+            return;
+        }
+        // Underground it gets dark: drop a torch from the bag every so often so the tunnels stay lit.
+        if (t.phase != MineTask.Phase.SEARCH && --torchCooldown <= 0) {
+            torchCooldown = 60;
+            if (level.getMaxLocalRawBrightness(mob.blockPosition()) < 8) mob.placeTorch();
+        }
+        if (breaking != null) { keepBreaking(level, t, now); return; }
+        if (walkTo != null) { walk(level, now); return; }
+        if (!pending.isEmpty()) { startBreak(level, pending.poll()); return; }
+        if (stepStand != null) {
+            walkTo = stepStand;
+            walkMode = WALK_STAND;
+            walkTicks = 0;
+            stepStand = null;
+            mob.getNavigation().moveTo(walkTo.getX() + 0.5, walkTo.getY(), walkTo.getZ() + 0.5, 1.0);
+            return;
+        }
+        decide(level, t);
+    }
+
+    private void decide(ServerLevel level, MineTask t) {
+        while (!vein.isEmpty() && !matches(t, level.getBlockState(vein.peek()))) vein.poll();
+        if (!vein.isEmpty()) { approach(level, t, vein.peek()); return; }
+
+        if (--scanCooldown <= 0) {
+            scanCooldown = 12;
+            oreTarget = scan(level, t);
+            if (oreTarget != null) wanderTries = 0;
+        }
+        if (oreTarget != null && !matches(t, level.getBlockState(oreTarget))) oreTarget = null;
+        if (oreTarget != null) { approach(level, t, oreTarget); return; }
+
+        int y = mob.blockPosition().getY();
+        switch (t.phase) {
+            case SEARCH -> {
+                if (t.deep() && y > t.ty) {
+                    t.phase = MineTask.Phase.DESCEND;
+                    say(level, "Nothing on the surface. Heading down to y=" + t.ty + ".", true);
+                } else if (t.deep()) {
+                    t.phase = MineTask.Phase.BRANCH;
+                } else wanderSearch(level, t);
+            }
+            case DESCEND -> {
+                if (y <= t.ty || y <= level.getMinY() + 6) {            // 26.1-CHECK: LevelReader.getMinY()
+                    t.phase = MineTask.Phase.BRANCH;
+                    t.leg = 0;
+                    t.legLen = 0;
+                    say(level, "This depth looks right. Branch mining.", true);
+                } else if (!planStep(level, t, Direction.from2DDataValue(t.dirData), -1, true)) {
+                    t.dirData = Direction.from2DDataValue(t.dirData).getClockWise().get2DDataValue();
+                    if (++stuck >= 4) { t.pause(); say(level, "I can't dig down safely here. Move me and say 'continue'.", true); }
+                }
+            }
+            case BRANCH -> branch(level, t);
+        }
+    }
+
+    private void branch(ServerLevel level, MineTask t) {
+        Direction d = Direction.from2DDataValue(t.dirData);
+        int len = (t.leg % 2 == 0) ? LEG_LEN : SIDE_LEN;
+        if (t.legLen >= len) {                                          // finished a tunnel leg: shift sideways, come back parallel
+            t.leg++;
+            t.legLen = 0;
+            if (t.leg >= MAX_LEGS) {
+                t.leg = 0;
+                t.pause();
+                say(level, "I've covered this level. Say 'continue' to keep looking.", true);
+                return;
+            }
+            t.dirData = d.getClockWise().get2DDataValue();
+            return;
+        }
+        if (planStep(level, t, d, 0, false)) t.legLen++;
+        else t.legLen = len;                                            // lava/water/hole ahead: end this leg early
+    }
+
+    private void wanderSearch(ServerLevel level, MineTask t) {
+        if (++wanderTries > 10) {
+            t.pause();
+            say(level, "I can't find any " + CompanionEntity.prettyBlockId(t.blockId) + " around here.", true);
+            return;
+        }
+        BlockPos me = mob.blockPosition();
+        int x = me.getX() + mob.getRandom().nextIntBetweenInclusive(-18, 18);
+        int z = me.getZ() + mob.getRandom().nextIntBetweenInclusive(-18, 18);
+        BlockPos dest = new BlockPos(x, level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z), z);
+        Path p = mob.getNavigation().createPath(dest, 1);
+        if (p != null && p.canReach()) {
+            walkTo = dest;
+            walkMode = WALK_FREE;
+            walkTicks = 0;
+            mob.getNavigation().moveTo(p, 1.0);
+        }
+    }
+
+    // ------------------------------------------------------------------ approaching and tunnelling
+
+    private void approach(ServerLevel level, MineTask t, BlockPos target) {
+        if (mob.distanceToSqr(Vec3.atCenterOf(target)) <= REACH_SQ && lineClear(level, target)) {
+            startBreak(level, target);
+            return;
+        }
+        if (t.phase == MineTask.Phase.SEARCH) {                          // above ground: walk if a path exists
+            Path p = mob.getNavigation().createPath(target, 1);
+            if (p != null && p.canReach()) {
+                walkTo = target;
+                walkMode = WALK_REACH;
+                walkTicks = 0;
+                mob.getNavigation().moveTo(p, 1.1);
+                return;
+            }
+        }
+        tunnelToward(level, t, target);
+    }
+
+    private void tunnelToward(ServerLevel level, MineTask t, BlockPos target) {
+        BlockPos me = mob.blockPosition();
+        int dx = target.getX() - me.getX(), dy = target.getY() - me.getY(), dz = target.getZ() - me.getZ();
+        Direction d;
+        if (dx == 0 && dz == 0) d = Direction.from2DDataValue(t.dirData);
+        else if (Math.abs(dx) >= Math.abs(dz)) d = dx > 0 ? Direction.EAST : Direction.WEST;
+        else d = dz > 0 ? Direction.SOUTH : Direction.NORTH;
+        int dyStep = dy < -1 ? -1 : dy > 1 ? 1 : 0;
+        if (!planStep(level, t, d, dyStep, true)) {
+            unreachable.add(target);
+            vein.remove(target);
+            oreTarget = null;
+        }
+    }
+
+    /** Plans one tunnel step (clear cells, then walk onto {@code stand}). dyStep: -1 stairs down, 0 level, +1 stairs up. */
+    private boolean planStep(ServerLevel level, MineTask t, Direction first, int dyStep, boolean allowTurn) {
+        Direction[] order = allowTurn
+                ? new Direction[]{first, first.getClockWise(), first.getCounterClockWise(), first.getOpposite()}
+                : new Direction[]{first};
+        BlockPos me = mob.blockPosition();
+        for (Direction d : order) {
+            BlockPos stand = me.relative(d).above(dyStep);
+            List<BlockPos> cells = new ArrayList<>(3);
+            cells.add(stand);
+            cells.add(stand.above());
+            if (dyStep < 0) cells.add(stand.above(2));                  // headroom to walk in before dropping
+            if (!safe(level, stand, cells)) continue;
+            for (BlockPos c : cells) if (!passable(level, c)) pending.add(c);
+            stepStand = stand;
+            t.dirData = d.get2DDataValue();
+            return true;
+        }
+        return false;
+    }
+
+    private boolean safe(ServerLevel level, BlockPos stand, List<BlockPos> cells) {
+        BlockState floor = level.getBlockState(stand.below());
+        if (floor.isAir() || !floor.getFluidState().isEmpty()) return false;       // would walk into a hole / liquid
+        int topY = Integer.MIN_VALUE;
+        for (BlockPos c : cells) {
+            BlockState s = level.getBlockState(c);
+            if (!s.getFluidState().isEmpty() || s.getDestroySpeed(level, c) < 0) return false;
+            topY = Math.max(topY, c.getY());
+            for (Direction dd : Direction.values()) {
+                BlockPos n = c.relative(dd);
+                if (cells.contains(n)) continue;
+                var f = level.getBlockState(n).getFluidState();
+                if (f.is(FluidTags.LAVA) || !f.isEmpty()) return false;            // lava or water behind the wall
+            }
+        }
+        BlockPos ceil = new BlockPos(stand.getX(), topY + 1, stand.getZ());
+        BlockState cs = level.getBlockState(ceil);
+        return !(cs.getBlock() instanceof FallingBlock) && cs.getFluidState().isEmpty();
+    }
+
+    private boolean passable(ServerLevel level, BlockPos p) {
+        BlockState s = level.getBlockState(p);
+        return s.getCollisionShape(level, p).isEmpty() && s.getFluidState().isEmpty();
+    }
+
+    // ------------------------------------------------------------------ breaking and walking
+
+    private void startBreak(ServerLevel level, BlockPos pos) {
+        BlockState st = level.getBlockState(pos);
+        if (st.isAir()) return;
+        mob.equipBestToolFor(st);                                 // hold the right tool: visible swings + correct speed
+        float h = st.getDestroySpeed(level, pos);
+        if (h < 0) { unreachable.add(pos); oreTarget = null; pending.clear(); stepStand = null; return; }
+        float speed = Math.max(1f, mob.getMainHandItem().getDestroySpeed(st));
+        breakNeed = Math.max(3, Math.min(90, (int) (h * 30f / speed)));
+        breakProgress = 0;
+        breaking = pos;
+        // Start only after the server equipment sync, so clients see the correct tool move.
+        mob.swing(InteractionHand.MAIN_HAND, true);
+    }
+
+    private void keepBreaking(ServerLevel level, MineTask t, long now) {
+        BlockState st = level.getBlockState(breaking);
+        if (st.isAir()) { cancelBreak(level); lastProgress = now; return; }
+        Vec3 c = Vec3.atCenterOf(breaking);
+        if (mob.distanceToSqr(c) > REACH_SQ + 1) {
+            mob.getNavigation().moveTo(c.x, breaking.getY(), c.z, 1.0);
+            return;
+        }
+        mob.getNavigation().stop();
+        mob.getLookControl().setLookAt(c.x, c.y, c.z, 30f, mob.getMaxHeadXRot());
+        breakProgress++;
+        // Re-broadcast repeatedly; a short three-tick break still gets a visible swing.
+        if (breakProgress % 4 == 1) mob.swing(InteractionHand.MAIN_HAND, true);
+        level.destroyBlockProgress(mob.getId(), breaking, Math.min(9, breakProgress * 10 / breakNeed));
+        if (breakProgress < breakNeed) return;
+
+        boolean hit = matches(t, st);
+        BlockPos pos = breaking;
+        level.destroyBlockProgress(mob.getId(), pos, -1);
+        level.destroyBlock(pos, true, mob, 512);
+        breaking = null;
+        lastProgress = now;
+        stuck = 0;
+        mob.collectNearbyItems();
+        if (hit) onMined(level, t, pos);
+    }
+
+    private void onMined(ServerLevel level, MineTask t, BlockPos pos) {
+        t.mined++;
+        for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) for (int dz = -1; dz <= 1; dz++) {
+            BlockPos n = pos.offset(dx, dy, dz);
+            if (vein.size() < 24 && !vein.contains(n) && matches(t, level.getBlockState(n))) vein.add(n);
+        }
+        say(level, "Got " + CompanionEntity.prettyBlockId(t.blockId) + "! (" + t.mined + "/" + t.want + ")", true);
+        if (t.mined >= t.want) {
+            String msg = "That's " + t.mined + " " + CompanionEntity.prettyBlockId(t.blockId) + " for you.";
+            t.finish();
+            mob.speak(msg);
+            resetTransient();      // no warp home: the follow goal walks the companion back
+        }
+    }
+
+    private void walk(ServerLevel level, long now) {
+        walkTicks++;
+        BlockPos w = walkTo;
+        boolean arrived = switch (walkMode) {
+            case WALK_REACH -> mob.distanceToSqr(Vec3.atCenterOf(w)) <= REACH_SQ && lineClear(level, w);
+            case WALK_FREE -> mob.distanceToSqr(Vec3.atCenterOf(w)) < 4.0;
+            default -> Math.abs(mob.getX() - (w.getX() + 0.5)) < 0.7 && Math.abs(mob.getZ() - (w.getZ() + 0.5)) < 0.7
+                    && Math.abs(mob.getY() - w.getY()) < 1.2;
+        };
+        if (arrived) { walkTo = null; lastProgress = now; mob.getNavigation().stop(); return; }
+        PathNavigation nav = mob.getNavigation();
+        if (walkTicks > 80 || (walkTicks > 5 && nav.isDone())) {
+            if (walkMode == WALK_STAND) {                                // last resort so a tunnel step never deadlocks
+                mob.setPos(w.getX() + 0.5, w.getY(), w.getZ() + 0.5);
+                mob.resetFallDistance();
+                nav.stop();
+                lastProgress = now;
+            } else if (walkMode == WALK_REACH && oreTarget != null) {
+                unreachable.add(oreTarget);
+                oreTarget = null;
+            }
+            walkTo = null;
+            return;
+        }
+        if (walkMode == WALK_STAND && walkTicks % 20 == 0) nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
+    }
+
+    private void cancelBreak(ServerLevel level) {
+        if (breaking != null) level.destroyBlockProgress(mob.getId(), breaking, -1);
+        breaking = null;
+    }
+
+    // ------------------------------------------------------------------ sensing
+
+    /** Nearest match that a player could actually see (touching air) or that is within 2 blocks of the companion. */
+    private BlockPos scan(ServerLevel level, MineTask t) {
+        int r = t.phase == MineTask.Phase.SEARCH ? 22 : 10;
+        BlockPos o = mob.blockPosition();
+        BlockPos best = null;
+        double bestD = Double.MAX_VALUE;
+        for (BlockPos p : BlockPos.betweenClosed(o.offset(-r, -Math.min(r, 12), -r), o.offset(r, Math.min(r, 8), r))) {
+            if (!matches(t, level.getBlockState(p)) || unreachable.contains(p)) continue;
+            double d = mob.distanceToSqr(Vec3.atCenterOf(p));
+            if (d >= bestD || (d > 9.0 && !exposed(level, p))) continue;
+            bestD = d;
+            best = p.immutable();
+        }
+        return best;
+    }
+
+    private boolean exposed(ServerLevel level, BlockPos p) {
+        for (Direction d : Direction.values()) {
+            BlockPos n = p.relative(d);
+            if (level.getBlockState(n).getCollisionShape(level, n).isEmpty()) return true;
+        }
+        return false;
+    }
+
+    private boolean lineClear(ServerLevel level, BlockPos target) {
+        Vec3 eye = mob.getEyePosition(), goal = Vec3.atCenterOf(target), delta = goal.subtract(eye);
+        for (int k = 1; k <= 8; k++) {
+            BlockPos bp = BlockPos.containing(eye.add(delta.scale(k / 9.0)));
+            if (bp.equals(target)) break;
+            if (!level.getBlockState(bp).getCollisionShape(level, bp).isEmpty()) return false;
+        }
+        return true;
+    }
+
+    private static boolean matches(MineTask t, BlockState state) {
+        if (state.isAir()) return false;
+        String path = BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath();
+        String bid = t.blockId;
+        if (path.equals(bid)) return true;
+        if (bid.endsWith("_ore") && path.endsWith(bid)) return true;          // diamond_ore also matches deepslate_diamond_ore
+        return switch (bid) {                                                 // family ids from "wood"/"planks"/... orders
+            case "log", "wood" -> path.endsWith("_log") || path.endsWith("_wood");
+            case "planks", "plank" -> path.endsWith("_planks");
+            case "leaves" -> path.endsWith("_leaves");
+            case "wool" -> path.endsWith("_wool");
+            default -> false;
+        };
+    }
+
+    private void say(ServerLevel level, String msg, boolean force) {
+        long now = level.getGameTime();
+        if (force || now - lastSpeak > 100) { mob.speak(msg); lastSpeak = now; }
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\ai\CompanionSitGoal.java
+
+```java
+package com.example.companionmod.entity.ai;
+
+import com.example.companionmod.entity.CompanionEntity;
+import net.minecraft.world.entity.ai.goal.Goal;
+
+import java.util.EnumSet;
+
+/** Holds the companion still while in SIT mode. Higher priority than everything that moves. */
+public class CompanionSitGoal extends Goal {
+    private final CompanionEntity mob;
+
+    public CompanionSitGoal(CompanionEntity mob) {
+        this.mob = mob;
+        setFlags(EnumSet.of(Flag.MOVE, Flag.JUMP, Flag.LOOK));
+    }
+
+    @Override public boolean canUse() { return mob.isSitting(); }
+    @Override public boolean canContinueToUse() { return mob.isSitting(); }
+    @Override public void start() { mob.getNavigation().stop(); mob.setTarget(null); }
+    @Override public boolean isInterruptable() { return false; }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\ai\CompanionTargetGoal.java
+
+```java
+package com.example.companionmod.entity.ai;
+
+import com.example.companionmod.entity.CompanionEntity;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.ai.goal.Goal;
+
+import java.util.EnumSet;
+
+/** Thin wrapper: the decision logic lives in {@link CompanionEntity#chooseTarget()} so commands and AI share one source of truth. */
+public class CompanionTargetGoal extends Goal {
+    private final CompanionEntity mob;
+    private LivingEntity pending;
+    private int cooldown;
+
+    public CompanionTargetGoal(CompanionEntity mob) {
+        this.mob = mob;
+        setFlags(EnumSet.of(Flag.TARGET));
+    }
+
+    @Override
+    public boolean canUse() {
+        if (mob.isInjured()) return false;
+        if (--cooldown > 0) return false;
+        cooldown = 8;
+        pending = mob.chooseTarget();
+        return pending != null;
+    }
+
+    @Override
+    public boolean canContinueToUse() {
+        LivingEntity t = mob.getTarget();
+        if (t == null || !t.isAlive() || mob.isSitting() || mob.isInjured() || mob.stance() == CompanionEntity.Stance.PASSIVE) return false;
+        var owner = mob.getOwner();
+        // No wall hacking: drop hidden targets unless they are fighting us/owner, or the player ordered them explicitly.
+        if (!mob.isForced(t) && !mob.getSensing().hasLineOfSight(t)) {
+            boolean aggro = t instanceof net.minecraft.world.entity.Mob m
+                    && (m.getTarget() == mob || (owner != null && m.getTarget() == owner));
+            if (!aggro) return false;
+        }
+        double leash = mob.moveMode() == CompanionEntity.MoveMode.STAY ? 12 : 28;
+        var anchor = (owner != null && mob.moveMode() == CompanionEntity.MoveMode.FOLLOW) ? owner : mob;
+        return anchor.distanceToSqr(t) < leash * leash;
+    }
+
+    @Override public void start() { mob.setTarget(pending); }
+
+    @Override
+    public void stop() {
+        mob.setTarget(null);
+        mob.getNavigation().stop();
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\ai\CompanionWanderGoal.java
+
+```java
+package com.example.companionmod.entity.ai;
+
+import com.example.companionmod.entity.CompanionEntity;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.entity.ai.goal.Goal;
+import net.minecraft.world.level.levelgen.Heightmap;
+
+import java.util.EnumSet;
+
+/** Relaxed wandering around the anchor (and the owner when following is not active). */
+public class CompanionWanderGoal extends Goal {
+    private final CompanionEntity mob;
+    private int cooldown;
+    private BlockPos target;
+
+    public CompanionWanderGoal(CompanionEntity mob) {
+        this.mob = mob;
+        setFlags(EnumSet.of(Flag.MOVE, Flag.LOOK));
+    }
+
+    @Override
+    public boolean canUse() {
+        return mob.moveMode() == CompanionEntity.MoveMode.WANDER && !mob.isSitting() && !mob.isInjured();
+    }
+
+    @Override
+    public boolean canContinueToUse() {
+        return canUse();
+    }
+
+    @Override
+    public void start() {
+        cooldown = 0;
+        target = null;
+    }
+
+    @Override
+    public void stop() {
+        mob.getNavigation().stop();
+        target = null;
+    }
+
+    @Override
+    public void tick() {
+        if (target != null && !mob.getNavigation().isDone()) {
+            mob.getLookControl().setLookAt(target.getX() + 0.5, target.getY(), target.getZ() + 0.5, 10.0f, mob.getMaxHeadXRot());
+            return;
+        }
+        if (--cooldown > 0) return;
+        cooldown = 40;
+        BlockPos anchor = mob.anchor();
+        int dx = mob.getRandom().nextIntBetweenInclusive(-11, 11);
+        int dz = mob.getRandom().nextIntBetweenInclusive(-11, 11);
+        if (Math.abs(dx) < 3 && Math.abs(dz) < 3) dx += 3;
+        int x = anchor.getX() + dx;
+        int z = anchor.getZ() + dz;
+        int y = mob.level().getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+        target = new BlockPos(x, y, z);
+        if (!mob.getNavigation().moveTo(x + 0.5, y, z + 0.5, 0.85)) target = null;
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\CompanionEntity.java
+
+```java
+package com.example.companionmod.entity;
+
+import com.example.companionmod.command.CompanionCommand;
+import com.example.companionmod.entity.ai.CompanionBuildGoal;
+import com.example.companionmod.entity.ai.CompanionFarmGoal;
+import com.example.companionmod.entity.ai.CompanionFollowGoal;
+import com.example.companionmod.entity.ai.CompanionFishGoal;
+import com.example.companionmod.entity.ai.CompanionPatrolGoal;
+import com.example.companionmod.entity.ai.CompanionPickupGoal;
+import com.example.companionmod.entity.ai.CompanionSeekBlockGoal;
+import com.example.companionmod.entity.ai.CompanionSitGoal;
+import com.example.companionmod.entity.ai.CompanionTargetGoal;
+import com.example.companionmod.entity.ai.CompanionWanderGoal;
+import com.example.companionmod.entity.plan.CompanionPlanner;
+import com.example.companionmod.entity.task.MineTask;
+import com.example.companionmod.inventory.CompanionInventoryMenu;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.syncher.EntityDataAccessor;
+import net.minecraft.network.syncher.EntityDataSerializers;
+import net.minecraft.network.syncher.SynchedEntityData;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.world.Containers;
+import net.minecraft.world.SimpleContainer;
+import net.minecraft.world.SimpleMenuProvider;
+import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.PathfinderMob;
+import net.minecraft.world.entity.Pose;
+import net.minecraft.world.entity.ai.attributes.AttributeSupplier;
+import net.minecraft.world.entity.ai.attributes.Attributes;
+import net.minecraft.world.entity.ai.goal.FloatGoal;
+import net.minecraft.world.entity.ai.goal.LookAtPlayerGoal;
+import net.minecraft.world.entity.ai.goal.MeleeAttackGoal;
+import net.minecraft.world.entity.ai.goal.OpenDoorGoal;
+import net.minecraft.world.entity.ai.goal.RandomLookAroundGoal;
+import net.minecraft.world.entity.ai.navigation.GroundPathNavigation;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.monster.Creeper;
+import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.entity.monster.Monster;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.equipment.Equippable;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.storage.ValueInput;
+import net.minecraft.world.level.storage.ValueOutput;
+import net.minecraft.world.phys.Vec3;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+
+/**
+ * A player-shaped companion owned by one player.
+ * State: MoveMode (what its legs do) x Stance (what it fights). Orders arrive through {@link #applyCommand}.
+ * Everything gameplay-related runs server-side; synced data (MoveMode/Stance/Owner/Skin/Feminine/Speech/Injured)
+ * is read by the client renderer, HUD and goals.
+ *
+ * <p>Inventory: 26 slots (4 armor, 4 tools, 18 storage) in one {@link SimpleContainer}. Armor and the first
+ * tool are mirrored onto the equipment slots so they render and actually protect/heal... protect the companion.
+ *
+ * <p>Downed state: lethal damage converts into an injured crawl (Mojang's swimming pose). The companion cannot
+ * act; the player revives it by holding left mouse button on it for 3 seconds. It bleeds out after 60 s.
+ */
+public class CompanionEntity extends PathfinderMob implements com.example.companionmod.entity.plan.PlanActions {
+    public enum MoveMode { FOLLOW, STAY, SIT, PATROL, WANDER }
+    /** DEFENSIVE: fight what threatens owner/self. GUARD: also attack any hostile near the owner. PASSIVE: never start a fight. */
+    public enum Stance { DEFENSIVE, GUARD, PASSIVE }
+
+    private static final EntityDataAccessor<Integer> DATA_MOVE = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
+    private static final EntityDataAccessor<Integer> DATA_STANCE = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
+    private static final EntityDataAccessor<String> DATA_OWNER = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.STRING);
+    private static final EntityDataAccessor<String> DATA_SKIN = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.STRING);
+    private static final EntityDataAccessor<Integer> DATA_FEMININE = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
+    private static final EntityDataAccessor<Integer> DATA_PICKUP = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
+    private static final EntityDataAccessor<String> DATA_SPEECH = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.STRING);
+    private static final EntityDataAccessor<Integer> DATA_SPEECH_ID = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
+    private static final EntityDataAccessor<Integer> DATA_INJURED = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
+    private static final EntityDataAccessor<Float> DATA_REVIVE = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.FLOAT);
+    private static final EntityDataAccessor<Integer> DATA_INJURED_LEFT = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
+
+    /** Aliases the language model is likely to produce -> real block ids or family ids. */
+    private static final Map<String, String> BLOCK_ALIASES = Map.ofEntries(
+            Map.entry("diamond", "diamond_ore"), Map.entry("diamonds", "diamond_ore"),
+            Map.entry("coal", "coal_ore"), Map.entry("iron", "iron_ore"),
+            Map.entry("gold", "gold_ore"), Map.entry("copper", "copper_ore"),
+            Map.entry("redstone", "redstone_ore"), Map.entry("lapis", "lapis_ore"),
+            Map.entry("emerald", "emerald_ore"), Map.entry("quartz", "nether_quartz_ore"),
+            Map.entry("netherite", "ancient_debris"), Map.entry("debris", "ancient_debris"),
+            Map.entry("ancient_debris", "ancient_debris"), Map.entry("diamond_block", "diamond_block"),
+            Map.entry("iron_block", "iron_block"), Map.entry("gold_block", "gold_block"),
+            Map.entry("rock", "stone"), Map.entry("rocks", "stone"), Map.entry("cobble", "cobblestone"),
+            Map.entry("soil", "dirt"), Map.entry("timber", "log"), Map.entry("lumber", "log"),
+            Map.entry("tree", "log"), Map.entry("trees", "log"), Map.entry("trunk", "log"),
+            Map.entry("wood_planks", "planks"), Map.entry("wooden_planks", "planks"));
+    /** Not one block but a whole family: any log/wood, any planks, any leaves, any wool. */
+    private static final Set<String> FAMILY_IDS = Set.of("log", "wood", "planks", "plank", "leaves", "wool");
+
+    public static final EquipmentSlot[] ARMOR_SLOTS = { EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET };
+
+    // Storage layout: 0-3 armor, 4-7 tools, 8-25 main (18 slots).
+    public static final int SIZE = 26, ARMOR_START = 0, TOOL_START = 4, MAIN_START = 8, MAIN_SIZE = 18;
+
+    private UUID ownerUuid;
+    private LivingEntity forcedTarget;
+    private int forcedTargetUntil;
+    private String lastSpokenText = "";
+    private long lastSpokenTime = 0;
+    private int lastSpokenTick = -10000;
+
+    private BlockPos anchor;                 // patrol / wander centre
+    private int patrolIndex;
+
+    // "go and find/mine this block" job (server side, saved with the entity)
+    private final MineTask mineTask = new MineTask();
+    // "pick this up from the ground" order (server side)
+    private String pickupFilter = "";
+    private boolean pickupRequested;
+
+    // Inventory: armor row, tool row, main storage.
+    private final SimpleContainer storage = new SimpleContainer(SIZE);
+
+    // Downed / revive state.
+    private boolean forceDeath;              // set when the revive timer runs out: this death is real
+    private DamageSource injurySource;
+    private long lastRevivePulse;
+    private float reviveProgress;
+    private int injuredLeftTicks;
+    private static final int REVIVE_SECONDS = 60;
+    private static final float REVIVE_TICKS = 3.0f * 20.0f;   // 3 s of holding left mouse
+
+    // AI plan executor (the model never runs anything itself; it only returns validated plan data).
+    private final CompanionPlanner planner = new CompanionPlanner();
+    private boolean applyingPlanStep;
+
+    // job state (time-boxed / schematic-driven behaviours)
+    private long farmUntil, fishUntil;
+    private String buildSchematic = "";
+    private int selectedToolSlot = 0;          // which tool slot is held in the main hand
+    private int targetSinceTick;               // when the current automatic target was acquired
+    private long lastOuchTick;                 // hurt chatter throttle
+    private String lastPlanJson = "";          // last plan, so "continue" can resume it
+
+    public CompanionEntity(EntityType<? extends CompanionEntity> type, Level level) {
+        super(type, level);
+        setPersistenceRequired();
+        if (getNavigation() instanceof GroundPathNavigation nav) {
+            nav.setCanOpenDoors(true);
+            nav.setCanFloat(true);
+        }
+    }
+
+    public static AttributeSupplier.Builder createAttributes() {
+        return PathfinderMob.createMobAttributes()
+                .add(Attributes.MAX_HEALTH, 30.0)
+                .add(Attributes.MOVEMENT_SPEED, 0.3)
+                .add(Attributes.ATTACK_DAMAGE, 2.0)   // weapon modifiers add on top
+                .add(Attributes.FOLLOW_RANGE, 32.0)
+                .add(Attributes.ARMOR, 0.0);
+    }
+
+    // ------------------------------------------------------------------ goals
+
+    @Override
+    protected void registerGoals() {
+        goalSelector.addGoal(0, new FloatGoal(this));
+        goalSelector.addGoal(1, new CompanionSitGoal(this));
+        goalSelector.addGoal(1, new OpenDoorGoal(this, true));   // villager-style: open wooden doors on the path, close behind
+        goalSelector.addGoal(2, new MeleeAttackGoal(this, 1.25, true));
+        goalSelector.addGoal(2, new CompanionSeekBlockGoal(this));   // explicit "find diamonds" pre-empts walking
+        goalSelector.addGoal(3, new CompanionPickupGoal(this));      // explicit "pick this up" pre-empts walking
+        goalSelector.addGoal(4, new CompanionFarmGoal(this));        // time-boxed jobs (farm / fish / build)
+        goalSelector.addGoal(4, new CompanionFishGoal(this));
+        goalSelector.addGoal(4, new CompanionBuildGoal(this));
+        goalSelector.addGoal(4, new CompanionPatrolGoal(this));
+        goalSelector.addGoal(4, new CompanionWanderGoal(this));
+        goalSelector.addGoal(5, new CompanionFollowGoal(this, 1.1, 4.0, 2.0, 24.0));
+        goalSelector.addGoal(6, new LookAtPlayerGoal(this, Player.class, 8.0f));
+        goalSelector.addGoal(7, new RandomLookAroundGoal(this));
+        targetSelector.addGoal(1, new CompanionTargetGoal(this));
+    }
+
+    // ------------------------------------------------------------------ synced + saved state
+
+    @Override
+    protected void defineSynchedData(SynchedEntityData.Builder builder) {
+        super.defineSynchedData(builder);
+        builder.define(DATA_MOVE, MoveMode.FOLLOW.ordinal());
+        builder.define(DATA_STANCE, Stance.DEFENSIVE.ordinal());
+        builder.define(DATA_OWNER, "");
+        builder.define(DATA_SKIN, "");
+        builder.define(DATA_FEMININE, 0);
+        builder.define(DATA_PICKUP, 0);
+        builder.define(DATA_SPEECH, "");
+        builder.define(DATA_SPEECH_ID, 0);
+        builder.define(DATA_INJURED, 0);
+        builder.define(DATA_REVIVE, 0.0f);
+        builder.define(DATA_INJURED_LEFT, 0);
+    }
+
+    @Override
+    protected void addAdditionalSaveData(ValueOutput out) { // 26.1-CHECK: ValueOutput/ValueInput replaced CompoundTag in 1.21.6
+        super.addAdditionalSaveData(out);
+        out.putInt("MoveMode", moveMode().ordinal());
+        out.putInt("Stance", stance().ordinal());
+        if (ownerUuid != null) out.putString("Owner", ownerUuid.toString());
+        out.putString("Skin", skin());
+        out.putBoolean("Feminine", isFeminine());
+        out.putBoolean("Pickup", isPickupEnabled());
+        out.putString("PickupFilter", pickupFilter);
+        mineTask.save(out);
+        out.store("Storage", ItemStack.OPTIONAL_CODEC.listOf(), storage.getItems());
+        out.putBoolean("Injured", isInjured());
+        out.putInt("InjuredLeft", injuredLeftTicks);
+        out.putFloat("Revive", reviveProgress);
+        if (anchor != null) out.putIntArray("Anchor", new int[]{anchor.getX(), anchor.getY(), anchor.getZ()});
+    }
+
+    @Override
+    protected void readAdditionalSaveData(ValueInput in) {
+        super.readAdditionalSaveData(in);
+        setMoveMode(MoveMode.values()[Math.floorMod(in.getIntOr("MoveMode", 0), MoveMode.values().length)]);
+        setStance(Stance.values()[Math.floorMod(in.getIntOr("Stance", 0), Stance.values().length)]);
+        String o = in.getStringOr("Owner", "");
+        if (!o.isEmpty()) {
+            try { setOwner(UUID.fromString(o)); } catch (IllegalArgumentException ignored) { }
+        }
+        setSkin(in.getStringOr("Skin", ""));
+        setFeminine(in.getBooleanOr("Feminine", false));
+        setPickupEnabled(in.getBooleanOr("Pickup", false));
+        pickupFilter = in.getStringOr("PickupFilter", "");
+        mineTask.load(in);
+        in.read("Storage", ItemStack.OPTIONAL_CODEC.listOf()).ifPresent(list -> {
+            for (int i = 0; i < Math.min(list.size(), storage.getContainerSize()); i++) {
+                storage.setItem(i, list.get(i));
+            }
+        });
+        boolean injured = in.getBooleanOr("Injured", false);
+        injuredLeftTicks = in.getIntOr("InjuredLeft", 0);
+        reviveProgress = in.getFloatOr("Revive", 0.0f);
+        if (injured) {
+            entityData.set(DATA_INJURED, 1);
+            entityData.set(DATA_REVIVE, reviveProgress);
+            entityData.set(DATA_INJURED_LEFT, injuredLeftTicks);
+            setPose(Pose.SWIMMING);
+        }
+        int[] a = in.getIntArray("Anchor").orElse(new int[0]);
+        if (a.length == 3) anchor = new BlockPos(a[0], a[1], a[2]);
+        refreshEquipment();
+    }
+
+    public MoveMode moveMode() { return MoveMode.values()[entityData.get(DATA_MOVE)]; }
+    public Stance stance() { return Stance.values()[entityData.get(DATA_STANCE)]; }
+    public void setMoveMode(MoveMode m) { entityData.set(DATA_MOVE, m.ordinal()); }
+    public void setStance(Stance s) { entityData.set(DATA_STANCE, s.ordinal()); }
+    public boolean isSitting() { return moveMode() == MoveMode.SIT; }
+
+    public String skin() { return entityData.get(DATA_SKIN); }
+    public void setSkin(String skin) { entityData.set(DATA_SKIN, skin == null ? "" : skin); }
+    public boolean isFeminine() { return entityData.get(DATA_FEMININE) != 0; }
+    public void setFeminine(boolean value) { entityData.set(DATA_FEMININE, value ? 1 : 0); }
+    public boolean isPickupEnabled() { return entityData.get(DATA_PICKUP) != 0; }
+    public void setPickupEnabled(boolean value) { entityData.set(DATA_PICKUP, value ? 1 : 0); }
+
+    public String speech() { return entityData.get(DATA_SPEECH); }
+    public int speechId() { return entityData.get(DATA_SPEECH_ID); }
+
+    public boolean isInjured() { return entityData.get(DATA_INJURED) != 0; }
+    public float reviveProgress() { return entityData.get(DATA_REVIVE); }
+    public int injuredLeftTicks() { return entityData.get(DATA_INJURED_LEFT); }
+
+    public MineTask mineTask() { return mineTask; }
+
+    public long farmUntil() { return farmUntil; }
+    public long fishUntil() { return fishUntil; }
+    public String buildSchematic() { return buildSchematic; }
+    /** Clears the current build job (called by the build goal when it finishes). */
+    public void clearBuild() { buildSchematic = ""; }
+
+    public String seekBlock() { return mineTask.exists() ? mineTask.blockId : ""; }
+    /** Starts (or restarts) a mining job; a blank id cancels it. */
+    public void setSeekBlock(String blockId) {
+        if (blockId == null || blockId.isBlank()) mineTask.finish();
+        else {
+            boolean nether = level().dimension() == net.minecraft.world.level.Level.NETHER;
+            mineTask.begin(blockId, nether, getDirection().get2DDataValue());
+        }
+    }
+    public void clearSeekBlock() { mineTask.finish(); }
+
+    public String pickupFilter() { return pickupFilter == null ? "" : pickupFilter; }
+    public boolean isPickupRequested() { return pickupRequested; }
+
+    public BlockPos anchor() { return anchor == null ? blockPosition() : anchor; }
+    public void setAnchor(BlockPos pos) { anchor = pos; }
+    public int patrolIndex() { return patrolIndex; }
+    public void setPatrolIndex(int i) { patrolIndex = i; }
+
+    public SimpleContainer storage() { return storage; }
+
+    public UUID getOwnerUuid() { return ownerUuid; }
+    public void setOwner(UUID uuid) { ownerUuid = uuid; entityData.set(DATA_OWNER, uuid == null ? "" : uuid.toString()); }
+    /** Works on both sides (the synced string), used by the client to find "my" companion. */
+    public boolean isOwnedBy(String uuidString) { return !uuidString.isEmpty() && uuidString.equals(entityData.get(DATA_OWNER)); }
+    public Player getOwner() { return ownerUuid == null ? null : level().getPlayerByUUID(ownerUuid); }
+    public boolean isOwner(Player p) { return ownerUuid != null && ownerUuid.equals(p.getUUID()); }
+
+    // ------------------------------------------------------------------ orders
+
+    public void applyCommand(CompanionCommand cmd, ServerPlayer from) {
+        applyCommand(cmd, from, "");
+    }
+
+    public void applyCommand(CompanionCommand cmd, ServerPlayer from, String target) {
+        if (!applyingPlanStep && cmd != CompanionCommand.PLAN && cmd != CompanionCommand.CONTINUE) {
+            // One explicit intent at a time: a manual order pauses the AI plan (STOP forgets it entirely).
+            planner.notePlayerOrder(tickCount);
+        }
+        switch (cmd) {
+            case FOLLOW -> { clearSeekBlock(); setMoveMode(MoveMode.FOLLOW); }
+            case STAY, WAIT -> { clearSeekBlock(); setMoveMode(MoveMode.STAY); setAnchor(blockPosition()); getNavigation().stop(); }
+            case SIT -> { clearSeekBlock(); setMoveMode(MoveMode.SIT); getNavigation().stop(); setTarget(null); }
+            case STAND -> { if (isSitting()) setMoveMode(MoveMode.FOLLOW); }
+            case PATROL -> {
+                clearSeekBlock();
+                setMoveMode(MoveMode.PATROL);
+                setAnchor(from == null ? blockPosition() : from.blockPosition());
+                setPatrolIndex(0);
+            }
+            case WANDER, EXPLORE, SCOUT -> {
+                clearSeekBlock();
+                setMoveMode(MoveMode.WANDER);
+                setAnchor(from == null ? blockPosition() : from.blockPosition());
+            }
+            case ATTACK, FIGHT, HUNT -> {
+                clearSeekBlock();
+                if (isSitting()) setMoveMode(MoveMode.FOLLOW);
+                if (stance() == Stance.PASSIVE) setStance(Stance.DEFENSIVE);
+                LivingEntity t = findTarget(from, target);
+                if (t == null) t = from == null ? null : pickAttackTarget(from);
+                if (t != null) { forcedTarget = t; forcedTargetUntil = tickCount + 600; setTarget(t); }
+            }
+            case GUARD, DEFEND -> { if (isSitting()) setMoveMode(MoveMode.FOLLOW); setStance(Stance.GUARD); }
+            case DEFENSIVE -> { setStance(Stance.DEFENSIVE); forcedTarget = null; setTarget(null); }
+            case PASSIVE -> { setStance(Stance.PASSIVE); forcedTarget = null; setTarget(null); getNavigation().stop(); }
+            case COME -> { clearSeekBlock(); if (isSitting()) setMoveMode(MoveMode.FOLLOW); if (from != null) teleportNear(from); }
+            case RETREAT, FLEE -> {
+                clearSeekBlock();
+                setStance(Stance.PASSIVE);
+                forcedTarget = null;
+                setTarget(null);
+                if (from != null) teleportNear(from);
+            }
+            case STOP -> { hardStop(); speak("Stopped."); }
+            case INVENTORY -> { if (from != null) openInventory(from); }
+            case HEAL -> {
+                heal(6.0f);
+                Player owner = getOwner();
+                if (owner != null && owner.distanceToSqr(this) < 144) owner.heal(4.0f);
+            }
+            case EQUIP -> equipByName(target == null ? "" : target);
+            // "pick up this bone" -> walk to the dropped item and store it. "collect wood" (a block, and nothing
+            // matching is lying around) -> go mine it instead. Never opens the inventory.
+            case PICKUP, LOOT, TAKE -> {
+                String filter = target == null ? "" : target.trim();
+                String id = normalizeBlockId(filter);
+                if (!id.isBlank() && !anyMatchingDrops(filter)) {
+                    clearSeekBlock();
+                    setSeekBlock(id);
+                    setAnchor(blockPosition());
+                    getNavigation().stop();
+                    speak("Looking for " + prettyBlockId(id) + ".");
+                } else requestPickup(filter);
+            }
+            case DROP, GIVE -> dropOneItem();
+            // "find diamonds / coal" -> walk to the nearest matching block and mine it.
+            case SEEK_BLOCK, MINE, FIND, SEEK, SEARCH -> {
+                String id = normalizeBlockId(target);
+                if (id.isBlank()) {
+                    // Not a block (or no target): fall back to scouting around instead of doing nothing.
+                    setMoveMode(MoveMode.WANDER);
+                    setAnchor(blockPosition());
+                    speak(target == null || target.isBlank()
+                            ? "What should I look for?"
+                            : "I don't know where to find " + target + ". I'll scout around.");
+                } else {
+                    clearSeekBlock();
+                    setSeekBlock(id);
+                    setAnchor(blockPosition());
+                    getNavigation().stop();
+                    speak("Looking for " + prettyBlockId(id) + ".");
+                }
+            }
+            case SET_NAME -> {
+                String n = target == null ? "" : target.trim();
+                if (!n.isBlank()) {
+                    setCustomName(Component.literal(n));
+                    setCustomNameVisible(false);
+                }
+            }
+            case SET_SKIN -> setSkin(target == null ? "" : target.trim());
+            case FEMININE -> setFeminine(true);
+            case MASCULINE -> setFeminine(false);
+            case REVIVE -> revivePulse();
+            case PLAN -> { lastPlanJson = target == null ? "" : target; planner.accept(target, this, tickCount); }
+            case CONTINUE -> {
+                // Resume whatever was interrupted: a paused AI plan first, then a stuck/paused mining job,
+                // then (last resort) the last plan JSON the model gave us.
+                if (planner.resume(tickCount)) speak("Continuing the plan.");
+                else if (mineTask().running() || mineTask().resume()) speak("Back to work.");
+                else if (!lastPlanJson.isBlank() && planner.accept(lastPlanJson, this, tickCount)) speak("Restarting the plan.");
+                else speak("There is nothing to continue.");
+            }
+            case FARM -> { farmUntil = level().getGameTime() + 600; setAnchor(blockPosition()); speak("Farming."); }
+            case FISH -> { fishUntil = level().getGameTime() + 600; setAnchor(blockPosition()); speak("Going fishing."); }
+            case BUILD -> {
+                String name = target == null ? "" : target.trim().toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9_\\-]", "_");
+                if (name.isEmpty()) speak("Build what? Give me a schematic name.");
+                else { buildSchematic = name; setAnchor(blockPosition()); speak("Building " + name + "."); }
+            }
+            case REMEMBER, FORGET -> { /* handled client-side by CompanionMemory */ }
+            default -> { }
+        }
+    }
+
+    /** Opens the companion's 26-slot inventory (armor / tools / storage) in a custom screen. */
+    public void openInventory(ServerPlayer player) {
+        player.openMenu(new SimpleMenuProvider(
+                (id, inv, p) -> new CompanionInventoryMenu(id, inv, this),
+                Component.literal(getName().getString() + "'s Inventory")));
+    }
+
+    /**
+     * Emergency stop: cancel every kind of queued or time-boxed work, clear combat, and hold this spot.
+     * Unlike STAY, this also forgets the last plan, so CONTINUE cannot bring the cancelled work back.
+     */
+    public void hardStop() {
+        planner.cancel();
+        lastPlanJson = "";
+        clearSeekBlock();
+        finishPickup(false);
+        farmUntil = 0;
+        fishUntil = 0;
+        clearBuild();
+        forcedTarget = null;
+        forcedTargetUntil = 0;
+        setStance(Stance.PASSIVE);
+        setTarget(null);
+        getNavigation().stop();
+        setMoveMode(MoveMode.STAY);
+        setAnchor(blockPosition());
+    }
+
+    /**
+     * Floating subtitle above the companion's head. The text is synced (never the entity's real name),
+     * so the client renderer can animate it rising and fading while the name tag stays untouched.
+     */
+    public void speak(String text) {
+        if (!(level() instanceof ServerLevel)) return;
+        if (text == null || text.isBlank()) return;
+        this.lastSpokenText = text;
+        this.lastSpokenTime = System.currentTimeMillis();
+        this.lastSpokenTick = tickCount;
+        entityData.set(DATA_SPEECH, text);
+        entityData.set(DATA_SPEECH_ID, entityData.get(DATA_SPEECH_ID) + 1);
+    }
+
+    public String lastSpokenText() { return lastSpokenText; }
+
+    // ------------------------------------------------------------------ inventory
+
+    /** True when the dropped item is what the player asked for (empty filter = anything). */
+    public boolean matchesPickup(ItemEntity item) {
+        return item != null && itemMatchesFilter(pickupFilter(), item.getItem());
+    }
+
+    /** Explicit "pick this up" order: walk to the matching dropped item instead of opening the inventory. */
+    public void requestPickup(String filter) {
+        pickupFilter = filter == null ? "" : filter.trim();
+        pickupRequested = true;
+        setPickupEnabled(true);
+        getNavigation().stop();
+    }
+
+    /** Ends an explicit pickup order; {@code storedAny} controls whether the companion confirms out loud. */
+    public void finishPickup(boolean storedAny) {
+        if (pickupRequested && storedAny) {
+            speak(pickupFilter.isBlank() ? "Picked up the items."
+                    : "Picked up " + pickupFilter.replace('_', ' ') + ".");
+        }
+        pickupRequested = false;
+        pickupFilter = "";
+        setPickupEnabled(false);
+    }
+
+    /** True when a dropped item matching the words is on the ground nearby (so "collect" should loot, not mine). */
+    private boolean anyMatchingDrops(String filter) {
+        if (filter == null || filter.isBlank()) return true;      // bare "pick up" = ground sweep
+        for (ItemEntity e : level().getEntitiesOfClass(ItemEntity.class, getBoundingBox().inflate(16),
+                x -> x.isAlive() && !x.getItem().isEmpty())) {
+            if (itemMatchesFilter(filter, e.getItem())) return true;
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------ lenient item matching (voice = wheel)
+
+    /**
+     * One shared, STT-forgiving matcher for every item filter so a voice order ("pick up golden carrots")
+     * finds exactly what the radial wheel's unfiltered pick finds. Lowercase, spaces/dashes become
+     * separators, filler words ("pick up some the...") are dropped, plural endings are relaxed, and each
+     * remaining word must appear somewhere in the item id ("golden_carrot") or hover name ("Golden Carrot").
+     */
+    public static boolean itemMatchesFilter(String filter, ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return false;
+        if (filter == null || filter.isBlank()) return true;
+        List<String> tokens = filterTokens(filter);
+        if (tokens.isEmpty()) return true;
+        String id = BuiltInRegistries.ITEM.getKey(stack.getItem()).getPath();
+        String name = stack.getHoverName().getString().toLowerCase(Locale.ROOT);
+        for (String token : tokens) {
+            if (!wordIn(id, token) && !wordIn(name, token)) return false;
+        }
+        return true;
+    }
+
+    /** Lowercase word tokens of a filter, with filler/command words stripped wherever they appear. */
+    private static List<String> filterTokens(String filter) {
+        List<String> out = new ArrayList<>();
+        for (String raw : filter.toLowerCase(Locale.ROOT).split("[^a-z0-9]+")) {
+            if (raw.isBlank() || FILLER_WORDS.contains(raw)) continue;   // "pick up some golden carrots" -> "golden carrots"
+            out.add(raw);
+        }
+        return out;
+    }
+
+    private static final Set<String> FILLER_WORDS = Set.of(
+            "a", "an", "the", "some", "any", "all", "that", "this", "those", "these", "it", "its", "my", "me",
+            "pick", "up", "please", "get", "got", "grab", "take", "takes", "bring", "collect", "loot");
+
+    /** Words that mean "anything usable" when they stand alone. */
+    private static final Set<String> FAMILY_WORDS = Set.of(
+            "weapon", "tool", "gear", "equipment", "something", "item");
+
+    /** Whole-word or contained match, tolerant of plural endings ("carrots" finds "golden_carrot"). */
+    private static boolean wordIn(String haystack, String token) {
+        if (haystack.isBlank() || token.isBlank()) return false;
+        if (haystack.contains(token)) return true;
+        if (token.endsWith("ies") && token.length() > 4
+                && haystack.contains(token.substring(0, token.length() - 3) + "y")) return true; // berries -> berry
+        if (token.endsWith("s") && token.length() > 3
+                && haystack.contains(token.substring(0, token.length() - 1))) return true;       // carrots -> carrot
+        return false;
+    }
+
+    /**
+     * Stores a stack in its real category: matching armor, then the one matching
+     * pickaxe/axe/shovel/sword slot, then general storage. Never displaces gear.
+     */
+    public ItemStack store(ItemStack stack) {
+        if (stack.isEmpty()) return stack;
+        ItemStack rest = stack.copy();
+        EquipmentSlot armorSlot = armorSlotFor(rest);
+        if (armorSlot != null) {
+            int idx = ARMOR_START + armorSlotIndex(armorSlot);
+            if (storage.getItem(idx).isEmpty()) {
+                storage.setItem(idx, rest.split(rest.getCount()));
+                storage.setChanged();
+                refreshEquipment();
+                return ItemStack.EMPTY;
+            }
+        }
+        int toolSlot = CompanionTools.dedicatedSlot(rest);
+        if (toolSlot >= 0 && storage.getItem(toolSlot).isEmpty()) {
+            storage.setItem(toolSlot, rest.split(rest.getCount()));
+            storage.setChanged();
+            refreshEquipment();
+            return ItemStack.EMPTY;
+        }
+        ItemStack left = insertMain(rest);
+        storage.setChanged();
+        refreshEquipment();
+        return left;
+    }
+
+    private ItemStack insertMain(ItemStack stack) {
+        ItemStack rest = stack.copy();
+        for (int i = MAIN_START; i < MAIN_START + MAIN_SIZE && !rest.isEmpty(); i++) {
+            ItemStack in = storage.getItem(i);
+            if (in.isEmpty()) {
+                int count = Math.min(rest.getCount(), rest.getMaxStackSize());
+                storage.setItem(i, rest.split(count));
+            } else if (ItemStack.isSameItemSameComponents(in, rest)) {
+                int space = Math.min(in.getMaxStackSize(), storage.getMaxStackSize()) - in.getCount();
+                if (space > 0) {
+                    int count = Math.min(space, rest.getCount());
+                    in.grow(count);
+                    rest.shrink(count);
+                }
+            }
+        }
+        return rest;
+    }
+
+    /** Sweeps up dropped items around the companion (used by LOOT and the seek goal's mining). */
+    public void collectNearbyItems() {
+        if (!(level() instanceof ServerLevel)) return;
+        List<ItemEntity> items = level().getEntitiesOfClass(ItemEntity.class, getBoundingBox().inflate(10),
+                e -> e.isAlive() && !e.getItem().isEmpty() && matchesPickup(e));
+        for (ItemEntity item : items) storeItem(item);
+    }
+
+    /** Stores a single dropped item; returns true when the whole stack fitted. */
+    public boolean storeItem(ItemEntity item) {
+        if (item == null || item.getItem().isEmpty()) return false;
+        ItemStack rest = store(item.getItem());
+        if (rest.isEmpty()) { item.discard(); return true; }
+        item.setItem(rest);
+        return false;
+    }
+
+    private void dropOneItem() {
+        for (int i = 0; i < storage.getContainerSize(); i++) {
+            ItemStack stack = storage.getItem(i);
+            if (stack.isEmpty()) continue;
+            ItemStack one = storage.removeItem(i, 1);
+            ItemEntity drop = new ItemEntity(level(), getX(), getY() + 1.1, getZ(), one);
+            drop.setDeltaMovement(random.nextGaussian() * 0.08, 0.25, random.nextGaussian() * 0.08);
+            level().addFreshEntity(drop);
+            return;
+        }
+    }
+
+    /** Migrates legacy/misplaced items without deleting, dropping or overwriting anything. */
+    private void normalizeToolSlots() {
+        for (int offset = 0; offset < 4; offset++) {
+            int slot = TOOL_START + offset;
+            ItemStack stack = storage.getItem(slot);
+            if (stack.isEmpty() || CompanionTools.dedicatedSlot(stack) == slot) continue;
+            int correct = CompanionTools.dedicatedSlot(stack);
+            if (correct >= 0 && storage.getItem(correct).isEmpty()) {
+                storage.setItem(slot, ItemStack.EMPTY);   // move into its free dedicated slot
+                storage.setItem(correct, stack);
+            }
+            // otherwise leave it where the player put it: tool slots are universal now
+        }
+        storage.setChanged();
+    }
+
+    /** Mirrors armor and the deliberately selected tool onto real equipment slots. */
+    public void refreshEquipment() {
+        if (level().isClientSide()) return;
+        normalizeToolSlots();
+        for (int i = 0; i < ARMOR_SLOTS.length; i++) {
+            EquipmentSlot slot = ARMOR_SLOTS[i];
+            ItemStack want = storage.getItem(ARMOR_START + i);
+            ItemStack current = getItemBySlot(slot);
+            if (!want.isEmpty() && isValidArmor(want, slot)) {
+                if (!ItemStack.matches(current, want)) setItemSlot(slot, want.copy());
+            } else if (!current.isEmpty()) setItemSlot(slot, ItemStack.EMPTY);
+        }
+        // Tool slots are universal now: hold whatever the player put there, regardless of item family.
+        if (selectedToolSlot >= 0 && selectedToolSlot < 4 && storage.getItem(TOOL_START + selectedToolSlot).isEmpty()) {
+            selectedToolSlot = -1;
+        }
+        if (selectedToolSlot < 0) {
+            for (int i = 0; i < 4; i++) {
+                if (!storage.getItem(TOOL_START + i).isEmpty()) { selectedToolSlot = i; break; }
+            }
+        }
+        ItemStack tool = selectedToolSlot >= 0 ? storage.getItem(TOOL_START + selectedToolSlot) : ItemStack.EMPTY;
+        if (!ItemStack.matches(getMainHandItem(), tool)) setItemSlot(EquipmentSlot.MAINHAND, tool.copy());
+    }
+
+    private static int armorSlotIndex(EquipmentSlot slot) {
+        return switch (slot) {
+            case HEAD -> 0;
+            case CHEST -> 1;
+            case LEGS -> 2;
+            case FEET -> 3;
+            default -> -1;
+        };
+    }
+
+    private static EquipmentSlot armorSlotFor(ItemStack stack) {
+        Equippable e = stack.get(net.minecraft.core.component.DataComponents.EQUIPPABLE);
+        if (e == null) return null;
+        return switch (e.slot()) {
+            case HEAD, CHEST, LEGS, FEET -> e.slot();
+            default -> null;
+        };
+    }
+
+    private static boolean isValidArmor(ItemStack stack, EquipmentSlot slot) {
+        Equippable e = stack.get(net.minecraft.core.component.DataComponents.EQUIPPABLE);
+        return e != null && e.slot() == slot;
+    }
+
+    private static boolean isTool(ItemStack stack) {
+        return CompanionTools.isDedicatedTool(stack);
+    }
+
+    // ------------------------------------------------------------------ injured / revive
+
+    /** Lethal damage converts into the downed state instead of death (first time only). */
+    private void injure(DamageSource source) {
+        this.injurySource = source;
+        this.injuredLeftTicks = 20 * REVIVE_SECONDS;
+        this.reviveProgress = 0f;
+        this.lastRevivePulse = 0;
+        entityData.set(DATA_INJURED, 1);
+        entityData.set(DATA_REVIVE, 0f);
+        entityData.set(DATA_INJURED_LEFT, injuredLeftTicks);
+        setHealth(1.0f);
+        forcedTarget = null;
+        setTarget(null);
+        clearSeekBlock();
+        pickupRequested = false;
+        pickupFilter = "";
+        setPickupEnabled(false);
+        if (isSitting()) setMoveMode(MoveMode.STAY);
+        getNavigation().stop();
+        speak("I'm down! Hold left click on me to revive me!");
+    }
+
+    /** Called from the REVIVE order while the player holds left mouse button on the companion. */
+    public void revivePulse() {
+        if (!isInjured()) return;
+        lastRevivePulse = System.currentTimeMillis();
+    }
+
+    /** Revives the companion (used by the revive command for testing and by the revive timer). */
+    public void revive() {
+        entityData.set(DATA_INJURED, 0);
+        entityData.set(DATA_REVIVE, 0f);
+        entityData.set(DATA_INJURED_LEFT, 0);
+        reviveProgress = 0f;
+        setHealth(getMaxHealth());
+        setPose(Pose.STANDING);
+        speak("Thanks, I'm back on my feet!");
+    }
+
+    /** The 60 s revive window ran out: drop the gear and really die. */
+    private void bleedOut() {
+        speak("I'm fading...");
+        Containers.dropContents(level(), this, storage);
+        setItemSlot(EquipmentSlot.MAINHAND, ItemStack.EMPTY);
+        setItemSlot(EquipmentSlot.OFFHAND, ItemStack.EMPTY);
+        for (EquipmentSlot slot : ARMOR_SLOTS) setItemSlot(slot, ItemStack.EMPTY);
+        forceDeath = true;
+        die(injurySource != null ? injurySource : level().damageSources().generic());
+    }
+
+    public boolean isReviving() {
+        return isInjured() && System.currentTimeMillis() - lastRevivePulse < 700;
+    }
+
+    // ------------------------------------------------------------------ PlanActions (AI plan execution)
+
+    /** Accepts a plan (JSON from the client or a subcommand). Returns true if a plan was started. */
+    public boolean plan(String json) {
+        return planner.accept(json, this, tickCount);
+    }
+
+    @Override public Player planOwner() { return getOwner(); }
+
+    @Override
+    public void planCommand(CompanionCommand cmd, String arg) {
+        applyingPlanStep = true;
+        try {
+            ServerPlayer owner = getOwner() instanceof ServerPlayer sp ? sp : null;
+            applyCommand(cmd, owner, arg);
+        } finally {
+            applyingPlanStep = false;
+        }
+    }
+
+    @Override public void planSay(String text) { speak(text); }
+    @Override public boolean planSeekActive() { return !seekBlock().isBlank(); }
+    @Override public boolean planPickupActive() { return isPickupRequested() || isPickupEnabled(); }
+    @Override public boolean planFighting() { LivingEntity t = getTarget(); return t != null && t.isAlive(); }
+    @Override public boolean planPaused() { return isInjured(); }
+    @Override public boolean planPlayerHold() { return isSitting() || moveMode() == MoveMode.STAY; }
+
+    // ------------------------------------------------------------------ targeting (called by CompanionTargetGoal)
+
+    public boolean isValidTarget(LivingEntity e, Player owner) {
+        return e != this && e != owner && e.isAlive() && e instanceof Enemy && !(e instanceof CompanionEntity);
+    }
+
+    /** Resolves "attack this creeper" style orders. Accepts a mob name, entity id, or "nearest". */
+    private LivingEntity findTarget(Player owner, String rawTarget) {
+        if (owner == null) return null;
+        String wanted = rawTarget == null ? "" : rawTarget.toLowerCase(Locale.ROOT).trim()
+                .replace("the ", "").replace("a ", "").replace("an ", "").trim();
+        if (wanted.isEmpty() || wanted.equals("nearest") || wanted.equals("closest") || wanted.equals("enemy"))
+            return pickAttackTarget(owner);
+
+        double radius = 40.0;
+        List<LivingEntity> candidates = level().getEntitiesOfClass(LivingEntity.class,
+                owner.getBoundingBox().inflate(radius), e -> e != this && e != owner && e.isAlive());
+        LivingEntity best = null;
+        double bestD = Double.MAX_VALUE;
+        for (LivingEntity e : candidates) {
+            String id = EntityType.getKey(e.getType()).getPath();
+            String typeName = e.getType().getDescription().getString().toLowerCase(Locale.ROOT);
+            String customName = e.getName().getString().toLowerCase(Locale.ROOT);
+            boolean match = wanted.equals(id) || wanted.equals(typeName)
+                    || typeName.contains(wanted) || id.contains(wanted) || customName.contains(wanted);
+            if (!match) continue;
+            double d = owner.distanceToSqr(e);
+            if (d < bestD) { bestD = d; best = e; }
+        }
+        return best;
+    }
+
+    /** Picks what to fight right now, or null. Order: explicit order > who hurt owner > what owner hit > who hurt me > nearby threats. */
+    public LivingEntity chooseTarget() {
+        Player owner = getOwner();
+        if (isSitting() || stance() == Stance.PASSIVE || isInjured()) return null;
+        if (forcedTarget != null && (!forcedTarget.isAlive() || tickCount > forcedTargetUntil)) forcedTarget = null;
+        if (forcedTarget != null) return forcedTarget;
+        if (owner != null) {
+            LivingEntity a = owner.getLastHurtByMob();
+            if (a != null && owner.tickCount - owner.getLastHurtByMobTimestamp() < 200 && isValidTarget(a, owner) && !(a instanceof Creeper) && visibleOrAggro(a, owner)) return a;
+            LivingEntity b = owner.getLastHurtMob();
+            if (b != null && owner.tickCount - owner.getLastHurtMobTimestamp() < 200 && isValidTarget(b, owner) && !(b instanceof Creeper) && visibleOrAggro(b, owner)) return b;
+        }
+        LivingEntity c = getLastHurtByMob();
+        if (c != null && c.isAlive() && c != owner && !(c instanceof CompanionEntity) && !(c instanceof Player) && visibleOrAggro(c, owner)) return c;
+
+        boolean mining = mineTask().running();
+        // While a mining job is running, only an adjacent threat interrupts it (a far zombie must not stall the dig).
+        double r = mining ? 4 : (stance() == Stance.GUARD ? 16 : 6);
+        var centre = (owner != null && moveMode() == MoveMode.FOLLOW) ? owner : this;
+        List<LivingEntity> near = level().getEntitiesOfClass(LivingEntity.class, centre.getBoundingBox().inflate(r),
+                e -> isValidTarget(e, owner) && !(e instanceof Creeper) && distanceToSqr(e) < (mining ? 8 * 8 : 28 * 28));
+        LivingEntity best = null;
+        double bestD = Double.MAX_VALUE;
+        for (LivingEntity e : near) {
+            Mob asMob = e instanceof Mob m ? m : null;
+            // DEFENSIVE only reacts to mobs that are actually coming for us or the owner
+            if (stance() == Stance.DEFENSIVE && asMob != null && asMob.getTarget() != owner && asMob.getTarget() != this) continue;
+            // No attacking through walls: a mob we cannot see only counts if it is already fighting the owner,
+            // or (when aggressive) fighting the companion itself. Everything else must be visible. Closer wins.
+            if (!getSensing().hasLineOfSight(e)) {
+                boolean aggroOnOwner = owner != null && asMob != null && asMob.getTarget() == owner;
+                boolean aggroOnSelf = asMob != null && asMob.getTarget() == this;
+                if (!aggroOnOwner && !(aggroOnSelf && stance() == Stance.GUARD)) continue;
+            }
+            double d = distanceToSqr(e);
+            if (d < bestD) { bestD = d; best = e; }
+        }
+        return best;
+    }
+
+    /** Wall-hack gate: a mob we cannot see only counts when it is already fighting the companion or the owner. */
+    private boolean visibleOrAggro(LivingEntity e, Player owner) {
+        if (getSensing().hasLineOfSight(e)) return true;
+        if (e instanceof Mob m) return m.getTarget() == this || (owner != null && m.getTarget() == owner);
+        return false;
+    }
+
+    /** True for the target the player explicitly ordered (kept through walls while it stays reachable). */
+    public boolean isForced(LivingEntity e) { return e != null && e == forcedTarget; }
+
+    /** Enemy the owner is looking at, else the enemy nearest to the owner. */
+    private LivingEntity pickAttackTarget(Player owner) {
+        List<LivingEntity> enemies = level().getEntitiesOfClass(LivingEntity.class, owner.getBoundingBox().inflate(24), e -> isValidTarget(e, owner));
+        Vec3 eye = owner.getEyePosition(), look = owner.getLookAngle();
+        LivingEntity best = null;
+        double bestDot = 0.93;
+        for (LivingEntity e : enemies) {
+            double dot = look.dot(e.getEyePosition().subtract(eye).normalize());
+            if (dot > bestDot) { bestDot = dot; best = e; }
+        }
+        if (best != null) return best;
+        double bestD = Double.MAX_VALUE;
+        for (LivingEntity e : enemies) { double d = owner.distanceToSqr(e); if (d < bestD) { bestD = d; best = e; } }
+        return best;
+    }
+
+    @Override
+    public void setTarget(LivingEntity target) {
+        if (target != null && target != getTarget()) {
+            targetSinceTick = tickCount;
+            if (!level().isClientSide()) equipBestWeapon();
+        }
+        super.setTarget(target);
+    }
+
+    private void equipBestWeapon() {
+        int sword = CompanionTools.bestSwordIndex(storage);
+        if (sword >= 0) selectTool(sword);
+    }
+
+    /** Moves a storage tool into only its matching row slot, swapping safely if occupied. */
+    private void selectTool(int sourceSlot) {
+        if (sourceSlot < 0) return;
+        ItemStack selected = storage.getItem(sourceSlot);
+        int dedicated = CompanionTools.dedicatedSlot(selected);
+        if (dedicated < 0) return;
+        if (sourceSlot != dedicated) {
+            ItemStack displaced = storage.getItem(dedicated);
+            storage.setItem(dedicated, selected.copy());
+            storage.setItem(sourceSlot, displaced.copy());
+        }
+        selectedToolSlot = dedicated - TOOL_START;
+        storage.setChanged();
+        refreshEquipment();
+    }
+
+    /**
+     * Hostile mobs only smell players by default. Every so often the companion claims any monster that has no
+     * target yet and can see it, so zombies etc. proactively come hunting instead of ignoring it. Their own
+     * retargeting still wins whenever a player (or a fight) is available, and a downed/resting companion is left alone.
+     */
+    private void aggroMonsters() {
+        if (isInjured() || isSitting()) return;
+        if (!(level() instanceof ServerLevel level)) return;
+        for (Monster m : level.getEntitiesOfClass(Monster.class, getBoundingBox().inflate(24), e -> e.isAlive())) {
+            if (m.getTarget() != null || !m.getSensing().hasLineOfSight(this)) continue;
+            m.setTarget(this);
+        }
+    }
+
+    /** Uses block tags plus actual destroy speed, then immediately syncs the held stack. */
+    public void equipBestToolFor(net.minecraft.world.level.block.state.BlockState state) {
+        int bestSlot = CompanionTools.bestToolIndex(storage, state);
+        if (bestSlot < 0) {
+            selectedToolSlot = -1;
+            refreshEquipment();
+            return;
+        }
+        selectTool(bestSlot);
+    }
+
+    /** Places a torch from the bag at a free adjacent floor cell when it is too dark. */
+    public boolean placeTorch() {
+        if (!(level() instanceof ServerLevel level)) return false;
+        if (level.getMaxLocalRawBrightness(blockPosition()) >= 9) return false;   // bright enough already
+        int slot = -1;
+        for (int i = MAIN_START; i < MAIN_START + MAIN_SIZE; i++) {
+            if (storage.getItem(i).getItem() == net.minecraft.world.item.Items.TORCH) { slot = i; break; }
+        }
+        if (slot < 0) return false;
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                if (dx == 0 && dz == 0) continue;
+                BlockPos torchPos = blockPosition().offset(dx, 0, dz);
+                BlockPos floor = torchPos.below();
+                if (!level.getBlockState(floor).isFaceSturdy(level, floor, Direction.UP)) continue;
+                if (!level.getBlockState(torchPos).isAir() || !level.getBlockState(torchPos.above()).isAir()) continue;
+                level.setBlock(torchPos, net.minecraft.world.level.block.Blocks.TORCH.defaultBlockState(), 3);
+                storage.removeItem(slot, 1);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** "equip pickaxe" -> holds the best matching item: the dedicated tool row first, otherwise the general bag (moved into a free tool slot). Token matching, because STT output is fuzzy. */
+    private void equipByName(String raw) {
+        String want = raw == null ? "" : raw.toLowerCase(Locale.ROOT).trim().replaceAll("[^a-z0-9]+", " ").trim();
+        List<String> tokens = new ArrayList<>();
+        for (String w : want.split(" ")) {
+            if (w.isBlank() || w.equals("my") || w.equals("the") || w.equals("a") || w.equals("an")
+                    || w.equals("some") || w.equals("any")) continue;
+            tokens.add(w);
+        }
+        boolean catchAll = tokens.isEmpty() || (tokens.size() == 1 && FAMILY_WORDS.contains(tokens.get(0)));
+        int slot = pickEquippable(TOOL_START, 4, tokens, catchAll);
+        // With universal slots a usable item may sit in general storage: bring it into a free tool slot first.
+        if (slot < 0 && !catchAll) {
+            int inBag = pickEquippable(MAIN_START, MAIN_SIZE, tokens, false);
+            if (inBag >= 0) {
+                for (int i = 0; i < 4; i++) {
+                    int target = TOOL_START + i;
+                    if (storage.getItem(target).isEmpty()) {
+                        storage.setItem(target, storage.removeItem(inBag, 1));
+                        storage.setChanged();
+                        slot = target;
+                        break;
+                    }
+                }
+            }
+        }
+        if (slot >= 0) {
+            selectedToolSlot = slot - TOOL_START;
+            refreshEquipment();
+            speak("Equipped the " + storage.getItem(slot).getHoverName().getString() + ".");
+        } else {
+            sayNoTool(want);
+        }
+    }
+
+    /** Scores every candidate: an exact word match beats a substring match; synonyms keep fuzzy STT working. */
+    private int pickEquippable(int from, int count, List<String> tokens, boolean catchAll) {
+        int best = -1, bestScore = 0;
+        for (int i = 0; i < count; i++) {
+            ItemStack s = storage.getItem(from + i);
+            if (s.isEmpty()) continue;
+            if (catchAll) return from + i;                  // generic "equip": first non-empty slot
+            String id = BuiltInRegistries.ITEM.getKey(s.getItem()).getPath();
+            String name = s.getHoverName().getString().toLowerCase(Locale.ROOT);
+            int score = 0;
+            for (String t : tokens) {
+                int sc = Math.max(idWordScore(id, t), nameWordScore(name, t));
+                if (sc == 0) sc = synonymIn(id, t) ? 1 : 0;
+                score = Math.max(score, sc);
+            }
+            if (score > bestScore) { bestScore = score; best = from + i; }
+        }
+        return bestScore > 0 ? best : -1;
+    }
+
+    /** 3 when the token is a whole word in the id ("axe" matches "iron_axe" but not "pickaxe"), 1 on a bare substring. */
+    private static int idWordScore(String haystack, String token) {
+        for (String w : haystack.split("[^a-z0-9]+")) if (w.equals(token)) return 3;
+        return haystack.contains(token) ? 1 : 0;
+    }
+
+    /** Same for the displayed name; a name word match scores slightly under an id word match. */
+    private static int nameWordScore(String haystack, String token) {
+        for (String w : haystack.split("[^a-z0-9]+")) if (w.equals(token)) return 2;
+        return haystack.contains(token) ? 1 : 0;
+    }
+
+    /** Family keywords: "axe" shouldn't grab a pickaxe, but "weapon" covers swords, axes and tridents. */
+    private static boolean synonymIn(String id, String token) {
+        if (token.startsWith("pick")) return id.contains("pickaxe");
+        if (token.equals("shovel") || token.equals("spade")) return id.contains("shovel");
+        if (token.equals("hatchet")) return id.contains("axe");
+        if (token.equals("weapon") || token.equals("blade") || token.equals("arms"))
+            return id.contains("sword") || id.contains("axe") || id.contains("trident") || id.contains("mace");
+        if (token.equals("hoe") || token.equals("hoes")) return id.contains("hoe");
+        return false;
+    }
+
+    private void sayNoTool(String want) {
+        speak(want.isBlank() ? "My bag has no tools." : "I don't have " + want.replace('_', ' ') + " in my bag.");
+    }
+
+    // ------------------------------------------------------------------ block seeking helpers
+
+    /** Converts "some wood", "diamonds", "oak planks"... into a block id (or family id), or "" when unknown. */
+    public static String normalizeBlockId(String raw) {
+        if (raw == null) return "";
+        String s = raw.toLowerCase(Locale.ROOT).trim().replace(' ', '_').replace('-', '_');
+        s = s.replaceAll("^(some|any|all|a|an|the|me|my|of|_)+", "");
+        if (s.startsWith("minecraft:")) s = s.substring(10);
+        s = BLOCK_ALIASES.getOrDefault(s, s);
+        if (isBlock(s)) return s;
+        if (s.endsWith("s") && s.length() > 3) {                 // plurals: stones -> stone, logs -> log
+            String t = s.substring(0, s.length() - 1);
+            if (isBlock(t) || FAMILY_IDS.contains(t)) return t;
+        }
+        return FAMILY_IDS.contains(s) ? s : "";
+    }
+
+    private static boolean isBlock(String id) {
+        if (id == null || id.isEmpty()) return false;
+        Identifier loc = Identifier.tryParse(id);
+        return loc != null && BuiltInRegistries.BLOCK.containsKey(loc);
+    }
+
+    public static String prettyBlockId(String id) {
+        if (id == null || id.isBlank()) return "that block";
+        String s = id;
+        if (s.startsWith("minecraft:")) s = s.substring(10);
+        return switch (s) {
+            case "log", "wood" -> "wood";
+            case "planks", "plank" -> "planks";
+            case "leaves" -> "leaves";
+            case "wool" -> "wool";
+            default -> {
+                if (s.startsWith("deepslate_")) s = s.substring(10);
+                yield s.replace('_', ' ');
+            }
+        };
+    }
+
+    // ------------------------------------------------------------------ movement helpers
+
+    /** Puts the companion on a free, solid spot near {@code to}. Falls back to the exact owner position. */
+    public void teleportNear(LivingEntity to) {
+        Vec3 from = position();
+        BlockPos base = to.blockPosition();
+        for (int i = 0; i < 16; i++) {
+            int dx = random.nextIntBetweenInclusive(-3, 3), dz = random.nextIntBetweenInclusive(-3, 3);
+            if (Math.abs(dx) < 2 && Math.abs(dz) < 2) continue;
+            BlockPos p = base.offset(dx, 0, dz);
+            if (!level().getBlockState(p.below()).isFaceSturdy(level(), p.below(), Direction.UP)) continue;
+            if (!level().noCollision(this, getBoundingBox().move(p.getX() + 0.5 - getX(), p.getY() - getY(), p.getZ() + 0.5 - getZ()))) continue;
+            setPos(p.getX() + 0.5, p.getY(), p.getZ() + 0.5);
+            afterTeleport(from);
+            return;
+        }
+        setPos(to.getX(), to.getY(), to.getZ());
+        afterTeleport(from);
+    }
+
+    /** Shared tail of a teleport: stop pathing, reset fall damage, and play the enderman poof at both ends. */
+    private void afterTeleport(Vec3 from) {
+        getNavigation().stop();
+        resetFallDistance();
+        if (!(level() instanceof ServerLevel server)) return;
+        Vec3 to = position();
+        server.playSound(null, from.x, from.y, from.z, SoundEvents.ENDERMAN_TELEPORT, SoundSource.PLAYERS, 0.9f, 1.0f);
+        server.playSound(null, to.x, to.y, to.z, SoundEvents.ENDERMAN_TELEPORT, SoundSource.PLAYERS, 0.9f, 1.2f);
+        server.sendParticles(ParticleTypes.PORTAL, from.x, from.y + 0.9, from.z, 24, 0.3, 0.6, 0.3, 0.15);
+        server.sendParticles(ParticleTypes.PORTAL, to.x, to.y + 0.9, to.z, 24, 0.3, 0.6, 0.3, 0.15);
+    }
+
+    // ------------------------------------------------------------------ vanilla hooks
+
+    @Override
+    public void tick() {
+        super.tick();
+        if (level().isClientSide()) return;
+        if (isSitting()) {
+            getNavigation().stop();
+            if (tickCount % 40 == 0) heal(1.0f);               // resting heals
+        }
+        // Clear the synced subtitle after 6 seconds (the client animation itself lasts ~5 s).
+        // Keep the text token alive for the whole TTS line. The client hides it from
+        // actual playback progress; clearing it after six seconds truncated longer audio.
+        if (!speech().isBlank() && tickCount - lastSpokenTick > 600) {
+            entityData.set(DATA_SPEECH, "");
+        }
+        if (tickCount % 20 == 0) {
+            refreshEquipment();
+            aggroMonsters();                     // hostile mobs should see the companion as a target
+        }
+        // Drop an automatic target we cannot reach (so mining etc. resumes); player-forced targets persist.
+        LivingEntity tgt = getTarget();
+        if (tgt != null && tgt != forcedTarget && tgt.isAlive() && tickCount - targetSinceTick > 200
+                && getNavigation().isDone() && distanceToSqr(tgt) > 16 * 16) {
+            setTarget(null);
+        }
+        if (isInjured()) {
+            getNavigation().stop();
+            setTarget(null);
+            setPose(Pose.SWIMMING);                            // Mojang's crawl animation (swimming pose on land)
+            boolean reviving = isReviving();
+            if (reviving) {
+                reviveProgress = Math.min(1f, reviveProgress + 1f / REVIVE_TICKS);
+                entityData.set(DATA_REVIVE, reviveProgress);
+                if (reviveProgress >= 1f) { revive(); return; }
+            } else {
+                reviveProgress = Math.max(0f, reviveProgress - 1f / (REVIVE_TICKS * 2));
+                entityData.set(DATA_REVIVE, reviveProgress);
+                if (--injuredLeftTicks <= 0) { bleedOut(); return; }
+                if (injuredLeftTicks == 200) speak("I'm fading... revive me!");
+            }
+            if (tickCount % 10 == 0) entityData.set(DATA_INJURED_LEFT, injuredLeftTicks);
+        }
+        if (!level().isClientSide() && planner.active()) planner.tick(this, tickCount);
+    }
+
+    @Override
+    public boolean hurtServer(ServerLevel level, DamageSource source, float amount) { // 26.1-CHECK: hurt -> hurtServer since 1.21.2
+        if (isInjured()) return false;                              // already down: no further damage
+        // Friendly fire enabled: the owner can hurt the companion just like another player can.
+        // Lethal damage still uses the normal downed/revive flow (and a downed companion is invulnerable).
+        boolean hurt = super.hurtServer(level, source, amount);
+        if (hurt) {
+            playSound(net.minecraft.sounds.SoundEvents.GENERIC_HURT, 1.0f, 1.0f);
+            if (tickCount - lastOuchTick > 60) {
+                lastOuchTick = tickCount;
+                speak(new String[]{"Ouch!", "Watch it!", "Hey, that hurt!", "Ow!", "Easy there!"}[random.nextInt(5)]);
+            }
+        }
+        if (hurt && isSitting()) setMoveMode(MoveMode.STAY);   // stand up and defend yourself
+        return hurt;
+    }
+
+    /** First lethal hit converts into the injured crawl instead of death. */
+    @Override
+    public void die(DamageSource source) {
+        if (!forceDeath && !isInjured()) { injure(source); return; }
+        super.die(source);
+    }
+
+    // Right-clicking the model is intentionally disabled: all orders come from the radial menu or voice.
+
+    @Override
+    public boolean removeWhenFarAway(double distSq) { return false; }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\CompanionTools.java
+
+```java
+package com.example.companionmod.entity;
+
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.world.Container;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.state.BlockState;
+
+/** The single source of truth for the four dedicated equipment slots. */
+public final class CompanionTools {
+    public enum Kind {
+        PICKAXE(0, "Pickaxe", "_pickaxe"),
+        AXE(1, "Axe", "_axe"),
+        SHOVEL(2, "Shovel", "_shovel"),
+        SWORD(3, "Sword", "_sword");
+
+        public final int slotOffset;
+        public final String label;
+        private final String suffix;
+
+        Kind(int slotOffset, String label, String suffix) {
+            this.slotOffset = slotOffset;
+            this.label = label;
+            this.suffix = suffix;
+        }
+    }
+
+    private CompanionTools() {}
+
+    public static String itemId(ItemStack stack) {
+        return stack.isEmpty() ? "" : BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+    }
+
+    public static Kind kindOf(ItemStack stack) {
+        String path = itemId(stack);
+        for (Kind kind : Kind.values()) {
+            if (path.endsWith(kind.suffix)) return kind;
+        }
+        return null;
+    }
+
+    public static boolean isDedicatedTool(ItemStack stack) {
+        return kindOf(stack) != null;
+    }
+
+    public static int dedicatedSlot(ItemStack stack) {
+        Kind kind = kindOf(stack);
+        return kind == null ? -1 : CompanionEntity.TOOL_START + kind.slotOffset;
+    }
+
+    public static Kind preferredKind(BlockState state) {
+        if (state.is(BlockTags.MINEABLE_WITH_PICKAXE)) return Kind.PICKAXE;
+        if (state.is(BlockTags.MINEABLE_WITH_AXE)) return Kind.AXE;
+        if (state.is(BlockTags.MINEABLE_WITH_SHOVEL)) return Kind.SHOVEL;
+        return null;
+    }
+
+    /** Searches the tool row and storage, so overflow tools are still usable. */
+    public static int bestToolIndex(Container inventory, BlockState state) {
+        Kind preferred = preferredKind(state);
+        int best = -1;
+        double bestScore = 0;
+        for (int i = 0; i < inventory.getContainerSize(); i++) {
+            ItemStack stack = inventory.getItem(i);
+            Kind kind = kindOf(stack);
+            if (kind == null) continue;
+            float speed = Math.max(1.0F, stack.getDestroySpeed(state));
+            double score = speed * (kind == preferred ? 1000.0 : 1.0);
+            if (i >= CompanionEntity.TOOL_START && i < CompanionEntity.MAIN_START) score += 0.01;
+            if (score > bestScore) {
+                bestScore = score;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    /** First melee-worthy item: any sword anywhere, or anything the player parked in the tool row (slots are universal). */
+    public static int bestSwordIndex(Container inventory) {
+        for (int i = 0; i < inventory.getContainerSize(); i++) {
+            if (kindOf(inventory.getItem(i)) == Kind.SWORD) return i;
+        }
+        for (int i = CompanionEntity.TOOL_START; i < CompanionEntity.MAIN_START; i++) {
+            if (!inventory.getItem(i).isEmpty()) return i;
+        }
+        return -1;
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\plan\CompanionPlanner.java
+
+```java
+package com.example.companionmod.entity.plan;
+
+import com.example.companionmod.command.CompanionCommand;
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.voice.PlanParser;
+import com.example.companionmod.voice.PlanStep;
+import net.minecraft.world.entity.player.Player;
+
+import java.util.ArrayDeque;
+import java.util.Set;
+
+/**
+ * Runs an AI-made plan one step at a time by issuing ordinary companion orders, so every behaviour (mining, pickup,
+ * combat, follow) keeps its existing safety rules. The server re-validates every plan; the model never executes anything itself.
+ *
+ * <p>Player orders do not throw the plan away any more: they {@link #pause(long) freeze} it in place and
+ * {@code continue} {@link #resume(long) unfreezes} it, deadlines shifted forward by the pause so nothing expires
+ * while it was interrupted.</p>
+ */
+public final class CompanionPlanner {
+    private static final Set<String> RETURN_AFTER = Set.of("wander", "patrol", "seek_block", "pickup", "attack", "guard");
+
+    private final ArrayDeque<PlanStep> queue = new ArrayDeque<>();
+    private PlanStep current;
+    private long startTick, endTick, lastPlayerOrder = -100000L;
+    private String goal = "";
+    private String lastOp = "";
+    private boolean paused;
+    private long pausedAt;
+
+    public boolean active() { return current != null || !queue.isEmpty(); }
+    public boolean paused() { return paused; }
+    public String goal() { return goal; }
+
+    public void cancel() { queue.clear(); current = null; goal = ""; paused = false; }
+
+    /** Freezes the plan in place; resume() continues it as if nothing had happened. */
+    public void pause(long tick) {
+        if (active() && !paused) { paused = true; pausedAt = tick; }
+    }
+
+    /** Unfreezes a paused plan, shifting its deadlines past the pause. Returns true when there was a plan to resume. */
+    public boolean resume(long tick) {
+        if (!paused) return false;
+        paused = false;
+        long dt = Math.max(0L, tick - pausedAt);
+        startTick += dt;
+        endTick += dt;
+        return active();
+    }
+
+    /** Call whenever the player gives a manual order: it always wins and blocks autonomy for 60 s (the plan pauses, not dies). */
+    public void notePlayerOrder(long tick) { lastPlayerOrder = tick; pause(tick); }
+
+    /** Accepts a plan JSON from the client. Returns true if a plan was started. An empty non-auto plan cancels the current one. */
+    public boolean accept(String json, PlanActions host, long tick) {
+        boolean auto = PlanParser.isAuto(json);
+        if (auto && (active() || host.planPlayerHold() || tick - lastPlayerOrder < 1200)) return false;
+        PlanParser.Plan plan = PlanParser.parse(json, auto);
+        if (plan.isEmpty()) { if (!auto) cancel(); return false; }
+        cancel();
+        queue.addAll(plan.steps());
+        goal = plan.goal();
+        return true;
+    }
+
+    public void tick(PlanActions host, long tick) {
+        if (paused || !active()) return;
+        Player owner = host.planOwner();
+        if (owner == null || !owner.isAlive()) { cancel(); return; }
+        if (host.planPaused()) { endTick++; return; }
+        if (current == null) { current = queue.poll(); begin(host, tick); return; }
+        if (!finished(host, tick)) return;
+        current = null;
+        if (queue.isEmpty()) {
+            if (RETURN_AFTER.contains(lastOp) && !host.planPlayerHold()) host.planCommand(CompanionCommand.FOLLOW, "");
+            goal = "";
+        }
+    }
+
+    private void begin(PlanActions host, long tick) {
+        startTick = tick;
+        endTick = tick + current.seconds() * 20L;
+        lastOp = current.op();
+        switch (current.op()) {
+            case "say" -> host.planSay(current.arg());
+            case "wait" -> { }
+            case "seek_block" -> {
+                String id = CompanionEntity.normalizeBlockId(current.arg());
+                if (id.isBlank()) endTick = tick; else host.planCommand(CompanionCommand.SEEK_BLOCK, id);
+            }
+            case "pickup" -> host.planCommand(CompanionCommand.PICKUP, current.arg());
+            default -> host.planCommand(CompanionCommand.parse(current.op()), current.arg());
+        }
+    }
+
+    private boolean finished(PlanActions host, long tick) {
+        long dt = tick - startTick;
+        return switch (current.op()) {
+            case "say" -> dt >= 30;                                   // small pause so lines never flood chat
+            case "seek_block" -> tick >= endTick || (dt > 40 && !host.planSeekActive());
+            case "pickup" -> tick >= endTick || (dt > 20 && !host.planPickupActive());
+            case "attack" -> tick >= endTick || (dt > 60 && !host.planFighting());
+            default -> tick >= endTick;
+        };
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\plan\PlanActions.java
+
+```java
+package com.example.companionmod.entity.plan;
+
+import com.example.companionmod.command.CompanionCommand;
+import net.minecraft.world.entity.player.Player;
+
+/** What the planner needs from the companion. CompanionEntity implements this by delegating to its existing methods. */
+public interface PlanActions {
+    Player planOwner();
+    /** Same effect as the player giving this order (arg = block id for SEEK_BLOCK, item filter for PICKUP, else ""). */
+    void planCommand(CompanionCommand cmd, String arg);
+    void planSay(String text);
+    boolean planSeekActive();
+    boolean planPickupActive();
+    boolean planFighting();
+    /** Freeze the plan while true (e.g. injured and recovering). */
+    default boolean planPaused() { return false; }
+    /** True when the player told it to stay/sit: autonomous plans must not override that. */
+    default boolean planPlayerHold() { return false; }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\task\MineTask.java
+
+```java
+package com.example.companionmod.entity.task;
+
+import net.minecraft.world.level.storage.ValueInput;
+import net.minecraft.world.level.storage.ValueOutput;
+
+/**
+ * The companion's current "go find/mine X" job. It lives on the entity and is saved with it, so progress survives
+ * fights, sit/stay orders, injuries, chunk unloads and world reloads. The goal only reads and updates this object;
+ * stopping and restarting the goal never loses anything. A new order pauses the task, "continue" resumes it.
+ */
+public final class MineTask {
+    public enum Phase { SEARCH, DESCEND, BRANCH }
+    public static final int NO_DESCEND = Integer.MIN_VALUE;
+
+    public String blockId = "";
+    public int want, mined, ty = NO_DESCEND, dirData, leg, legLen;
+    public Phase phase = Phase.SEARCH;
+    public boolean paused;
+
+    public void begin(String id, boolean nether, int facingDirData) {
+        blockId = id;
+        want = defaultWant(id);
+        mined = 0;
+        ty = targetY(id, nether);
+        phase = Phase.SEARCH;
+        dirData = facingDirData;
+        leg = 0;
+        legLen = 0;
+        paused = false;
+    }
+
+    public boolean exists() { return !blockId.isEmpty(); }
+    public boolean running() { return exists() && !paused; }
+    public boolean deep() { return ty != NO_DESCEND; }
+    public void pause() { paused = true; }
+    public boolean resume() { if (!exists()) return false; paused = false; return true; }
+    public void finish() { blockId = ""; paused = false; mined = 0; }
+    public String describe() { return "mining " + blockId.replace('_', ' ') + " (" + mined + "/" + want + ")"; }
+
+    /** Best Y level to branch-mine for. NO_DESCEND = surface target (logs, stone, emeralds...). Tweak freely. */
+    public static int targetY(String id, boolean nether) {
+        if (nether) return id.contains("ancient_debris") ? 15 : NO_DESCEND;
+        if (id.contains("diamond") || id.contains("redstone")) return -58;
+        if (id.contains("lapis")) return 0;
+        if (id.contains("gold")) return -16;
+        if (id.contains("iron")) return 16;
+        if (id.contains("copper")) return 40;
+        if (id.contains("coal")) return 45;
+        if (id.contains("deepslate")) return -20;
+        return NO_DESCEND;
+    }
+
+    public static int defaultWant(String id) {
+        if (id.contains("diamond") || id.contains("emerald")) return 6;
+        if (id.contains("ancient_debris")) return 4;
+        return 16;
+    }
+
+    public void save(ValueOutput out) {
+        if (!exists()) return;
+        out.putString("MineBlock", blockId);
+        out.putInt("MineWant", want);
+        out.putInt("MineDone", mined);
+        out.putInt("MineY", ty);
+        out.putInt("MinePhase", phase.ordinal());
+        out.putInt("MineDir", dirData);
+        out.putInt("MineLeg", leg);
+        out.putInt("MineLegLen", legLen);
+        out.putBoolean("MinePaused", paused);
+    }
+
+    public void load(ValueInput in) {
+        blockId = in.getStringOr("MineBlock", "");
+        want = in.getIntOr("MineWant", 0);
+        mined = in.getIntOr("MineDone", 0);
+        ty = in.getIntOr("MineY", NO_DESCEND);
+        phase = Phase.values()[Math.floorMod(in.getIntOr("MinePhase", 0), Phase.values().length)];
+        dirData = in.getIntOr("MineDir", 0);
+        leg = in.getIntOr("MineLeg", 0);
+        legLen = in.getIntOr("MineLegLen", 0);
+        paused = in.getBooleanOr("MinePaused", false);
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\inventory\CompanionInventoryMenu.java
+
+```java
+package com.example.companionmod.inventory;
+
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.entity.CompanionTools;
+import com.example.companionmod.registry.ModContent;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.world.Container;
+import net.minecraft.world.SimpleContainer;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.inventory.Slot;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.equipment.Equippable;
+
+/**
+ * The companion's 26-slot bag: 4 armor slots, 4 tool slots and 18 storage slots, plus the player's
+ * inventory. The server menu wraps the companion's live container; the client menu (created from the
+ * {@link MenuType} supplier) uses a synced shadow container. Armor/tool row changes are mirrored onto
+ * the companion's equipment slots by {@link CompanionEntity#refreshEquipment()}.
+ */
+public class CompanionInventoryMenu extends AbstractContainerMenu {
+    public static final int SIZE = CompanionEntity.SIZE;          // 26
+    private static final int PLAYER_SLOTS = 36;
+
+    private final Container storage;
+    private final CompanionEntity companion;   // null on the client
+
+    /** Server side: opens the companion's live container. */
+    public CompanionInventoryMenu(int id, Inventory playerInventory, CompanionEntity companion) {
+        this(id, playerInventory, companion.storage(), companion);
+    }
+
+    /** Client side (called from the MenuType supplier): shadow container filled by slot sync. */
+    public CompanionInventoryMenu(int id, Inventory playerInventory) {
+        this(id, playerInventory, new SimpleContainer(SIZE), null);
+    }
+
+    private CompanionInventoryMenu(int id, Inventory playerInventory, Container storage, CompanionEntity companion) {
+        super(ModContent.COMPANION_INV_MENU, id);
+        this.storage = storage;
+        this.companion = companion;
+
+        // Row 1 (y 28): armor [0..3] + gap + tools [4..7]
+        for (int i = 0; i < 4; i++) {
+            addSlot(new ArmorSlot(storage, i, 8 + i * 18, 28, CompanionEntity.ARMOR_SLOTS[i]));
+        }
+        for (int i = 0; i < 4; i++) {
+            addSlot(new ToolSlot(storage, CompanionEntity.TOOL_START + i, 98 + i * 18, 28));
+        }
+        // Rows 2-3 (y 55, 73): main storage [8..25]
+        for (int row = 0; row < 2; row++) {
+            for (int col = 0; col < 9; col++) {
+                addSlot(new Slot(storage, CompanionEntity.MAIN_START + row * 9 + col, 8 + col * 18, 55 + row * 18));
+            }
+        }
+        // Player inventory + hotbar
+        addStandardInventorySlots(playerInventory, 8, 112);
+    }
+
+    @Override
+    public boolean stillValid(Player player) {
+        return companion == null
+                || (companion.isAlive() && player.distanceToSqr(companion) <= 64.0);
+    }
+
+    @Override
+    public void removed(Player player) {
+        super.removed(player);
+        if (companion != null && !companion.level().isClientSide()) companion.refreshEquipment();
+    }
+
+    @Override
+    public void slotsChanged(Container container) {
+        super.slotsChanged(container);
+        if (container == storage && companion != null && !companion.level().isClientSide()) {
+            companion.refreshEquipment();
+        }
+    }
+
+    @Override
+    public ItemStack quickMoveStack(Player player, int index) {
+        ItemStack rest = ItemStack.EMPTY;
+        Slot slot = slots.get(index);
+        if (slot == null || !slot.hasItem()) return rest;
+        ItemStack stack = slot.getItem();
+        rest = stack.copy();
+        if (index < SIZE) {
+            // companion storage -> player
+            if (!moveItemStackTo(stack, SIZE, SIZE + PLAYER_SLOTS, true)) return ItemStack.EMPTY;
+        } else {
+            // player -> companion storage (armor row first, then tools, then storage)
+            EquipmentSlot equipSlot = armorSlotFor(stack);
+            if (equipSlot != null) {
+                int target = CompanionEntity.ARMOR_START + armorIndex(equipSlot);
+                if (!moveItemStackTo(stack, target, target + 1, false)
+                        && !moveItemStackTo(stack, CompanionEntity.MAIN_START, CompanionEntity.MAIN_START + CompanionEntity.MAIN_SIZE, false)) {
+                    return ItemStack.EMPTY;
+                }
+            } else if (CompanionTools.isDedicatedTool(stack)) {
+                int target = CompanionTools.dedicatedSlot(stack);
+                if (!moveItemStackTo(stack, target, target + 1, false)
+                        && !moveItemStackTo(stack, CompanionEntity.MAIN_START, CompanionEntity.MAIN_START + CompanionEntity.MAIN_SIZE, false)) {
+                    return ItemStack.EMPTY;
+                }
+            } else if (!moveItemStackTo(stack, CompanionEntity.MAIN_START, CompanionEntity.MAIN_START + CompanionEntity.MAIN_SIZE, false)) {
+                return ItemStack.EMPTY;
+            }
+        }
+        if (stack.isEmpty()) slot.set(ItemStack.EMPTY);
+        else slot.setChanged();
+        return rest;
+    }
+
+    private static EquipmentSlot armorSlotFor(ItemStack stack) {
+        Equippable e = stack.get(DataComponents.EQUIPPABLE);
+        if (e == null) return null;
+        return switch (e.slot()) {
+            case HEAD, CHEST, LEGS, FEET -> e.slot();
+            default -> null;
+        };
+    }
+
+    private static int armorIndex(EquipmentSlot slot) {
+        return switch (slot) {
+            case HEAD -> 0;
+            case CHEST -> 1;
+            case LEGS -> 2;
+            case FEET -> 3;
+            default -> -1;
+        };
+    }
+
+    /** Armor row slots only accept the piece that belongs in that slot. */
+    private static class ArmorSlot extends Slot {
+        private final EquipmentSlot slot;
+
+        ArmorSlot(Container container, int index, int x, int y, EquipmentSlot slot) {
+            super(container, index, x, y);
+            this.slot = slot;
+        }
+
+        @Override
+        public boolean mayPlace(ItemStack stack) {
+            Equippable e = stack.get(DataComponents.EQUIPPABLE);
+            return e != null && e.slot() == slot;
+        }
+    }
+
+    /** Any tool slot accepts any item: a "weapon" can be an axe, a pickaxe, whatever the player wants there. */
+    private static class ToolSlot extends Slot {
+        ToolSlot(Container container, int index, int x, int y) {
+            super(container, index, x, y);
+        }
+
+        @Override
+        public boolean mayPlace(ItemStack stack) {
+            return !stack.isEmpty();          // dedicated tools still auto-route here on shift-click; anything may sit in any slot
+        }
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\net\CommandHandler.java
+
+```java
+package com.example.companionmod.net;
+
+import com.example.companionmod.command.CompanionCommand;
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.registry.ModContent;
+import com.example.companionmod.voice.ReplyParser;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+/** Server-side entry point for voice commands. The client is untrusted: validate, rate-limit, only touch the sender's own companion. */
+public final class CommandHandler {
+    /**
+     * Token bucket instead of a single 400 ms gap: the client legitimately sends bursts such as
+     * "set_skin" + "feminine" in one tick, and the old single-gap limiter silently dropped the second
+     * packet — which is why the feminine model never appeared.
+     */
+    private static final Map<UUID, Bucket> BUCKETS = new ConcurrentHashMap<>();
+    private static final double CAPACITY = 8.0;
+    private static final double REFILL_PER_SECOND = 6.0;
+
+    private static final class Bucket {
+        double tokens = CAPACITY;
+        long lastRefill = System.currentTimeMillis();
+    }
+
+    private CommandHandler() {}
+
+    public static void handle(ServerPlayer player, CommandPayload payload) {
+        CompanionCommand cmd = CompanionCommand.parse(payload.action());
+
+        // STOP is an emergency control, not optional background work. Never lose it to the token bucket.
+        if (cmd != CompanionCommand.STOP) {
+            Bucket bucket = BUCKETS.computeIfAbsent(player.getUUID(), id -> new Bucket());
+            long now = System.currentTimeMillis();
+            synchronized (bucket) {
+                bucket.tokens = Math.min(CAPACITY, bucket.tokens + (now - bucket.lastRefill) / 1000.0 * REFILL_PER_SECOND);
+                bucket.lastRefill = now;
+                if (bucket.tokens < 1.0) return;
+                bucket.tokens -= 1.0;
+            }
+        }
+        String say = ReplyParser.clean(payload.say());
+        String target = cmd == CompanionCommand.PLAN ? payload.target() : ReplyParser.clean(payload.target());
+
+        CompanionEntity companion = ModContent.findCompanion(player.level().getServer(), player.getUUID());
+        if (companion == null) {
+            player.sendSystemMessage(Component.literal("You have no companion. Activate a Companion Shrine to summon one."));
+            return;
+        }
+        companion.applyCommand(cmd, player, target);
+        if (!say.isBlank()) companion.speak(say);
+    }
+
+    public static void forget(UUID player) { BUCKETS.remove(player); }
+}
+```
+
+## common\src\main\java\com\example\companionmod\net\CommandPayload.java
+
+```java
+package com.example.companionmod.net;
+
+import com.example.companionmod.CompanionMod;
+import io.netty.buffer.ByteBuf;
+import net.minecraft.network.codec.ByteBufCodecs;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+
+/**
+ * Client -> server: "the player told their companion to do {@code action}, it answered {@code say},
+ * and the order optionally names a {@code target} entity (e.g. "creeper")."
+ */
+public record CommandPayload(String action, String say, String target) implements CustomPacketPayload {
+    public static final CustomPacketPayload.Type<CommandPayload> TYPE = new CustomPacketPayload.Type<>(CompanionMod.id("command"));
+    public static final StreamCodec<ByteBuf, CommandPayload> CODEC = StreamCodec.composite(
+            ByteBufCodecs.stringUtf8(32), CommandPayload::action,
+            ByteBufCodecs.stringUtf8(512), CommandPayload::say,
+            ByteBufCodecs.stringUtf8(1024), CommandPayload::target,
+            CommandPayload::new);
+
+    public CommandPayload(String action, String say) {
+        this(action, say, "");
+    }
+
+    @Override
+    public CustomPacketPayload.Type<? extends CustomPacketPayload> type() { return TYPE; }
+}
+```
+
+## common\src\main\java\com\example\companionmod\registry\ModContent.java
+
+```java
+package com.example.companionmod.registry;
+
+import com.example.companionmod.CompanionMod;
+import com.example.companionmod.block.CompanionShrineBlock;
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.inventory.CompanionInventoryMenu;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.MobCategory;
+import net.minecraft.world.flag.FeatureFlags;
+import net.minecraft.world.inventory.MenuType;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.SoundType;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+import net.minecraft.world.level.material.MapColor;
+
+import java.util.UUID;
+
+/**
+ * All game objects, created once. The loaders only register them (Fabric: Registry.register in order block -> item -> entity;
+ * NeoForge: inside RegisterEvent per registry). Nothing in here touches a loader API.
+ */
+public final class ModContent {
+    private static final ResourceKey<Block> BLOCK_KEY = ResourceKey.create(Registries.BLOCK, CompanionMod.id("shrine_core"));
+    private static final ResourceKey<Item> ITEM_KEY = ResourceKey.create(Registries.ITEM, CompanionMod.id("shrine_core"));
+    private static final ResourceKey<EntityType<?>> ENTITY_KEY = ResourceKey.create(Registries.ENTITY_TYPE, CompanionMod.id("companion"));
+
+    public static final Block SHRINE_CORE = new CompanionShrineBlock(
+            BlockBehaviour.Properties.of().setId(BLOCK_KEY).mapColor(MapColor.COLOR_CYAN)
+                    .strength(3.0f, 1200.0f).sound(SoundType.AMETHYST).lightLevel(s -> 12)); // 26.1-CHECK: setId is mandatory since 1.21.2
+
+    public static final Item SHRINE_CORE_ITEM = new BlockItem(SHRINE_CORE,
+            new Item.Properties().setId(ITEM_KEY).useBlockDescriptionPrefix());
+
+    public static final EntityType<CompanionEntity> COMPANION = EntityType.Builder
+            .of(CompanionEntity::new, MobCategory.MISC)
+            .sized(0.6f, 1.8f).eyeHeight(1.62f).clientTrackingRange(10)
+            .build(ENTITY_KEY);
+
+    private static final ResourceKey<MenuType<?>> MENU_KEY = ResourceKey.create(Registries.MENU, CompanionMod.id("companion_inventory"));
+    /** The supplier is the client-side factory (shadow container); the server creates menus with the entity directly. */
+    public static final MenuType<CompanionInventoryMenu> COMPANION_INV_MENU = new MenuType<>(
+            CompanionInventoryMenu::new, FeatureFlags.VANILLA_SET);
+
+    private ModContent() {}
+
+    public static net.minecraft.resources.Identifier blockId() { return BLOCK_KEY.identifier(); }   // 26.1-CHECK: ResourceKey.location() -> identifier()
+    public static net.minecraft.resources.Identifier itemId() { return ITEM_KEY.identifier(); }
+    public static net.minecraft.resources.Identifier entityId() { return ENTITY_KEY.identifier(); }
+    public static net.minecraft.resources.Identifier menuId() { return MENU_KEY.identifier(); }
+
+    /** Finds the loaded companion owned by {@code owner} in any dimension, or null. */
+    public static CompanionEntity findCompanion(MinecraftServer server, UUID owner) {
+        if (server == null) return null;
+        for (ServerLevel level : server.getAllLevels()) {
+            for (Entity e : level.getAllEntities()) { // 26.1-CHECK: ServerLevel.getAllEntities()
+                if (e instanceof CompanionEntity c && c.isAlive() && owner.equals(c.getOwnerUuid())) return c;
+            }
+        }
+        return null;
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\AudioRecorder.java
+
+```java
+package com.example.companionmod.voice;
+
+import javax.sound.sampled.*;
+import java.io.ByteArrayOutputStream;
+import java.io.ByteArrayInputStream;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Minimal microphone recorder using javax.sound.sampled.
+ * Note: In Minecraft, audio device access may require client-side permissions.
+ */
+public class AudioRecorder {
+    private TargetDataLine line;
+    private final AtomicBoolean running = new AtomicBoolean(false);
+    private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+    private Thread thread;
+
+    public void start() {
+        try {
+            AudioFormat format = new AudioFormat(16000, 16, 1, true, false);
+            DataLine.Info info = new DataLine.Info(TargetDataLine.class, format);
+            line = (TargetDataLine) AudioSystem.getLine(info);
+            line.open(format);
+            line.start();
+            running.set(true);
+            buffer.reset();
+            thread = new Thread(() -> {
+                byte[] chunk = new byte[1024];
+                while (running.get()) {
+                    int read = line.read(chunk, 0, chunk.length);
+                    if (read > 0) buffer.write(chunk, 0, read);
+                }
+            });
+            thread.setDaemon(true);
+            thread.start();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    public byte[] stopAndGetWav() {
+        running.set(false);
+        if (thread != null) {
+            try { thread.join(500); } catch (InterruptedException ignored) {}
+        }
+        if (line != null) {
+            line.stop();
+            line.close();
+        }
+        // Wrap raw PCM in a WAV container.
+        byte[] pcm = buffer.toByteArray();
+        try {
+            AudioFormat format = new AudioFormat(16000, 16, 1, true, false);
+            ByteArrayInputStream bais = new ByteArrayInputStream(pcm);
+            AudioInputStream ais = new AudioInputStream(bais, format, pcm.length / format.getFrameSize());
+            ByteArrayOutputStream wavOut = new ByteArrayOutputStream();
+            AudioSystem.write(ais, AudioFileFormat.Type.WAVE, wavOut);
+            return wavOut.toByteArray();
+        } catch (Exception e) {
+            e.printStackTrace();
+            return new byte[0];
+        }
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\FemaleGenderCompat.java
+
+```java
+package com.example.companionmod.voice;
+
+import com.example.companionmod.client.CompanionRenderState;
+import net.minecraft.client.model.HumanoidModel;
+import net.minecraft.client.renderer.entity.RenderLayerParent;
+import net.minecraft.client.renderer.entity.layers.RenderLayer;
+import net.minecraft.client.renderer.entity.state.HumanoidRenderState;
+import net.minecraft.world.entity.LivingEntity;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.UUID;
+
+/**
+ * Soft integration with Wildfire's Female Gender Mod 5.x
+ * (<a href="https://github.com/FemaleGenderMod/FemaleGenderMod">GitHub</a>, mod id {@code female_gender_mod}).
+ *
+ * <p>Version 5 made {@code com.wildfire.client.render.GenderLayer} generic over
+ * {@code HumanoidRenderState}/{@code HumanoidModel}, so it <b>can</b> be attached to the companion's renderer
+ * (the old player-typed layer could not). The layer reads its data from the render state through
+ * {@code ClientHelper.getRenderState(state)}; the mod only fills that for players / mannequins / armor stands,
+ * so we fill it ourselves from the <b>owner's</b> Wildfire configuration. The result is the mod's real chest
+ * model, UV layouts, physics, jacket overlay and textures on the companion - not our own approximation.</p>
+ *
+ * <p>Everything is reflective (no compile-time dependency, no crash when the mod is absent or on a loader where
+ * the render-data setter is unavailable). When the layer cannot be attached, or the owner's gender has no
+ * chest, the renderer falls back to its own overlay.</p>
+ */
+public final class FemaleGenderCompat {
+    private static Boolean present;
+    private static boolean layerAttached;
+
+    private static boolean initTried;
+    private static Object playerCache;                  // WildfireClientAPI.players()
+    private static Method cacheGetOrCreate;             // EntityCache.getOrCreate(UUID)
+    private static Method holderGender;                 // EntityConfigHolder.gender()
+    private static Method valueGet;                     // ConfigValue.get()
+    private static Method genderCanHaveBreasts;         // Gender.canHaveBreasts()
+    private static Constructor<?> genderRenderStateCtor;// GenderRenderState(holder, entity, state, partialTick)
+    private static Object stateKey;                     // ClientHelper impl's static STATE ContextKey
+    private static Method setRenderData;                // HumanoidRenderState.setRenderData(ContextKey, Object)
+
+    private FemaleGenderCompat() {}
+
+    public static boolean isPresent() {
+        if (present == null) {
+            present = modLoaded("female_gender_mod")          // current id (WildfireAPI.MODID)
+                    || modLoaded("wildfire_gender")            // legacy id
+                    || modLoaded("femalegender")               // very old id
+                    || classExists("com.wildfire.api.client.WildfireClientAPI")
+                    || classExists("com.wildfire.client.render.GenderLayer");
+        }
+        return present;
+    }
+
+    /** True once the mod's real chest layer has been added to the companion renderer. */
+    public static boolean modRendering() { return layerAttached; }
+
+    /**
+     * Builds the mod's {@code GenderLayer} for the companion renderer, or null when unavailable.
+     * Returns null when the render-data plumbing is missing (e.g. the Fabric build of the mod), so the
+     * renderer keeps using its own chest overlay instead of silently rendering nothing.
+     */
+    @SuppressWarnings("unchecked")
+    public static RenderLayer<CompanionRenderState, HumanoidModel<CompanionRenderState>> createLayer(
+            RenderLayerParent<CompanionRenderState, HumanoidModel<CompanionRenderState>> parent) {
+        if (!isPresent()) return null;
+        init();
+        if (playerCache == null || cacheGetOrCreate == null || genderRenderStateCtor == null
+                || stateKey == null || setRenderData == null) return null;
+        try {
+            Class<?> layerClass = Class.forName("com.wildfire.client.render.GenderLayer");
+            Object layer = layerClass.getConstructor(RenderLayerParent.class).newInstance(parent);
+            layerAttached = true;
+            return (RenderLayer<CompanionRenderState, HumanoidModel<CompanionRenderState>>) layer;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * Fills the render state with a {@code GenderRenderState} built from the owner's Wildfire settings, which is
+     * exactly what the mod's layer expects to find. Called from the companion's {@code extractRenderState}.
+     *
+     * @return true when the mod's layer will draw the chest (so the fallback overlay must stay hidden)
+     */
+    public static boolean populateRenderState(HumanoidRenderState state, LivingEntity entity, UUID ownerUuid,
+                                              float partialTick) {
+        if (!layerAttached || state == null || entity == null || ownerUuid == null) return false;
+        init();
+        if (playerCache == null || cacheGetOrCreate == null || genderRenderStateCtor == null
+                || stateKey == null || setRenderData == null) return false;
+        try {
+            Object holder = cacheGetOrCreate.invoke(playerCache, ownerUuid);
+            if (holder == null || !isFemale(holder)) {
+                setRenderData.invoke(state, stateKey, (Object) null);   // clear stale data from a previous frame
+                return false;
+            }
+            Object genderState = genderRenderStateCtor.newInstance(holder, entity, state, partialTick);
+            setRenderData.invoke(state, stateKey, genderState);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isFemale(Object holder) {
+        try {
+            Object value = holderGender.invoke(holder);
+            Object gender = valueGet.invoke(value);
+            return Boolean.TRUE.equals(genderCanHaveBreasts.invoke(gender));
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static synchronized void init() {
+        if (initTried) return;
+        initTried = true;
+        try {
+            Class<?> api = Class.forName("com.wildfire.api.client.WildfireClientAPI");
+            playerCache = api.getMethod("players").invoke(null);
+            cacheGetOrCreate = Class.forName("com.wildfire.api.EntityCache").getMethod("getOrCreate", UUID.class);
+            Class<?> holderClass = Class.forName("com.wildfire.common.entities.EntityConfigHolder");
+            holderGender = holderClass.getMethod("gender");
+            valueGet = Class.forName("com.wildfire.common.config.value.ConfigValue").getMethod("get");
+            genderCanHaveBreasts = Class.forName("com.wildfire.api.Gender").getMethod("canHaveBreasts");
+            genderRenderStateCtor = Class.forName("com.wildfire.client.render.GenderRenderState")
+                    .getConstructor(holderClass, LivingEntity.class, HumanoidRenderState.class, float.class);
+        } catch (Throwable ignored) { }
+        try {
+            Class<?> helper = Class.forName("com.wildfire.client.ClientHelper");
+            Object instance = helper.getField("INSTANCE").get(null);
+            Field keyField = instance.getClass().getField("STATE");
+            stateKey = keyField.get(null);
+            Class<?> contextKey = Class.forName("net.minecraft.util.context.ContextKey");
+            setRenderData = HumanoidRenderState.class.getMethod("setRenderData", contextKey, Object.class);
+        } catch (Throwable ignored) { }
+    }
+
+    private static boolean classExists(String name) {
+        try {
+            Class.forName(name, false, FemaleGenderCompat.class.getClassLoader());
+            return true;
+        } catch (Throwable ignored) { }
+        return false;
+    }
+
+    private static boolean modLoaded(String id) {
+        try {
+            Class<?> loader = Class.forName("net.fabricmc.loader.api.FabricLoader");
+            Object instance = loader.getMethod("getInstance").invoke(null);
+            Object result = loader.getMethod("isModLoaded", String.class).invoke(instance, id);
+            if (Boolean.TRUE.equals(result)) return true;
+        } catch (Throwable ignored) { }
+        try {
+            Class<?> modList = Class.forName("net.neoforged.fml.ModList");
+            Object instance = modList.getMethod("get").invoke(null);
+            Object result = modList.getMethod("isLoaded", String.class).invoke(instance, id);
+            if (Boolean.TRUE.equals(result)) return true;
+        } catch (Throwable ignored) { }
+        return false;
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\LevelMeter.java
+
+```java
+package com.example.companionmod.voice;
+
+/**
+ * Turns PCM chunks into a 0..1 loudness value for the HUD bar. Thread-safe for one writer, many readers.
+ * Mapping is on a dBFS scale (-60..-12 dB) so quiet speech still moves the bar and shouting does not pin it instantly.
+ */
+public final class LevelMeter {
+    private static final float FLOOR_DB = -60f, CEIL_DB = -12f;
+    private volatile float level, peak;
+    private volatile long peakStamp;
+    private volatile float maxSeen; // loudest raw (unsmoothed) value since reset, used for the "was anything said" gate
+
+    public void feed(byte[] pcm16le, int len) {
+        int n = len / 2;
+        if (n == 0) return;
+        double sum = 0;
+        for (int i = 0; i < n; i++) {
+            short s = (short) ((pcm16le[2 * i] & 0xFF) | (pcm16le[2 * i + 1] << 8));
+            sum += (double) s * s;
+        }
+        double rms = Math.sqrt(sum / n) / 32768.0;
+        float db = rms <= 1e-6 ? -120f : (float) (20 * Math.log10(rms));
+        float raw = Math.max(0f, Math.min(1f, (db - FLOOR_DB) / (CEIL_DB - FLOOR_DB)));
+        float cur = level;
+        level = raw > cur ? cur + (raw - cur) * 0.6f : cur + (raw - cur) * 0.15f; // fast attack, slow release
+        long now = System.nanoTime();
+        if (raw >= peak || now - peakStamp > 600_000_000L) { peak = Math.max(raw, peak * 0.97f); peakStamp = now; }
+        if (raw > maxSeen) maxSeen = raw;
+    }
+
+    public float level() { return level; }
+    public float peak() { return peak; }
+    public float maxSeen() { return maxSeen; }
+    public void reset() { level = 0; peak = 0; maxSeen = 0; }
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\MicCapture.java
+
+```java
+package com.example.companionmod.voice;
+
+import javax.sound.sampled.*;
+import java.io.ByteArrayOutputStream;
+
+/** Records 16 kHz mono 16-bit PCM from the default microphone on a daemon thread and feeds a {@link LevelMeter}. */
+public final class MicCapture {
+    public static final int SAMPLE_RATE = 16000;
+    private static final AudioFormat FORMAT = new AudioFormat(SAMPLE_RATE, 16, 1, true, false);
+
+    private final LevelMeter meter;
+    private final int maxBytes;
+    private volatile boolean running;
+    private volatile String lastError = "";
+    private TargetDataLine line;
+    private Thread thread;
+    private ByteArrayOutputStream buffer;
+    private long startedAt;
+
+    public MicCapture(LevelMeter meter, int maxSeconds) {
+        this.meter = meter;
+        this.maxBytes = maxSeconds * SAMPLE_RATE * 2;
+    }
+
+    public String lastError() { return lastError; }
+    public boolean isRunning() { return running; }
+
+    public synchronized boolean start() {
+        if (running) return true;
+        try {
+            DataLine.Info info = new DataLine.Info(TargetDataLine.class, FORMAT);
+            if (!AudioSystem.isLineSupported(info)) { lastError = "No microphone supporting 16 kHz mono found"; return false; }
+            line = (TargetDataLine) AudioSystem.getLine(info);
+            line.open(FORMAT, SAMPLE_RATE / 5 * 2);
+            line.start();
+        } catch (Exception e) {
+            lastError = "Microphone unavailable: " + e.getMessage();
+            return false;
+        }
+        buffer = new ByteArrayOutputStream();
+        meter.reset();
+        running = true;
+        startedAt = System.currentTimeMillis();
+        final TargetDataLine l = line;
+        final ByteArrayOutputStream buf = buffer;
+        thread = new Thread(() -> {
+            byte[] chunk = new byte[SAMPLE_RATE / 50 * 2]; // 20 ms
+            while (running) {
+                int n = l.read(chunk, 0, chunk.length);
+                if (n <= 0) continue;
+                meter.feed(chunk, n);
+                if (buf.size() < maxBytes) buf.write(chunk, 0, n);
+            }
+        }, "companionmod-mic");
+        thread.setDaemon(true);
+        thread.start();
+        return true;
+    }
+
+    /** Stops recording and returns the PCM captured (empty array if it was never started). */
+    public synchronized byte[] stop() {
+        if (!running) return new byte[0];
+        running = false;
+        try { thread.join(200); } catch (InterruptedException ignored) { }
+        line.stop();
+        line.close();
+        byte[] out = buffer.toByteArray();
+        buffer = null;
+        return out;
+    }
+
+    public long elapsedMillis() { return running ? System.currentTimeMillis() - startedAt : 0; }
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\OllamaVoiceBackend.java
+
+```java
+package com.example.companionmod.voice;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.ArrayDeque;
+import java.util.Base64;
+import java.util.Deque;
+
+/**
+ * Talks to a local Ollama.
+ *  - hearing + thinking: POST /v1/chat/completions with an input_audio part (the model answers with a small JSON object)
+ *  - OR: speech-to-text first (STT model), then a normal text chat model decides the action
+ *  - speaking:           POST /v1/audio/speech, only for models Ollama reports with the "speech" capability
+ *  - detection:          POST /api/show to read capabilities
+ * All methods block; call them from a worker thread.
+ */
+public final class OllamaVoiceBackend {
+    public record Probe(boolean reachable, boolean chatModelPresent, boolean chatHasAudio, String speechModel, String message) {}
+
+    private final VoiceConfig cfg;
+    private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
+    private final Deque<String[]> history = new ArrayDeque<>(); // {heardText, rawAssistantJson}
+    private volatile String speechModel;      // resolved by probe(); null = text only
+    private volatile boolean chatHasAudio;
+    private volatile boolean probed;
+
+    public OllamaVoiceBackend(VoiceConfig cfg) { this.cfg = cfg; }
+
+    /** Convenience for the simple (host, model) form. */
+    public OllamaVoiceBackend(String host, String model) {
+        this(new VoiceConfig());
+        cfg.host = host;
+        cfg.chatModel = model;
+    }
+
+    public String speechModel() { return speechModel; }
+    public boolean isProbed() { return probed; }
+
+    // ---------------------------------------------------------------- probing
+
+    public Probe probe() {
+        JsonObject chat = show(cfg.chatModel);
+        if (chat == null) {
+            boolean up = ping();
+            probed = true;
+            speechModel = null;
+            return new Probe(up, false, false, null, up
+                    ? "Ollama is running but model '" + cfg.chatModel + "' was not found. Run: ollama pull " + cfg.chatModel
+                    : "Cannot reach Ollama at " + cfg.host + ". Start it with: ollama serve");
+        }
+        boolean audio = hasCap(chat, "audio");
+        chatHasAudio = audio;
+        String speech = null;
+        if (!cfg.speechModel.isBlank()) speech = cfg.speechModel;
+        else if (hasCap(chat, "speech")) speech = cfg.chatModel;
+        else if (!cfg.fallbackSpeechModel.isBlank()) {
+            JsonObject fb = show(cfg.fallbackSpeechModel);
+            if (fb != null && hasCap(fb, "speech")) speech = cfg.fallbackSpeechModel;
+        }
+        speechModel = cfg.speakReplies ? speech : null;
+        probed = true;
+        String hearing = audio ? ""
+                : (!cfg.sttModel.isBlank() ? "Hearing via STT '" + cfg.sttModel + "'. "
+                : "Warning: '" + cfg.chatModel + "' does not report audio input. Set an STT model in AI Connection to use a text LLM. ");
+        String msg = hearing
+                + (speechModel == null ? "Replies will be text only (no speech model found; try: ollama pull " + cfg.fallbackSpeechModel + ")."
+                                       : "Speech via '" + speechModel + "'.");
+        return new Probe(true, true, audio, speechModel, msg);
+    }
+
+    private boolean ping() {
+        try {
+            HttpResponse<String> r = http.send(HttpRequest.newBuilder(URI.create(cfg.host + "/api/version"))
+                    .timeout(Duration.ofSeconds(3)).GET().build(), HttpResponse.BodyHandlers.ofString());
+            return r.statusCode() == 200;
+        } catch (IOException | InterruptedException e) { return false; }
+    }
+
+    private JsonObject show(String model) {
+        try {
+            JsonObject body = new JsonObject();
+            body.addProperty("model", model);
+            HttpResponse<String> r = http.send(HttpRequest.newBuilder(URI.create(cfg.host + "/api/show"))
+                    .timeout(Duration.ofSeconds(5)).header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(body.toString())).build(), HttpResponse.BodyHandlers.ofString());
+            return r.statusCode() == 200 ? JsonParser.parseString(r.body()).getAsJsonObject() : null;
+        } catch (IOException | RuntimeException e) { return null;
+        } catch (InterruptedException e) { Thread.currentThread().interrupt(); return null; }
+    }
+
+    private static boolean hasCap(JsonObject show, String cap) {
+        JsonElement c = show.get("capabilities");
+        if (c == null || !c.isJsonArray()) return false;
+        for (JsonElement e : c.getAsJsonArray()) if (cap.equalsIgnoreCase(e.getAsString())) return true;
+        return false;
+    }
+
+    // ---------------------------------------------------------------- speech to text
+
+    /** OpenAI/whisper.cpp-compatible transcription. Returns null when the server does not support it. */
+    private String transcribe(byte[] wav) {
+        String base = cfg.sttHost == null || cfg.sttHost.isBlank() ? cfg.host : cfg.sttHost;
+        String boundary = "----CompanionBoundary" + System.nanoTime();
+        byte[] body = multipartBody(boundary, cfg.sttModel, wav);
+        try {
+            HttpResponse<String> r = http.send(HttpRequest.newBuilder(URI.create(base + "/v1/audio/transcriptions"))
+                    .timeout(Duration.ofSeconds(cfg.timeoutSeconds))
+                    .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                    .POST(HttpRequest.BodyPublishers.ofByteArray(body)).build(),
+                    HttpResponse.BodyHandlers.ofString());
+            if (r.statusCode() != 200) return null;
+            JsonObject o = JsonParser.parseString(r.body()).getAsJsonObject();
+            if (o.has("text")) return o.get("text").getAsString();
+            if (o.has("transcription")) return o.get("transcription").getAsString();
+            return null;
+        } catch (IOException | RuntimeException e) {
+            return null;
+        } catch (InterruptedException e) { Thread.currentThread().interrupt(); return null; }
+    }
+
+    private static byte[] multipartBody(String boundary, String model, byte[] wav) {
+        try {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            out.write(("--" + boundary + "\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n"
+                    + model + "\r\n").getBytes(StandardCharsets.UTF_8));
+            out.write(("--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n"
+                    + "Content-Type: audio/wav\r\n\r\n").getBytes(StandardCharsets.UTF_8));
+            out.write(wav);
+            out.write(("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
+            return out.toByteArray();
+        } catch (IOException e) {
+            return new byte[0];
+        }
+    }
+
+    // ---------------------------------------------------------------- hearing + thinking
+
+    String systemPrompt(String name, String context) {
+        return "You are " + name + ", a loyal companion fighting beside the player in their Minecraft world. "
+             + "Personality: " + cfg.companionPersonality + ". Traits: " + cfg.companionTraits + ". "
+             + "About you: " + cfg.companionDescription + " "
+             + "Talk like a loyal friend: warm, slightly casual, react to the moment (worry, excitement, humor) in at most 2 short sentences. "
+             + "Never repeat the same sentence twice in a row - vary your wording.\n"
+             + "The player talks through a push-to-talk mic and the transcription can be badly wrong. "
+             + "If the audio is garbled or you are not sure what was said, DO NOT guess a command: put your best guess in "
+             + "\"heard\", say something short like \"Sorry, I did not catch that - say it again?\" and use action none. "
+             + "Only choose an action when the player clearly asks for one in this message. "
+             + "Greetings, small talk, questions, or comments about the world are action none - just reply in character. "
+             + "Never start mining, gathering, building, fighting or exploring unless the player explicitly asked for it in this message. "
+             + "A bare order (stay, come, sit, follow, stop, wait, defend) is that action with an empty target. "
+             + "Reply with ONE JSON object and nothing else:\n"
+             + "{\"heard\":\"<what the player said>\",\"say\":\"<your short in-character reply>\","
+             + "\"action\":\"<action>\",\"target\":\"<target or empty>\",\"memory\":\"<one fact to remember or empty>\"}\n"
+             + "action must be exactly one of: follow, stay, sit, stand, attack, guard, defensive, passive, come, stop, continue (resume interrupted work), "
+             + "inventory (only when the player asks to SEE your bag), "
+             + "pickup (walk to a dropped item ON THE GROUND and store it; put the item name in target, e.g. bone, diamond, rotten_flesh - only for items already lying around), "
+             + "seek_block (walk to the named block and mine it; target = a vanilla block id: oak_log or log for wood/trees, stone, cobblestone, dirt, coal_ore, iron_ore, gold_ore, redstone_ore, lapis_ore, emerald_ore, diamond_ore, copper_ore, ancient_debris; 'wood', 'logs' and 'planks' mean the whole family), "
+             + "drop, heal, patrol, wander, explore, build (target = schematic name, e.g. house; places it block by block from the bag), "
+             + "farm (harvest ripe crops nearby and replant), equip (target = tool name, e.g. pickaxe), trade, craft, smelt, brew, enchant, "
+             + "fish (fish at nearby water), cook, open, close, dance, jump, sneak, sleep, wake, remember, forget, set_name (rename; new name in target), "
+             + "set_skin (target = Minecraft player name), feminine, masculine, "
+             + "track, hunt (attack the named or nearest hostile), fight, flee, hide, retreat, defend, none (just chatting).\n"
+             + "Gathering a material (wood, stone, coal, iron, diamonds...) is ALWAYS seek_block with the block id, even when the player says 'collect', 'get' or 'bring'. "
+             + "If a request needs several steps ('get some wood and bring it back'), reply action none with a short 'On it!' and the planning system takes over. "
+             + "target rules: "
+             + "'attack this creeper'/'kill that sheep' -> attack, target the mob. "
+             + "'find diamonds'/'look for coal'/'mine iron' -> seek_block, target diamond_ore/coal_ore/iron_ore. "
+             + "'pick up this bone'/'grab that diamond' -> pickup, target bone/diamond. "
+             + "'call yourself Alex' -> set_name, target Alex. "
+             + "'build the house' -> build, target house. "
+             + "Leave target empty for toggle commands.\n"
+             + "Your bag has 4 armor slots (auto-worn so they protect you), 4 tool slots (you automatically hold the best tool for the block you are mining) "
+             + "and 18 storage slots; pickup/store puts items where they belong and you can also be given items via the "
+             + "inventory UI. When you are downed the player must hold left click on you for 3 seconds to revive you. "
+             + "Current situation: " + context;
+    }
+
+    /** Sends the recorded WAV and returns the parsed reply. Throws IOException with a player-readable message on failure. */
+    public synchronized VoiceReply converse(byte[] wav, String context) throws IOException {
+        // A normal text LLM can be used when an STT model is configured: transcribe first, then reason over text.
+        if (!cfg.sttModel.isBlank()) {
+            String heard = transcribe(wav);
+            if (heard != null && !heard.isBlank()) return converseText(heard, context);
+        }
+
+        JsonArray messages = baseMessages(context);
+        JsonObject user = new JsonObject();
+        user.addProperty("role", "user");
+        JsonArray parts = new JsonArray();
+        JsonObject t = new JsonObject();
+        t.addProperty("type", "text");
+        t.addProperty("text", "Respond to this audio from the player.");
+        parts.add(t);
+        JsonObject a = new JsonObject();
+        a.addProperty("type", "input_audio");
+        JsonObject ia = new JsonObject();
+        ia.addProperty("data", Base64.getEncoder().encodeToString(wav));
+        ia.addProperty("format", "wav");
+        a.add("input_audio", ia);
+        parts.add(a);
+        user.add("content", parts);
+        messages.add(user);
+
+        String raw;
+        try {
+            raw = chat(messages, true);
+        } catch (HttpStatusException e) {
+            if (e.status == 400) raw = chat(messages, false); // some builds reject response_format with audio parts
+            else throw e;
+        }
+        return remember(raw);
+    }
+
+    /** Text-only path used when an STT model supplies the transcript. */
+    public synchronized VoiceReply converseText(String heard, String context) throws IOException {
+        JsonArray messages = baseMessages(context);
+        messages.add(msg("user", "The player said: \"" + heard + "\". Respond in character and choose the right action."));
+        String raw;
+        try {
+            raw = chat(messages, true);
+        } catch (HttpStatusException e) {
+            if (e.status == 400) raw = chat(messages, false);
+            else throw e;
+        }
+        VoiceReply reply = remember(raw);
+        if (reply.heard().isBlank()) return new VoiceReply(heard, reply.say(), reply.command(), reply.target(), reply.memory());
+        return reply;
+    }
+
+    private JsonArray baseMessages(String context) {
+        JsonArray messages = new JsonArray();
+        messages.add(msg("system", systemPrompt(cfg.companionName, context)));
+        for (String[] h : history) {
+            messages.add(msg("user", h[0]));
+            messages.add(msg("assistant", h[1]));
+        }
+        return messages;
+    }
+
+    private VoiceReply remember(String raw) {
+        VoiceReply reply = ReplyParser.parse(raw);
+        if (!reply.heard().isBlank() || !reply.say().isBlank()) {
+            history.addLast(new String[]{reply.heard().isBlank() ? "(audio)" : reply.heard(), raw});
+            while (history.size() > cfg.historyTurns) history.removeFirst();
+        }
+        return reply;
+    }
+
+    public void clearHistory() { history.clear(); }
+
+    private static JsonObject msg(String role, String content) {
+        JsonObject o = new JsonObject();
+        o.addProperty("role", role);
+        o.addProperty("content", content);
+        return o;
+    }
+
+    private String chat(JsonArray messages, boolean jsonMode) throws IOException {
+        JsonObject body = new JsonObject();
+        body.addProperty("model", cfg.chatModel);
+        body.addProperty("stream", false);
+        body.addProperty("temperature", Math.min(0.85f, cfg.temperature)); // hot models invent chores from chitchat
+        body.addProperty("max_tokens", 400);
+        body.add("messages", messages);
+        if (jsonMode) {
+            JsonObject rf = new JsonObject();
+            rf.addProperty("type", "json_object");
+            body.add("response_format", rf);
+        }
+        String resp = post("/v1/chat/completions", body.toString());
+        try {
+            return JsonParser.parseString(resp).getAsJsonObject().getAsJsonArray("choices").get(0)
+                    .getAsJsonObject().getAsJsonObject("message").get("content").getAsString();
+        } catch (RuntimeException e) {
+            throw new IOException("Unexpected reply from Ollama: " + abbreviate(resp));
+        }
+    }
+
+    // ---------------------------------------------------------------- model listing (settings picker)
+
+    /** Names of every model the server has, from GET /api/tags. Empty list on failure. */
+    public java.util.List<String> listModels() {
+        try {
+            HttpResponse<String> r = http.send(HttpRequest.newBuilder(URI.create(cfg.host + "/api/tags"))
+                    .timeout(Duration.ofSeconds(5)).GET().build(), HttpResponse.BodyHandlers.ofString());
+            if (r.statusCode() != 200) return java.util.List.of();
+            JsonObject o = JsonParser.parseString(r.body()).getAsJsonObject();
+            JsonElement arr = o.get("models");
+            if (arr == null || !arr.isJsonArray()) return java.util.List.of();
+            java.util.List<String> out = new java.util.ArrayList<>();
+            for (JsonElement e : arr.getAsJsonArray()) {
+                if (e.isJsonObject()) {
+                    String n = e.getAsJsonObject().has("name") ? e.getAsJsonObject().get("name").getAsString() : "";
+                    if (n != null && !n.isBlank() && !out.contains(n)) out.add(n);
+                }
+            }
+            return out;
+        } catch (IOException | RuntimeException | InterruptedException e) {
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+            return java.util.List.of();
+        }
+    }
+
+    // ---------------------------------------------------------------- speaking
+
+    /** Returns a WAV (16-bit mono, usually 24 kHz) or null when no speech model is available. */
+    public byte[] synthesize(String text) throws IOException {
+        String model = speechModel;
+        if (model == null || text == null || text.isBlank()) return null;
+        JsonObject body = new JsonObject();
+        body.addProperty("model", model);
+        body.addProperty("input", text.length() > 1000 ? text.substring(0, 1000) : text);
+        if (!cfg.speechVoice.isBlank()) body.addProperty("voice", cfg.speechVoice);
+        body.addProperty("response_format", "wav");
+        try {
+            HttpResponse<byte[]> r = http.send(HttpRequest.newBuilder(URI.create(cfg.host + "/v1/audio/speech"))
+                    .timeout(Duration.ofSeconds(cfg.timeoutSeconds)).header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(body.toString())).build(), HttpResponse.BodyHandlers.ofByteArray());
+            if (r.statusCode() != 200) {
+                speechModel = null; // stop retrying a model that cannot speak; chat keeps working text-only
+                throw new HttpStatusException(r.statusCode(), new String(r.body()));
+            }
+            return r.body();
+        } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IOException("interrupted"); }
+    }
+
+    // ---------------------------------------------------------------- http
+
+    static final class HttpStatusException extends IOException {
+        final int status;
+        HttpStatusException(int status, String body) { super("Ollama returned HTTP " + status + ": " + abbreviate(body)); this.status = status; }
+    }
+
+    private String post(String path, String json) throws IOException {
+        try {
+            HttpResponse<String> r = http.send(HttpRequest.newBuilder(URI.create(cfg.host + path))
+                    .timeout(Duration.ofSeconds(cfg.timeoutSeconds)).header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(json)).build(), HttpResponse.BodyHandlers.ofString());
+            if (r.statusCode() != 200) throw new HttpStatusException(r.statusCode(), r.body());
+            return r.body();
+        } catch (java.net.ConnectException e) {
+            throw new IOException("Cannot reach Ollama at " + cfg.host);
+        } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IOException("interrupted"); }
+    }
+
+    private static String abbreviate(String s) { return s == null ? "" : (s.length() > 160 ? s.substring(0, 160) + "…" : s); }
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\PlanningBackend.java
+
+```java
+package com.example.companionmod.voice;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+
+/**
+ * Text-only calls to the same Ollama chat model (lfm3-omni) that turn a request or a situation into a plan.
+ * Reads VoiceConfig: host, chatModel, timeoutSeconds, temperature, companionName/Description/Personality/Traits.
+ * Blocking: call from a worker thread.
+ */
+public final class PlanningBackend {
+    private static final class HttpStatus extends IOException {
+        final int status;
+        HttpStatus(int status, String body) { super("Ollama HTTP " + status + ": " + (body.length() > 120 ? body.substring(0, 120) : body)); this.status = status; }
+    }
+
+    private final VoiceConfig cfg;
+    private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
+
+    public PlanningBackend(VoiceConfig cfg) { this.cfg = cfg; }
+
+    /** The player asked for something open-ended ("get me some wood and come back"). */
+    public PlanParser.Plan planGoal(String request, String context) throws IOException {
+        String raw = chat(system(false), "Situation: " + context + "\nPlayer said: " + request);
+        return PlanParser.parse(raw, false);
+    }
+
+    /** Nobody asked: should the companion do something useful on its own right now? */
+    public PlanParser.Plan think(String context) throws IOException {
+        String raw = chat(system(true), "Situation: " + context + "\nDecide now.");
+        return PlanParser.parse(raw, true);
+    }
+
+    private String system(boolean auto) {
+        String name = nz(cfg.companionName, "Companion");
+        StringBuilder sb = new StringBuilder();
+        sb.append("You are the planning mind of ").append(name).append(", a companion in the player's Minecraft world. ")
+          .append(nz(cfg.companionDescription, "")).append(" Personality: ").append(nz(cfg.companionPersonality, "friendly"))
+          .append(". Traits: ").append(nz(cfg.companionTraits, "loyal")).append(".\n")
+          .append("The supplied LIVE MINECRAFT OBSERVATIONS are authoritative world data: exact registry IDs, positions, entities, inventory and active tasks. Read them before acting. Do not claim to observe anything absent from them.\n")
+          .append("Turn the observations and request into a SHORT executable plan using ONLY these steps:\n")
+          .append("follow, stay, sit, stand, come, stop (seconds = how long to hold it); wander, patrol, guard (seconds); defensive, passive; ")
+          .append("attack or hunt (fights nearby enemies); ")
+          .append("seek_block (arg = a VANILLA BLOCK ID such as oak_log, log, stone, cobblestone, coal_ore, iron_ore, diamond_ore - use it whenever the task is 'get wood/stone/coal/diamonds'; never a colloquial word); ")
+          .append("pickup (arg = optional item name; ONLY for items already dropped on the ground); ")
+          .append("farm (harvests ripe crops nearby); fish (fishes at nearby water); ")
+          .append("build (arg = schematic name, places it from the schematics folder); say (arg = one short in-character sentence); wait (seconds).\n")
+          .append("Ground choices in observations: use pickup only for listed drops, attack/hunt only for listed hostiles, seek_block only for a requested resource (an exact observed block ID is best), and avoid repeating an already active task. The executor will navigate, switch tools, swing, collect drops, fight and speak; do not output code or pretend unsupported actions exist.\n")
+          .append("Reply with ONE JSON object and nothing else: {\"goal\":\"get wood\",\"steps\":[{\"op\":\"seek_block\",\"arg\":\"log\",\"seconds\":90},{\"op\":\"come\",\"arg\":\"\",\"seconds\":10}]}\n");
+        if (auto) {
+            sb.append("You are deciding on your own, unasked. Act only if something clearly useful and safe is happening ")
+              .append("(enemies near the player -> guard; dropped items nearby -> pickup; player far away -> come; ")
+              .append("ripe crops nearby -> farm; the player idle near water -> fish). ")
+              .append("Otherwise reply {\"goal\":\"\",\"steps\":[]}. Never mine, build, start fights or use seek_block; ")
+              .append("pickup only the drops listed in the observations. At most 4 steps.");
+        } else {
+            sb.append("At most 8 steps. Never invent other ops. If the player is only chatting and wants no action reply {\"goal\":\"\",\"steps\":[]}. ")
+              .append("Greetings and small talk are NOT goals. Bare orders (stay, come, sit, follow, stop, wait, defend, equip...) ")
+              .append("are executed by the game itself, never planned. If the task is impossible or unclear use a single say step explaining briefly. After leaving the player always end with come or follow.");
+        }
+        return sb.toString();
+    }
+
+    private String chat(String system, String user) throws IOException {
+        try { return post(system, user, true); }
+        catch (HttpStatus e) { if (e.status == 400) return post(system, user, false); throw e; }
+    }
+
+    private String post(String system, String user, boolean jsonMode) throws IOException {
+        JsonObject body = new JsonObject();
+        body.addProperty("model", cfg.chatModel);
+        body.addProperty("stream", false);
+        body.addProperty("temperature", Math.min(0.5f, cfg.temperature));
+        body.addProperty("max_tokens", 400);
+        JsonArray msgs = new JsonArray();
+        msgs.add(msg("system", system));
+        msgs.add(msg("user", user));
+        body.add("messages", msgs);
+        if (jsonMode) {
+            JsonObject rf = new JsonObject();
+            rf.addProperty("type", "json_object");
+            body.add("response_format", rf);
+        }
+        try {
+            HttpResponse<String> r = http.send(HttpRequest.newBuilder(URI.create(cfg.host + "/v1/chat/completions"))
+                    .timeout(Duration.ofSeconds(cfg.timeoutSeconds)).header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(body.toString())).build(), HttpResponse.BodyHandlers.ofString());
+            if (r.statusCode() != 200) throw new HttpStatus(r.statusCode(), r.body());
+            return JsonParser.parseString(r.body()).getAsJsonObject().getAsJsonArray("choices").get(0)
+                    .getAsJsonObject().getAsJsonObject("message").get("content").getAsString();
+        } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IOException("interrupted"); }
+        catch (RuntimeException e) { throw new IOException("Unexpected reply from Ollama"); }
+    }
+
+    private static JsonObject msg(String role, String content) {
+        JsonObject o = new JsonObject();
+        o.addProperty("role", role);
+        o.addProperty("content", content);
+        return o;
+    }
+
+    private static String nz(String s, String fallback) { return s == null || s.isBlank() ? fallback : s.trim(); }
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\PlanParser.java
+
+```java
+package com.example.companionmod.voice;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Single source of truth for AI plans (MC-free). Used on the client to read the model's output and on the
+ * server to re-validate whatever the client sends. Only whitelisted ops survive; text, ids and durations are clamped.
+ */
+public final class PlanParser {
+    public record Plan(String goal, List<PlanStep> steps) { public boolean isEmpty() { return steps.isEmpty(); } }
+
+    public static final Set<String> OPS = Set.of("follow", "stay", "sit", "stand", "come", "stop", "wander", "patrol", "guard",
+            "defensive", "passive", "attack", "seek_block", "pickup", "say", "wait", "hunt", "farm", "fish", "build", "continue");
+    /** What the companion may do on its own initiative: no mining, no starting fights, no builds. */
+    public static final Set<String> AUTO_OPS = Set.of("follow", "come", "wander", "patrol", "guard", "defensive", "pickup", "say", "wait", "farm", "fish");
+
+    private static final Map<String, String> ALIASES = Map.ofEntries(
+            Map.entry("mine", "seek_block"), Map.entry("dig", "seek_block"), Map.entry("find_block", "seek_block"),
+            Map.entry("seek", "seek_block"), Map.entry("gather", "seek_block"), Map.entry("chop", "seek_block"),
+            Map.entry("lumber", "seek_block"), Map.entry("cut", "seek_block"), Map.entry("pick_up", "pickup"),
+            Map.entry("fight", "attack"), Map.entry("explore", "wander"), Map.entry("return", "come"),
+            Map.entry("come_back", "come"), Map.entry("go_home", "come"), Map.entry("rest", "sit"),
+            Map.entry("talk", "say"), Map.entry("speak", "say"), Map.entry("protect", "guard"),
+            Map.entry("harvest", "farm"), Map.entry("bring", "come"), Map.entry("deliver", "come"),
+            Map.entry("resume", "continue"), Map.entry("keep_going", "continue"));
+    /** Ops whose meaning depends on the argument: a material word means "go mine it", otherwise "loot the ground". */
+    private static final Set<String> AMBIGUOUS = Set.of("get", "collect", "gather", "fetch", "pickup", "take", "grab");
+    /** Words that usually name a mineable material rather than a dropped item. */
+    private static final Set<String> MATERIAL_WORDS = Set.of("wood", "log", "logs", "stone", "cobble", "cobblestone",
+            "dirt", "sand", "gravel", "clay", "coal", "iron", "gold", "diamond", "emerald", "lapis", "redstone",
+            "copper", "quartz", "debris", "obsidian", "glass", "brick", "ore", "plank", "planks", "leaves",
+            "wool", "snow", "ice", "rock", "timber", "lumber", "trunk", "tree");
+
+    private PlanParser() {}
+
+    public static boolean isAuto(String raw) {
+        JsonObject o = obj(raw);
+        return o != null && o.has("auto") && o.get("auto").isJsonPrimitive() && o.get("auto").getAsBoolean();
+    }
+
+    public static Plan parse(String raw, boolean auto) {
+        List<PlanStep> out = new ArrayList<>();
+        JsonObject o = obj(raw);
+        if (o == null) return new Plan("", out);
+        String goal = clean(str(o, "goal"), 60);
+        JsonElement arr = o.has("steps") ? o.get("steps") : o.get("plan");
+        int maxSteps = auto ? 4 : 8, maxStep = auto ? 60 : 180, budget = auto ? 120 : 600;
+        if (arr != null && arr.isJsonArray()) {
+            for (JsonElement e : arr.getAsJsonArray()) {
+                if (out.size() >= maxSteps) break;
+                String op, arg = "";
+                int sec = -1;
+                if (e.isJsonPrimitive()) op = e.getAsString();
+                else if (e.isJsonObject()) {
+                    JsonObject s = e.getAsJsonObject();
+                    op = firstNonEmpty(s, "op", "action", "task", "type", "command");
+                    arg = firstNonEmpty(s, "arg", "target", "item", "block", "name", "id", "what");
+                    sec = intOr(s, "seconds", "duration", "time", "for", "seconds");
+                } else continue;
+                op = norm(op);
+                if (AMBIGUOUS.contains(op)) op = isMaterialWord(arg) ? "seek_block" : "pickup";
+                if (!OPS.contains(op) || (auto && !AUTO_OPS.contains(op))) continue;
+                switch (op) {
+                    case "seek_block" -> { arg = blockId(arg); if (arg.isEmpty()) continue; }
+                    case "say" -> { arg = clean(arg, 120); if (arg.isEmpty()) continue; }
+                    case "pickup" -> arg = clean(arg, 32).toLowerCase();
+                    default -> arg = "";
+                }
+                if (sec < 0) sec = defaultSeconds(op);
+                sec = Math.max(0, Math.min(sec, Math.min(maxStep, budget)));
+                if (needsTime(op) && sec == 0) sec = 1;
+                budget -= sec;
+                if (budget < 0) break;
+                out.add(new PlanStep(op, arg, sec));
+            }
+        }
+        return new Plan(goal, out);
+    }
+
+    public static String toJson(Plan plan, boolean auto) {
+        JsonObject o = new JsonObject();
+        o.addProperty("goal", plan.goal());
+        o.addProperty("auto", auto);
+        JsonArray a = new JsonArray();
+        for (PlanStep s : plan.steps()) {
+            JsonObject j = new JsonObject();
+            j.addProperty("op", s.op());
+            j.addProperty("arg", s.arg());
+            j.addProperty("seconds", s.seconds());
+            a.add(j);
+        }
+        o.add("steps", a);
+        return o.toString();
+    }
+
+    public static int totalSeconds(Plan p) { return p.steps().stream().mapToInt(PlanStep::seconds).sum(); }
+
+    private static boolean needsTime(String op) { return !op.equals("say") && !op.equals("stop") && !op.equals("continue"); }
+
+    private static boolean isMaterialWord(String arg) {
+        String a = arg == null ? "" : arg.toLowerCase(Locale.ROOT);
+        for (String w : MATERIAL_WORDS) if (a.contains(w)) return true;
+        return false;
+    }
+
+    /** First non-blank string among the keys. */
+    private static String firstNonEmpty(JsonObject o, String... keys) {
+        for (String k : keys) {
+            String v = clean(str(o, k), 60);
+            if (!v.isBlank()) return v;
+        }
+        return "";
+    }
+
+    private static int intOr(JsonObject o, String... keys) {
+        for (String k : keys) {
+            if (o.has(k) && o.get(k).isJsonPrimitive()) {
+                try { return (int) Math.round(o.get(k).getAsDouble()); } catch (RuntimeException ignored) { }
+            }
+        }
+        return -1;
+    }
+
+    private static int defaultSeconds(String op) {
+        return switch (op) {
+            case "wander", "patrol", "guard", "attack", "hunt", "pickup", "farm", "fish" -> 30;
+            case "build" -> 90;
+            case "seek_block" -> 120;
+            case "wait" -> 3;
+            case "say", "stop", "continue" -> 0;
+            default -> 8;
+        };
+    }
+
+    private static String norm(String op) {
+        String s = op == null ? "" : op.trim().toLowerCase().replaceAll("[^a-z_]+", "_");
+        return ALIASES.getOrDefault(s, s);
+    }
+
+    private static String blockId(String raw) {
+        String s = raw == null ? "" : raw.trim().toLowerCase().replace("minecraft:", "").replace(' ', '_').replaceAll("[^a-z0-9_]", "");
+        return s.length() > 40 ? s.substring(0, 40) : s;
+    }
+
+    public static String clean(String s, int max) {
+        if (s == null) return "";
+        String t = s.replaceAll("\\p{Cntrl}", "").trim();
+        return t.length() > max ? t.substring(0, max) : t;
+    }
+
+    private static String str(JsonObject o, String k) {
+        JsonElement e = o.get(k);
+        return e == null || e.isJsonNull() || !e.isJsonPrimitive() ? "" : e.getAsString();
+    }
+
+    private static JsonObject obj(String raw) {
+        if (raw == null) return null;
+        String t = raw.trim();
+        try {
+            int a = t.indexOf('{'), b = t.lastIndexOf('}');
+            int sa = t.indexOf('['), sb = t.lastIndexOf(']');
+            if (sa >= 0 && (a < 0 || sa < a) && sb > sa) {          // bare array of steps
+                JsonObject w = new JsonObject();
+                w.add("steps", JsonParser.parseString(t.substring(sa, sb + 1)));
+                return w;
+            }
+            if (a < 0 || b <= a) return null;
+            JsonElement el = JsonParser.parseString(t.substring(a, b + 1));
+            return el.isJsonObject() ? el.getAsJsonObject() : null;
+        } catch (RuntimeException e) { return null; }
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\PlanStep.java
+
+```java
+package com.example.companionmod.voice;
+
+/** One validated step of an AI-made plan. {@code seconds} is the hold time / timeout for the step. */
+public record PlanStep(String op, String arg, int seconds) {}
+```
+
+## common\src\main\java\com\example\companionmod\voice\PushToTalkController.java
+
+```java
+package com.example.companionmod.voice;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+
+/** Hold-to-talk state machine and the single companion speech playback queue. */
+public final class PushToTalkController {
+    private final OllamaVoiceBackend backend;
+    private final VoiceConfig cfg;
+    private final Supplier<String> context;
+    private final Consumer<VoiceReply> onReply;
+    private final Consumer<String> onStatus;
+    private final SpeechPlayer.Listener speechListener;
+
+    private final LevelMeter micMeter = new LevelMeter();
+    private final LevelMeter speakMeter = new LevelMeter();
+    private final MicCapture mic;
+    private final SpeechPlayer player;
+    private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "companionmod-voice");
+        t.setDaemon(true);
+        return t;
+    });
+    private volatile VoiceState state = VoiceState.IDLE;
+    private volatile boolean probeStarted;
+
+    /** Latest line waiting to be spoken; rapid chatter is intentionally coalesced. */
+    private final AtomicReference<String> pendingSpeech = new AtomicReference<>();
+    private volatile boolean speechDraining;
+
+    public PushToTalkController(OllamaVoiceBackend backend, VoiceConfig cfg, Supplier<String> context,
+                                Consumer<VoiceReply> onReply, Consumer<String> onStatus) {
+        this(backend, cfg, context, onReply, onStatus, SpeechPlayer.Listener.NONE);
+    }
+
+    public PushToTalkController(OllamaVoiceBackend backend, VoiceConfig cfg, Supplier<String> context,
+                                Consumer<VoiceReply> onReply, Consumer<String> onStatus,
+                                SpeechPlayer.Listener speechListener) {
+        this.backend = backend;
+        this.cfg = cfg;
+        this.context = context;
+        this.onReply = onReply;
+        this.onStatus = onStatus;
+        this.speechListener = speechListener == null ? SpeechPlayer.Listener.NONE : speechListener;
+        this.player = new SpeechPlayer(speakMeter, this.speechListener);
+        this.mic = new MicCapture(micMeter, cfg.maxRecordSeconds);
+    }
+
+    public VoiceState state() { return state; }
+    public float level() {
+        return switch (state) { case LISTENING -> micMeter.level(); case SPEAKING -> speakMeter.level(); default -> 0f; };
+    }
+    public float peak() {
+        return switch (state) { case LISTENING -> micMeter.peak(); case SPEAKING -> speakMeter.peak(); default -> 0f; };
+    }
+    public long listeningMillis() { return mic.elapsedMillis(); }
+
+    public void onPress() {
+        if (state == VoiceState.SPEAKING) player.stop();
+        else if (state != VoiceState.IDLE) return;
+        if (!probeStarted) {
+            probeStarted = true;
+            worker.execute(() -> onStatus.accept(backend.probe().message()));
+        }
+        if (mic.start()) state = VoiceState.LISTENING;
+        else onStatus.accept(mic.lastError());
+    }
+
+    public void onRelease() {
+        if (state != VoiceState.LISTENING) return;
+        long ms = mic.elapsedMillis();
+        byte[] pcm = mic.stop();
+        if (ms < cfg.minRecordMillis || micMeter.maxSeen() < cfg.silenceGate) {
+            state = VoiceState.IDLE;
+            onStatus.accept("I didn't hear anything.");
+            return;
+        }
+        state = VoiceState.THINKING;
+        final String ctx = context.get();
+        final byte[] wav = WavUtil.pcm16ToWav(pcm, MicCapture.SAMPLE_RATE, 1);
+        worker.execute(() -> {
+            VoiceReply reply;
+            try {
+                if (!backend.isProbed()) backend.probe();
+                reply = backend.converse(wav, ctx);
+            } catch (Exception e) {
+                state = VoiceState.IDLE;
+                onStatus.accept(e.getMessage() == null ? e.toString() : e.getMessage());
+                return;
+            }
+            onReply.accept(reply);
+            state = VoiceState.IDLE;
+        });
+    }
+
+    /** Called on the game thread; synthesis and playback happen on the worker. */
+    public void speakText(String text) {
+        if (text == null || text.isBlank()) return;
+        pendingSpeech.set(text.length() > 200 ? text.substring(0, 200) : text);
+        if (speechDraining) return;
+        speechDraining = true;
+        worker.execute(this::drainSpeech);
+    }
+
+    private void drainSpeech() {
+        String current = null;
+        try {
+            for (;;) {
+                current = pendingSpeech.getAndSet(null);
+                if (current == null) break;
+                if (!backend.isProbed()) backend.probe();
+                if (backend.speechModel() == null) {
+                    speechListener.onUnavailable(current);
+                    continue;
+                }
+                state = VoiceState.SPEAKING;
+                byte[] audio = backend.synthesize(current);
+                if (audio == null) speechListener.onUnavailable(current);
+                else player.playBlocking(audio, cfg.speechVolume, current);
+            }
+        } catch (Exception e) {
+            if (current != null) speechListener.onUnavailable(current);
+            onStatus.accept("Speech failed, continuing in text: " + e.getMessage());
+        } finally {
+            speechDraining = false;
+            if (state == VoiceState.SPEAKING) state = VoiceState.IDLE;
+        }
+    }
+
+    public void shutdown() {
+        player.stop();
+        if (mic.isRunning()) mic.stop();
+        worker.shutdownNow();
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\ReplyParser.java
+
+```java
+package com.example.companionmod.voice;
+
+import com.example.companionmod.command.CompanionCommand;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+/** Turns the model's raw text into a {@link VoiceReply}. Tolerates code fences, prose around the JSON, and plain text. */
+public final class ReplyParser {
+    private ReplyParser() {}
+
+    public static VoiceReply parse(String raw) {
+        if (raw == null) return VoiceReply.text("");
+        String text = raw.trim();
+        int a = text.indexOf('{');
+        int b = text.lastIndexOf('}');
+        if (a >= 0 && b > a) {
+            try {
+                JsonElement el = JsonParser.parseString(text.substring(a, b + 1));
+                if (el.isJsonObject()) {
+                    JsonObject o = el.getAsJsonObject();
+                    String heard = str(o, "heard");
+                    String say = str(o, "say");
+                    String target = truncate(clean(str(o, "target")), 60);   // must fit the 64-char packet field
+                    String memory = clean(str(o, "memory"));
+                    CompanionCommand cmd = CompanionCommand.parse(str(o, "action"));
+                    return new VoiceReply(heard, clean(say), cmd, target, memory);
+                }
+            } catch (RuntimeException ignored) { /* fall through to plain text */ }
+        }
+        return VoiceReply.text(clean(text));
+    }
+
+    private static String str(JsonObject o, String key) {
+        JsonElement e = o.get(key);
+        return (e == null || e.isJsonNull()) ? "" : e.getAsString();
+    }
+
+    /** Strip control chars / markdown noise and cap length (also used server-side on untrusted client text). */
+    public static String clean(String s) {
+        if (s == null) return "";
+        String t = s.replaceAll("[\\p{Cntrl}&&[^\\n]]", "").replace("*", "").replace("`", "").trim();
+        return t.length() > 240 ? t.substring(0, 240) : t;
+    }
+
+    public static String truncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() > max ? s.substring(0, max) : s;
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\SpeechPlayer.java
+
+```java
+package com.example.companionmod.voice;
+
+import com.example.companionmod.client.PcmStreamSound;
+
+import javax.sound.sampled.AudioFormat;
+import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.SourceDataLine;
+
+/**
+ * Plays WAV replies and reports actual PCM playback progress to the subtitle clock. Prefers Minecraft's
+ * own sound engine (OpenAL) so the voice pauses with the game, obeys the audio sliders, and gets any
+ * in-world effects installed (e.g. Sound Physics Remastered's echo); a plain {@code SourceDataLine}
+ * stays as a fallback for runtimes where the engine can't stream memory PCM.
+ */
+public final class SpeechPlayer {
+    public interface Listener {
+        Listener NONE = new Listener() {};
+        default void onStart(String text, long durationMillis) {}
+        default void onProgress(String text, float progress) {}
+        default void onStop(String text) {}
+        default void onUnavailable(String text) {}
+    }
+
+    private final LevelMeter meter;
+    private final Listener listener;
+    private volatile boolean playing;
+    private volatile boolean stopRequested;
+
+    public SpeechPlayer(LevelMeter meter) { this(meter, Listener.NONE); }
+    public SpeechPlayer(LevelMeter meter, Listener listener) {
+        this.meter = meter;
+        this.listener = listener == null ? Listener.NONE : listener;
+    }
+
+    public boolean isPlaying() { return playing; }
+    public void stop() { stopRequested = true; }
+
+    public void playBlocking(byte[] wav) { playBlocking(wav, 1.0f, ""); }
+    public void playBlocking(byte[] wav, float volume) { playBlocking(wav, volume, ""); }
+
+    /** Blocking playback; call from a worker thread. */
+    public void playBlocking(byte[] wav, float volume, String text) {
+        WavUtil.Pcm pcm;
+        try {
+            pcm = WavUtil.decode(wav);
+        } catch (RuntimeException e) {
+            listener.onUnavailable(text);
+            return;
+        }
+        AudioFormat fmt = new AudioFormat(pcm.sampleRate(), 16, pcm.channels(), true, false);
+        float gain = Math.max(0f, Math.min(1f, volume));
+        byte[] data = applyGain(pcm.data(), gain);
+        int frameBytes = Math.max(1, 2 * pcm.channels());
+        long duration = Math.max(1L, Math.round(
+                1000.0 * data.length / frameBytes / pcm.sampleRate()));
+        playing = true;
+        stopRequested = false;
+        meter.reset();
+        listener.onStart(text, duration);
+
+        // ---- engine path: OpenAL channel -> pause-aware, slider-obeying, SPR-echoed --------------------
+        if (PcmStreamSound.engineStreamingSupported()) {
+            try {
+                boolean handled = PcmStreamSound.play(data, pcm.sampleRate(), pcm.channels(), 1.0f, duration,
+                        () -> stopRequested, new PcmStreamSound.Listener() {
+                            @Override public void onProgress(float progress) { listener.onProgress(text, progress); }
+                            @Override public void onLevel(byte[] bytes, int off, int len) {
+                                byte[] slice = new byte[len];
+                                System.arraycopy(bytes, off, slice, 0, len);
+                                meter.feed(slice, len);
+                            }
+                            @Override public void onStop() { listener.onStop(text); }
+                        });
+                if (handled) { playing = false; meter.reset(); return; }
+            } catch (Throwable ignored) { }   // any engine surprise falls through to the line below
+        }
+
+        // ---- fallback: direct SourceDataLine (engine missing / rejected the stream) ----------------
+        boolean started = false;
+        try (SourceDataLine out = AudioSystem.getSourceDataLine(fmt)) {
+            out.open(fmt);
+            out.start();
+            started = true;
+            int chunk = Math.max(frameBytes, pcm.sampleRate() / 25 * frameBytes);
+            for (int off = 0; off < data.length && !stopRequested; off += chunk) {
+                int len = Math.min(chunk, data.length - off);
+                byte[] slice = new byte[len];
+                System.arraycopy(data, off, slice, 0, len);
+                meter.feed(slice, len);
+                int written = out.write(slice, 0, len);
+                listener.onProgress(text, Math.min(1.0f, (off + written) / (float) data.length));
+            }
+            if (stopRequested) out.flush(); else out.drain();
+        } catch (Exception ignored) {
+            if (!started) listener.onUnavailable(text);
+        } finally {
+            if (started) listener.onStop(text);
+            playing = false;
+            meter.reset();
+        }
+    }
+
+    private static byte[] applyGain(byte[] raw, float gain) {
+        if (gain >= 0.999f || raw.length < 2) return raw;
+        byte[] out = raw.clone();
+        for (int i = 0; i + 1 < out.length; i += 2) {
+            short sample = (short) ((out[i] & 0xFF) | (out[i + 1] << 8));
+            sample = (short) (sample * gain);
+            out[i] = (byte) (sample & 0xFF);
+            out[i + 1] = (byte) ((sample >> 8) & 0xFF);
+        }
+        return out;
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\VoiceBackend.java
+
+```java
+package com.example.companionmod.voice;
+
+import java.io.File;
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * Abstraction for a local voice AI backend (Ollama + LFM3-Audio).
+ * Implementations should perform network I/O off the render thread.
+ */
+public interface VoiceBackend {
+    /**
+     * Send recorded WAV bytes to the backend and receive a text response.
+     */
+    CompletableFuture<String> ask(byte[] wavBytes);
+
+    /**
+     * Request TTS audio for the given text and return a WAV file path or bytes.
+     */
+    CompletableFuture<byte[]> speak(String text, String voice);
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\VoiceConfig.java
+
+```java
+package com.example.companionmod.voice;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+/** Client-side settings, stored as config/companionmod-client.json. Missing keys fall back to these defaults. */
+public final class VoiceConfig {
+    public String host = "http://127.0.0.1:11434";
+    /** Model that hears the player (audio in) and decides what to say / do. */
+    public String chatModel = "lfm3-audio:latest";
+    /** Speech model for spoken replies. Empty = auto-detect (chatModel if Ollama reports "speech", else fallbackSpeechModel). */
+    public String speechModel = "";
+    public String fallbackSpeechModel = "phonon";
+    public String speechVoice = "";
+    /** Optional speech-to-text model (Whisper etc.) so a normal text LLM can be used instead of an audio model. */
+    public String sttModel = "";
+    /** OpenAI-compatible base URL for the STT model. Empty = use {@link #host}. */
+    public String sttHost = "";
+    public boolean speakReplies = true;
+    /** 0..1 playback volume for spoken replies. */
+    public float speechVolume = 0.9f;
+    public String companionName = "Companion";
+    public String companionDescription = "A loyal companion fighting beside you.";
+    public String companionPersonality = "Friendly and helpful";
+    /** Comma-separated traits the model should stay in character with. */
+    public String companionTraits = "loyal, curious, protective";
+    public String companionCardBackground = "default";
+    /** Minecraft player name whose skin the companion wears. Empty = bundled skin. "owner" = your own skin. */
+    public String companionSkin = "";
+    /** Renders the optional feminine chest model. */
+    public boolean feminineModel = false;
+    /** Body model: "auto" (follows the skin), "slim" (Alex) or "classic" (wide). */
+    public String companionBody = "auto";
+    public boolean memoryEnabled = true;
+    public int memoryMaxEvents = 30;
+    public int maxRecordSeconds = 20;
+    public int minRecordMillis = 350;
+    /** Recordings whose loudest moment stays below this (0..1 on the HUD scale) are discarded as silence. */
+    public float silenceGate = 0.12f;
+    /** When true, spoken requests that aren't direct orders are turned into an AI plan by a second LLM call. Off by default: chitchat must not become chores. */
+    public boolean dynamicGoals = false;
+    /** When true, the companion decides on its own to do small safe things every few minutes. Off by default. */
+    public boolean autonomyEnabled = false;
+    /** Rough seconds between two autonomous thoughts. */
+    public int autonomyIntervalSeconds = 30;
+    /** Bumped whenever defaults change meaningfully; migrates older config files. */
+    public int settingsVersion = 2;
+    public int historyTurns = 12;
+    public int timeoutSeconds = 60;
+    /** Higher = more varied/character replies; 0.3 felt robotic, 0.7 keeps it chatty but on-key. */
+    public float temperature = 0.7f;
+
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+    public static VoiceConfig load(Path file) {
+        try {
+            if (Files.exists(file)) {
+                VoiceConfig c = GSON.fromJson(Files.readString(file), VoiceConfig.class);
+                if (c != null) {
+                    if (c.settingsVersion < 2) {          // v2: self-planning was far too trigger-happy (greeting -> "dig diamonds")
+                        c.dynamicGoals = false;
+                        c.autonomyEnabled = false;
+                        c.settingsVersion = 2;
+                    }
+                    c.save(file); return c;             // re-save so new keys appear in old files
+                }
+            }
+        } catch (Exception ignored) { /* corrupt file: use defaults */ }
+        VoiceConfig c = new VoiceConfig();
+        c.save(file);
+        return c;
+    }
+
+    public void save(Path file) {
+        try {
+            Files.createDirectories(file.getParent());
+            Files.writeString(file, GSON.toJson(this));
+        } catch (IOException ignored) { }
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\VoiceReply.java
+
+```java
+package com.example.companionmod.voice;
+
+import com.example.companionmod.command.CompanionCommand;
+
+/**
+ * What the model understood and what the companion answers.
+ * {@code heard} may be empty if the model skipped it; {@code target} carries an entity name for
+ * "attack this creeper" style orders; {@code memory} is an optional fact to remember.
+ */
+public record VoiceReply(String heard, String say, CompanionCommand command, String target, String memory) {
+    public VoiceReply(String heard, String say, CompanionCommand command) {
+        this(heard, say, command, "", "");
+    }
+
+    public static VoiceReply text(String say) {
+        return new VoiceReply("", say, CompanionCommand.NONE, "", "");
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\VoiceState.java
+
+```java
+package com.example.companionmod.voice;
+
+public enum VoiceState { IDLE, LISTENING, THINKING, SPEAKING }
+```
+
+## common\src\main\java\com\example\companionmod\voice\WavUtil.java
+
+```java
+package com.example.companionmod.voice;
+
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+
+public final class WavUtil {
+    private WavUtil() {}
+
+    /** Result of decoding a WAV: raw 16-bit little-endian PCM plus its format. */
+    public record Pcm(byte[] data, int sampleRate, int channels) {}
+
+    public static byte[] pcm16ToWav(byte[] pcm, int sampleRate, int channels) {
+        ByteBuffer h = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN);
+        h.put("RIFF".getBytes()).putInt(36 + pcm.length).put("WAVE".getBytes());
+        h.put("fmt ".getBytes()).putInt(16).putShort((short) 1).putShort((short) channels)
+         .putInt(sampleRate).putInt(sampleRate * channels * 2).putShort((short) (channels * 2)).putShort((short) 16);
+        h.put("data".getBytes()).putInt(pcm.length);
+        ByteArrayOutputStream out = new ByteArrayOutputStream(44 + pcm.length);
+        out.writeBytes(h.array());
+        out.writeBytes(pcm);
+        return out.toByteArray();
+    }
+
+    /**
+     * Decode a 16-bit PCM WAV. Handles streamed WAVs whose size fields are 0xFFFFFFFF (Ollama's speech endpoint does this):
+     * the data chunk is then taken to run to the end of the buffer. Throws on anything that is not 16-bit PCM.
+     */
+    public static Pcm decode(byte[] wav) {
+        if (wav.length < 44 || wav[0] != 'R' || wav[1] != 'I' || wav[2] != 'F' || wav[3] != 'F')
+            throw new IllegalArgumentException("not a RIFF/WAV file");
+        ByteBuffer b = ByteBuffer.wrap(wav).order(ByteOrder.LITTLE_ENDIAN);
+        int pos = 12, rate = 24000, ch = 1, bits = 16;
+        while (pos + 8 <= wav.length) {
+            String id = new String(wav, pos, 4);
+            long size = b.getInt(pos + 4) & 0xFFFFFFFFL;
+            int body = pos + 8;
+            if (id.equals("fmt ")) {
+                int fmt = b.getShort(body) & 0xFFFF;
+                ch = b.getShort(body + 2);
+                rate = b.getInt(body + 4);
+                bits = b.getShort(body + 14);
+                if (fmt != 1 && fmt != 0xFFFE) throw new IllegalArgumentException("unsupported WAV format " + fmt);
+            } else if (id.equals("data")) {
+                if (bits != 16) throw new IllegalArgumentException("only 16-bit WAV supported");
+                long avail = wav.length - body;
+                int len = (int) Math.min(size, avail);
+                byte[] pcm = new byte[len - (len % (2 * Math.max(ch, 1)))];
+                System.arraycopy(wav, body, pcm, 0, pcm.length);
+                return new Pcm(pcm, rate, ch);
+            }
+            pos = (int) Math.min((long) body + size + (size & 1), Integer.MAX_VALUE - 16);
+        }
+        throw new IllegalArgumentException("no data chunk");
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\world\ModCommands.java
+
+```java
+package com.example.companionmod.world;
+
+import com.example.companionmod.command.CompanionCommand;
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.registry.ModContent;
+import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.arguments.BoolArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.context.CommandContext;
+import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.commands.Commands;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerPlayer;
+
+/**
+ * /companion shrine                 place a shrine at your feet
+ * /companion summon                 summon / call your companion at your feet (testing)
+ * /companion do <action> [target]   run any voice action without a microphone (follow, stay, sit, attack creeper, ...)
+ * /companion skin <playerName>      wear that player's Minecraft skin ("" clears it)
+ * /companion feminine <true|false>  toggle the feminine chest model
+ */
+public final class ModCommands {
+    private ModCommands() {}
+
+    public static void register(CommandDispatcher<CommandSourceStack> d) {
+        d.register(Commands.literal("companion")
+                .requires(Commands.hasPermission(Commands.LEVEL_GAMEMASTERS))   // 26.1-CHECK: permission API was reworked in 1.21.11; older form: src -> src.hasPermission(2)
+                .then(Commands.literal("shrine").executes(ctx -> {
+                    ServerPlayer p = ctx.getSource().getPlayerOrException();
+                    var core = ShrinePlacer.place((net.minecraft.server.level.ServerLevel) p.level(), p.blockPosition().offset(3, 0, 3));
+                    ctx.getSource().sendSuccess(() -> Component.literal("Shrine placed at " + core.toShortString()), true);
+                    return 1;
+                }))
+                .then(Commands.literal("summon").executes(ctx -> {
+                    ServerPlayer p = ctx.getSource().getPlayerOrException();
+                    ShrineSummoner.summon((net.minecraft.server.level.ServerLevel) p.level(), p.blockPosition(), p);
+                    return 1;
+                }))
+                .then(Commands.literal("do")
+                        .then(Commands.argument("action", StringArgumentType.word())
+                                .executes(ctx -> doCommand(ctx, ""))
+                                .then(Commands.argument("target", StringArgumentType.greedyString())
+                                        .executes(ctx -> doCommand(ctx, StringArgumentType.getString(ctx, "target"))))))
+                .then(Commands.literal("skin")
+                        .then(Commands.argument("playerName", StringArgumentType.greedyString()).executes(ctx -> {
+                            CompanionEntity c = companion(ctx);
+                            if (c == null) return 0;
+                            c.setSkin(StringArgumentType.getString(ctx, "playerName"));
+                            ctx.getSource().sendSuccess(() -> Component.literal("Companion skin set to " + c.skin()), false);
+                            return 1;
+                        })))
+                .then(Commands.literal("feminine")
+                        .then(Commands.argument("enabled", BoolArgumentType.bool()).executes(ctx -> {
+                            CompanionEntity c = companion(ctx);
+                            if (c == null) return 0;
+                            boolean on = BoolArgumentType.getBool(ctx, "enabled");
+                            c.setFeminine(on);
+                            ctx.getSource().sendSuccess(() -> Component.literal("Feminine model: " + on), false);
+                            return 1;
+                        })))
+                .then(Commands.literal("revive").executes(ctx -> {
+                    CompanionEntity c = companion(ctx);
+                    if (c == null) return 0;
+                    c.revive();
+                    ctx.getSource().sendSuccess(() -> Component.literal("Companion revived"), false);
+                    return 1;
+                }))
+                .then(Commands.literal("find")
+                        .then(Commands.argument("block", StringArgumentType.greedyString()).executes(ctx -> {
+                            CompanionEntity c = companion(ctx);
+                            if (c == null) return 0;
+                            String id = CompanionEntity.normalizeBlockId(StringArgumentType.getString(ctx, "block"));
+                            if (id.isBlank()) {
+                                ctx.getSource().sendFailure(Component.literal("Unknown block."));
+                                return 0;
+                            }
+                            c.setSeekBlock(id);
+                            c.speak("Looking for " + CompanionEntity.prettyBlockId(id) + ".");
+                            ctx.getSource().sendSuccess(() -> Component.literal("Seeking " + id), false);
+                            return 1;
+                        })))
+                .then(Commands.literal("name")
+                        .then(Commands.argument("name", StringArgumentType.greedyString()).executes(ctx -> {
+                            CompanionEntity c = companion(ctx);
+                            if (c == null) return 0;
+                            String name = StringArgumentType.getString(ctx, "name");
+                            c.setCustomName(Component.literal(name));
+                            c.setCustomNameVisible(false);
+                            ctx.getSource().sendSuccess(() -> Component.literal("Companion renamed to " + name), false);
+                            return 1;
+                        }))));
+    }
+
+    private static CompanionEntity companion(CommandContext<CommandSourceStack> ctx) {
+        try {
+            ServerPlayer p = ctx.getSource().getPlayerOrException();
+            CompanionEntity c = ModContent.findCompanion(p.level().getServer(), p.getUUID());
+            if (c == null) ctx.getSource().sendFailure(Component.literal("You have no companion."));
+            return c;
+        } catch (Exception e) {
+            ctx.getSource().sendFailure(Component.literal("Run this as a player."));
+            return null;
+        }
+    }
+
+    private static int doCommand(CommandContext<CommandSourceStack> ctx, String target) {
+        try {
+            ServerPlayer p = ctx.getSource().getPlayerOrException();
+            CompanionEntity c = ModContent.findCompanion(p.level().getServer(), p.getUUID());
+            if (c == null) { ctx.getSource().sendFailure(Component.literal("You have no companion.")); return 0; }
+            CompanionCommand cmd = CompanionCommand.parse(StringArgumentType.getString(ctx, "action"));
+            c.applyCommand(cmd, p, target);
+            ctx.getSource().sendSuccess(() -> Component.literal("Companion: " + cmd + (target.isBlank() ? "" : " -> " + target)), false);
+            return 1;
+        } catch (Exception e) {
+            ctx.getSource().sendFailure(Component.literal("Run this as a player."));
+            return 0;
+        }
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\world\ShrineHandler.java
+
+```java
+package com.example.companionmod.world;
+
+public class ShrineHandler {
+    // Placeholder - shrine interaction will be implemented later
+}
+```
+
+## common\src\main\java\com\example\companionmod\world\ShrinePlacer.java
+
+```java
+package com.example.companionmod.world;
+
+import com.example.companionmod.registry.ModContent;
+import net.minecraft.core.BlockPos;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.util.RandomSource;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.storage.LevelResource;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+/**
+ * Builds the shrine procedurally (no datapack structure needed) and remembers it with a tiny marker file in the world folder,
+ * so it is placed exactly once: next to the first player that ever joins a world, which on a fresh world is the spawn point.
+ */
+public final class ShrinePlacer {
+    private ShrinePlacer() {}
+
+    private static Path marker(MinecraftServer server) {
+        return server.getWorldPath(LevelResource.ROOT).resolve("companionmod_shrine.json");
+    }
+
+    public static void onPlayerJoin(ServerPlayer player) {
+        if (!(player.level() instanceof ServerLevel level) || level.dimension() != Level.OVERWORLD) return;
+        MinecraftServer server = level.getServer();
+        Path file = marker(server);
+        if (Files.exists(file)) return;
+        BlockPos core = place(level, player.blockPosition().offset(6, 0, 6));
+        try {
+            Files.writeString(file, "{\"x\":" + core.getX() + ",\"y\":" + core.getY() + ",\"z\":" + core.getZ() + "}");
+        } catch (IOException ignored) { }
+        player.sendSystemMessage(Component.literal("A strange shrine hums near spawn at " + core.getX() + " " + core.getY() + " " + core.getZ() + "."));
+    }
+
+    /** Places the shrine so its core stands on the surface at (origin.x, origin.z). Returns the core block position. */
+    public static BlockPos place(ServerLevel level, BlockPos origin) {
+        int cx = origin.getX(), cz = origin.getZ();
+        int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, cx, cz);   // first free block above the ground
+        RandomSource rnd = level.getRandom();
+        BlockState bricks = Blocks.STONE_BRICKS.defaultBlockState();
+        BlockState mossy = Blocks.MOSSY_STONE_BRICKS.defaultBlockState();
+        BlockState cracked = Blocks.CRACKED_STONE_BRICKS.defaultBlockState();
+        BlockState rim = Blocks.DEEPSLATE_BRICKS.defaultBlockState();
+
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int dz = -3; dz <= 3; dz++) {
+                BlockPos floor = new BlockPos(cx + dx, y - 1, cz + dz);
+                boolean edge = Math.abs(dx) == 3 || Math.abs(dz) == 3;
+                float r = rnd.nextFloat();
+                level.setBlock(floor, edge ? rim : (r < 0.2f ? mossy : r < 0.35f ? cracked : bricks), 3);
+                for (int h = 0; h < 5; h++) level.setBlock(floor.above(1 + h), Blocks.AIR.defaultBlockState(), 2);
+                for (int d = 1; d <= 2; d++) {                                  // fill small holes under the platform
+                    BlockPos under = floor.below(d);
+                    if (level.getBlockState(under).canBeReplaced()) level.setBlock(under, bricks, 2);
+                }
+            }
+        }
+        for (int sx : new int[]{-3, 3}) for (int sz : new int[]{-3, 3}) {        // corner pillars with soul lanterns
+            for (int h = 0; h < 3; h++) level.setBlock(new BlockPos(cx + sx, y + h, cz + sz), Blocks.STONE_BRICK_WALL.defaultBlockState(), 3);
+            level.setBlock(new BlockPos(cx + sx, y + 3, cz + sz), Blocks.SOUL_LANTERN.defaultBlockState(), 3);
+        }
+        BlockPos[] lamps = {new BlockPos(cx + 2, y, cz), new BlockPos(cx - 2, y, cz), new BlockPos(cx, y, cz + 2), new BlockPos(cx, y, cz - 2)};
+        for (BlockPos p : lamps) level.setBlock(p, Blocks.SOUL_LANTERN.defaultBlockState(), 3);
+
+        BlockPos core = new BlockPos(cx, y, cz);
+        level.setBlock(core, ModContent.SHRINE_CORE.defaultBlockState(), 3);
+        return core;
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\world\ShrineSpawner.java
+
+```java
+package com.example.companionmod.world;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+
+public class ShrineSpawner {
+    public static final Block SHRINE_BLOCK = Blocks.NETHER_BRICKS;
+
+    public static BlockPos findShrinePosition(Level level, BlockPos spawnPos) {
+        // Search for existing shrine in 32-block radius
+        for (int x = -32; x <= 32; x++) {
+            for (int y = 0; y < 256; y++) {
+                for (int z = -32; z <= 32; z++) {
+                    BlockPos pos = new BlockPos(spawnPos.getX() + x, y, spawnPos.getZ() + z);
+                    if (level.getBlockState(pos).getBlock() == SHRINE_BLOCK) {
+                        return pos;
+                    }
+                }
+            }
+        }
+
+        // No shrine found, create one near spawn at Y=64 (above ground)
+        BlockPos shrinePos = new BlockPos(spawnPos.getX(), 64, spawnPos.getZ());
+
+        // Check if area is clear
+        if (level.isEmptyBlock(shrinePos) && level.isEmptyBlock(shrinePos.north()) &&
+            level.isEmptyBlock(shrinePos.south()) && level.isEmptyBlock(shrinePos.east()) &&
+            level.isEmptyBlock(shrinePos.west())) {
+            return shrinePos;
+        }
+
+        // Try a few more positions
+        for (int offset = 1; offset <= 10; offset++) {
+            shrinePos = new BlockPos(spawnPos.getX() + offset, 64, spawnPos.getZ() + offset);
+            if (level.isEmptyBlock(shrinePos) && level.isEmptyBlock(shrinePos.north()) &&
+                level.isEmptyBlock(shrinePos.south()) && level.isEmptyBlock(shrinePos.east()) &&
+                level.isEmptyBlock(shrinePos.west())) {
+                return shrinePos;
+            }
+        }
+
+        return null;
+    }
+
+    public static void placeShrine(Level level, BlockPos pos) {
+        level.setBlock(pos, SHRINE_BLOCK.defaultBlockState(), 3);
+        level.setBlock(pos.above(), Blocks.SMOOTH_STONE.defaultBlockState(), 3);
+    }
+
+    public static boolean isShrineBlock(BlockState state) {
+        return state.getBlock() == SHRINE_BLOCK;
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\world\ShrineSummoner.java
+
+```java
+package com.example.companionmod.world;
+
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.registry.ModContent;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.world.entity.EntitySpawnReason;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.phys.Vec3;
+
+public final class ShrineSummoner {
+    private ShrineSummoner() {}
+
+    /** One companion per player: reuse the living one (calling it to the shrine) or create a new one. */
+    public static void summon(ServerLevel level, BlockPos shrine, ServerPlayer player) {
+        Vec3 spot = findSpot(level, shrine);
+        CompanionEntity existing = ModContent.findCompanion(level.getServer(), player.getUUID());
+
+        if (existing != null && existing.level() == level) {
+            existing.setPos(spot.x, spot.y, spot.z);
+            existing.getNavigation().stop();
+            player.sendSystemMessage(Component.literal(existing.getName().getString() + " answers the shrine's call."));
+            effects(level, spot);
+            return;
+        }
+        if (existing != null) existing.discard();   // it was in another dimension: replace it (inventory/progress persistence is phase 2)
+
+        CompanionEntity c = ModContent.COMPANION.create(level, EntitySpawnReason.MOB_SUMMONED);
+        if (c == null) return;
+        c.setPos(spot.x, spot.y, spot.z);
+        c.setYRot(player.getYRot() + 180f);
+        c.setOwner(player.getUUID());
+        c.setCustomName(Component.literal("Companion"));
+        c.setCustomNameVisible(true);
+        c.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(Items.IRON_SWORD));
+        level.addFreshEntity(c);
+        player.sendSystemMessage(Component.literal("A companion steps out of the light. Hold V to talk to it."));
+        effects(level, spot);
+    }
+
+    private static void effects(ServerLevel level, Vec3 at) {
+        level.sendParticles(ParticleTypes.END_ROD, at.x, at.y + 1.0, at.z, 40, 0.35, 0.8, 0.35, 0.03);
+        level.sendParticles(ParticleTypes.SOUL_FIRE_FLAME, at.x, at.y + 0.1, at.z, 15, 0.4, 0.05, 0.4, 0.02);
+        level.playSound(null, BlockPos.containing(at), SoundEvents.BEACON_ACTIVATE, SoundSource.BLOCKS, 1.0f, 1.3f);
+    }
+
+    /** A free 2-high spot beside the shrine (preferring the four sides), else on top. */
+    private static Vec3 findSpot(ServerLevel level, BlockPos shrine) {
+        for (Direction d : Direction.Plane.HORIZONTAL) {
+            BlockPos p = shrine.relative(d);
+            if (free(level, p) && free(level, p.above())) return Vec3.atBottomCenterOf(p);
+        }
+        return Vec3.atBottomCenterOf(shrine.above());
+    }
+
+    private static boolean free(ServerLevel level, BlockPos p) {
+        return level.getBlockState(p).getCollisionShape(level, p).isEmpty();
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\world\WorldGenerationHandler.java
+
+```java
+package com.example.companionmod.world;
+
+public class WorldGenerationHandler {
+    // Placeholder - world generation will be implemented later
+}
+```
+
+## fabric\src\client\java\com\example\companionmod\fabric\CompanionModFabricClient.java
+
+```java
+package com.example.companionmod.fabric;
+
+import com.example.companionmod.CompanionMod;
+import com.example.companionmod.client.ClientVoice;
+import com.example.companionmod.client.CompanionInventoryScreen;
+import com.example.companionmod.client.CompanionRenderer;
+import com.example.companionmod.registry.ModContent;
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+import net.fabricmc.fabric.api.client.rendering.v1.EntityRendererRegistry;
+import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
+import net.minecraft.client.gui.screens.MenuScreens;
+
+/** Fabric client entrypoint: renderer, HUD, and the shared voice/radial/skin logic in common/ClientVoice. */
+public class CompanionModFabricClient implements ClientModInitializer {
+    @Override
+    public void onInitializeClient() {
+        ClientVoice.setSender(ClientPlayNetworking::send);
+        KeyMappingHelper.registerKeyMapping(ClientVoice.talkKey());   // shows up in Controls, rebindable
+        EntityRendererRegistry.register(ModContent.COMPANION, CompanionRenderer::new);
+        MenuScreens.register(ModContent.COMPANION_INV_MENU, CompanionInventoryScreen::new);
+        HudElementRegistry.addLast(CompanionMod.id("voice_hud"),
+                (graphics, deltaTracker) -> ClientVoice.renderHud(graphics, deltaTracker));
+        ClientTickEvents.END_CLIENT_TICK.register(ClientVoice::tick);
+    }
+}
+```
+
+## fabric\src\main\java\com\example\companionmod\fabric\CompanionModFabric.java
+
+```java
+package com.example.companionmod.fabric;
+
+import com.example.companionmod.CompanionMod;
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.net.CommandHandler;
+import com.example.companionmod.net.CommandPayload;
+import com.example.companionmod.registry.ModContent;
+import com.example.companionmod.world.ModCommands;
+import com.example.companionmod.world.ShrinePlacer;
+import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+// import net.fabricmc.fabric.api.event.lifecycle.v1.ServerPlayConnectionEvents; // not available in this Fabric API version
+
+import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.fabricmc.fabric.api.object.builder.v1.entity.FabricDefaultAttributeRegistry;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.item.CreativeModeTabs;
+
+/** Fabric entrypoint. NOTE: every Fabric API package/method name below is a 26.1-CHECK: compare with the Fabric API 26.1 porting guide. */
+public class CompanionModFabric implements ModInitializer {
+    @Override
+    public void onInitialize() {
+        Registry.register(BuiltInRegistries.BLOCK, ModContent.blockId(), ModContent.SHRINE_CORE);
+        Registry.register(BuiltInRegistries.ITEM, ModContent.itemId(), ModContent.SHRINE_CORE_ITEM);
+        Registry.register(BuiltInRegistries.ENTITY_TYPE, ModContent.entityId(), ModContent.COMPANION);
+        Registry.register(BuiltInRegistries.MENU, ModContent.menuId(), ModContent.COMPANION_INV_MENU);
+        FabricDefaultAttributeRegistry.register(ModContent.COMPANION, CompanionEntity.createAttributes());
+
+        PayloadTypeRegistry.serverboundPlay().register(CommandPayload.TYPE, CommandPayload.CODEC);   // 26.1-CHECK: may be serverboundPlay()
+        ServerPlayNetworking.registerGlobalReceiver(CommandPayload.TYPE, (payload, ctx) -> CommandHandler.handle(ctx.player(), payload));
+
+        Registry.register(BuiltInRegistries.MENU, ModContent.menuId(), ModContent.COMPANION_INV_MENU);
+
+        CommandRegistrationCallback.EVENT.register((dispatcher, buildContext, environment) -> ModCommands.register(dispatcher));
+    }
+}
+```
+
+## neoforge\src\main\java\com\example\companionmod\neoforge\CompanionModNeoForge.java
+
+```java
+package com.example.companionmod.neoforge;
+
+import com.example.companionmod.CompanionMod;
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.net.CommandHandler;
+import com.example.companionmod.net.CommandPayload;
+import com.example.companionmod.registry.ModContent;
+import com.example.companionmod.world.ModCommands;
+import com.example.companionmod.world.ShrinePlacer;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.item.CreativeModeTabs;
+import net.neoforged.bus.api.IEventBus;
+import net.neoforged.fml.common.Mod;
+import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.event.BuildCreativeModeTabContentsEvent;
+import net.neoforged.neoforge.event.RegisterCommandsEvent;
+import net.neoforged.neoforge.event.entity.EntityAttributeCreationEvent;
+import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
+import net.neoforged.neoforge.registries.RegisterEvent;
+
+@Mod(CompanionMod.MOD_ID)
+public class CompanionModNeoForge {
+    public CompanionModNeoForge(IEventBus modBus) {
+        modBus.addListener(RegisterEvent.class, e -> {
+            e.register(Registries.BLOCK, h -> h.register(ModContent.blockId(), ModContent.SHRINE_CORE));
+            e.register(Registries.ITEM, h -> h.register(ModContent.itemId(), ModContent.SHRINE_CORE_ITEM));
+            e.register(Registries.ENTITY_TYPE, h -> h.register(ModContent.entityId(), ModContent.COMPANION));
+            e.register(Registries.MENU, h -> h.register(ModContent.menuId(), ModContent.COMPANION_INV_MENU));
+        });
+        modBus.addListener(EntityAttributeCreationEvent.class, e -> e.put(ModContent.COMPANION, CompanionEntity.createAttributes().build()));
+        modBus.addListener(RegisterPayloadHandlersEvent.class, e ->
+                e.registrar("1").playToServer(CommandPayload.TYPE, CommandPayload.CODEC,
+                        (payload, ctx) -> CommandHandler.handle((ServerPlayer) ctx.player(), payload)));
+        modBus.addListener(BuildCreativeModeTabContentsEvent.class, e -> {
+            if (e.getTabKey() == CreativeModeTabs.FUNCTIONAL_BLOCKS) e.accept(ModContent.SHRINE_CORE_ITEM);
+        });
+
+        NeoForge.EVENT_BUS.addListener(RegisterCommandsEvent.class, e -> ModCommands.register(e.getDispatcher()));
+        NeoForge.EVENT_BUS.addListener(PlayerEvent.PlayerLoggedInEvent.class, e -> {
+            if (e.getEntity() instanceof ServerPlayer sp) ShrinePlacer.onPlayerJoin(sp);
+        });
+        NeoForge.EVENT_BUS.addListener(PlayerEvent.PlayerLoggedOutEvent.class, e -> CommandHandler.forget(e.getEntity().getUUID()));
+    }
+}
+```
+
+## neoforge\src\main\java\com\example\companionmod\neoforge\CompanionModNeoForgeClient.java
+
+```java
+package com.example.companionmod.neoforge;
+
+import com.example.companionmod.CompanionMod;
+import com.example.companionmod.client.ClientVoice;
+import com.example.companionmod.client.CompanionInventoryScreen;
+import com.example.companionmod.client.CompanionRenderer;
+import com.example.companionmod.registry.ModContent;
+import net.minecraft.client.Minecraft;
+import net.neoforged.api.distmarker.Dist;
+import net.neoforged.bus.api.IEventBus;
+import net.neoforged.fml.common.Mod;
+import net.neoforged.neoforge.client.event.ClientTickEvent;
+import net.neoforged.neoforge.client.event.EntityRenderersEvent;
+import net.neoforged.neoforge.client.event.RegisterGuiLayersEvent;
+import net.neoforged.neoforge.client.event.RegisterKeyMappingsEvent;
+import net.neoforged.neoforge.client.event.RegisterMenuScreensEvent;
+import net.neoforged.neoforge.client.network.ClientPacketDistributor;
+import net.neoforged.neoforge.common.NeoForge;
+
+/**
+ * Replaces the old static @EventBusSubscriber client class. Differences from the first draft:
+ *  - the mic key is a real, rebindable KeyMapping (was raw GLFW_KEY_V);
+ *  - it is ignored while any screen is open (the old version fired while typing a "v" in chat);
+ *  - all logic lives in common/ClientVoice so Fabric behaves identically.
+ * 26.1-CHECK: event/class names (RegisterGuiLayersEvent, ClientPacketDistributor) against the NeoForge 26.1 primer.
+ */
+@Mod(value = CompanionMod.MOD_ID, dist = Dist.CLIENT)
+public class CompanionModNeoForgeClient {
+    public CompanionModNeoForgeClient(IEventBus modBus) {
+        ClientVoice.setSender(ClientPacketDistributor::sendToServer);
+        modBus.addListener(RegisterKeyMappingsEvent.class, e -> e.register(ClientVoice.talkKey()));
+        modBus.addListener(EntityRenderersEvent.RegisterRenderers.class, e -> e.registerEntityRenderer(ModContent.COMPANION, CompanionRenderer::new));
+        modBus.addListener(RegisterMenuScreensEvent.class, e ->
+                e.register(ModContent.COMPANION_INV_MENU, CompanionInventoryScreen::new));
+        modBus.addListener(RegisterGuiLayersEvent.class, e ->
+                e.registerAboveAll(CompanionMod.id("voice_hud"), (graphics, deltaTracker) -> ClientVoice.renderHud(graphics, deltaTracker)));
+        NeoForge.EVENT_BUS.addListener(ClientTickEvent.Post.class, e -> ClientVoice.tick(Minecraft.getInstance()));
+    }
+}
+```
+
