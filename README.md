@@ -175,9 +175,3 @@ Key fields: `host`, `chatModel`, `sttModel`, `sttHost`, `speechModel`, `speechVo
 - Outputs: `fabric/build/libs/companionmod-0.1.1.jar`, `neoforge/build/libs/companionmod-0.1.1.jar`.
 - Fabric client classes live in `fabric/src/client/java` (split source sets) and are folded into
   the jar by `jar`/`shadowJar` in `fabric/build.gradle`.
-
-## Status
-
-Builds cleanly for both loaders. In-game behaviour (radial rendering, skin download, armor rendering,
-chest overlay placement, patrol/pickup/seek-mining, revive timer) still needs a manual playtest — no
-Minecraft assets are cached in this environment, so `runClient` would need a large download first.
