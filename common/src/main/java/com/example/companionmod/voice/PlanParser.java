@@ -19,7 +19,7 @@ public final class PlanParser {
     public record Plan(String goal, List<PlanStep> steps) { public boolean isEmpty() { return steps.isEmpty(); } }
 
     public static final Set<String> OPS = Set.of("follow", "stay", "sit", "stand", "come", "stop", "wander", "patrol", "guard",
-            "defensive", "passive", "attack", "seek_block", "pickup", "say", "wait", "hunt", "farm", "fish", "build", "continue");
+            "defensive", "passive", "attack", "seek_block", "pickup", "say", "wait", "hunt", "farm", "fish", "build", "plant", "continue");
     /** What the companion may do on its own initiative: no mining, no starting fights, no builds. */
     public static final Set<String> AUTO_OPS = Set.of("follow", "come", "wander", "patrol", "guard", "defensive", "pickup", "say", "wait", "farm", "fish");
 
@@ -31,7 +31,7 @@ public final class PlanParser {
             Map.entry("come_back", "come"), Map.entry("go_home", "come"), Map.entry("rest", "sit"),
             Map.entry("talk", "say"), Map.entry("speak", "say"), Map.entry("protect", "guard"),
             Map.entry("harvest", "farm"), Map.entry("bring", "come"), Map.entry("deliver", "come"),
-            Map.entry("resume", "continue"), Map.entry("keep_going", "continue"));
+            Map.entry("replant", "plant"), Map.entry("reforest", "plant"), Map.entry("resume", "continue"), Map.entry("keep_going", "continue"));
     /** Ops whose meaning depends on the argument: a material word means "go mine it", otherwise "loot the ground". */
     private static final Set<String> AMBIGUOUS = Set.of("get", "collect", "gather", "fetch", "pickup", "take", "grab");
     /** Words that usually name a mineable material rather than a dropped item. */
@@ -78,6 +78,7 @@ public final class PlanParser {
                         if (arg.isEmpty()) continue;
                     }
                     case "attack", "hunt" -> arg = clean(arg, 32).toLowerCase(Locale.ROOT);
+                    case "plant" -> arg = clean(arg, 32).toLowerCase(Locale.ROOT);
                     default -> arg = "";
                 }
                 if (sec < 0) sec = defaultSeconds(op);
@@ -139,6 +140,7 @@ public final class PlanParser {
         return switch (op) {
             case "wander", "patrol", "guard", "attack", "hunt", "pickup", "farm", "fish" -> 30;
             case "build" -> 90;
+            case "plant" -> 60;
             case "seek_block" -> 120;
             case "wait" -> 3;
             case "say", "stop", "continue" -> 0;

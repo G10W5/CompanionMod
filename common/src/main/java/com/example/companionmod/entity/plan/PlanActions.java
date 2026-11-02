@@ -11,6 +11,7 @@ public interface PlanActions {
     void planSay(String text);
     boolean planSeekActive();
     boolean planPickupActive();
+    default boolean planPlantActive() { return false; }
     boolean planFighting();
     /** Freeze the plan while true (e.g. injured and recovering). */
     default boolean planPaused() { return false; }

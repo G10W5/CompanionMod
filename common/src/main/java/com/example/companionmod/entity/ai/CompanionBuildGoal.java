@@ -113,7 +113,6 @@ public class CompanionBuildGoal extends Goal {
             mob.swing(InteractionHand.MAIN_HAND);
             level.setBlock(pos, s.block().defaultBlockState(), 3);
             index++;
-            if (mob.getRandom().nextInt(12) == 0) mob.speak("Building...");
         }
         mob.speak(blocked > 0 ? "Build finished, but " + blocked + " spots are protected." : "Build finished!");
         mob.clearBuild();

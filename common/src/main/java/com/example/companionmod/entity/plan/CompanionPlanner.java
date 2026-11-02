@@ -18,7 +18,7 @@ import java.util.Set;
  * while it was interrupted.</p>
  */
 public final class CompanionPlanner {
-    private static final Set<String> RETURN_AFTER = Set.of("wander", "patrol", "seek_block", "pickup", "attack", "guard");
+    private static final Set<String> RETURN_AFTER = Set.of("wander", "patrol", "seek_block", "pickup", "attack", "guard", "plant");
 
     private final ArrayDeque<PlanStep> queue = new ArrayDeque<>();
     private PlanStep current;
@@ -31,6 +31,13 @@ public final class CompanionPlanner {
     public boolean active() { return current != null || !queue.isEmpty(); }
     public boolean paused() { return paused; }
     public String goal() { return goal; }
+
+    /** A work goal made real progress: a timed seek_block / plant step gets at least {@code ticks} more, so it is never cut off mid-job. */
+    public void extendDeadline(long fromTick, long ticks) {
+        if (current != null && ("seek_block".equals(current.op()) || "plant".equals(current.op()))) {
+            endTick = Math.max(endTick, fromTick + ticks);
+        }
+    }
 
     public void cancel() { queue.clear(); current = null; goal = ""; paused = false; }
 
@@ -100,6 +107,7 @@ public final class CompanionPlanner {
             case "say" -> dt >= 30;                                   // small pause so lines never flood chat
             case "seek_block" -> tick >= endTick || (dt > 40 && !host.planSeekActive());
             case "pickup" -> tick >= endTick || (dt > 20 && !host.planPickupActive());
+            case "plant" -> tick >= endTick || (dt > 40 && !host.planPlantActive());
             case "attack" -> tick >= endTick || (dt > 60 && !host.planFighting());
             default -> tick >= endTick;
         };

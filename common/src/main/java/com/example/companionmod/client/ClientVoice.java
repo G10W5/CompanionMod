@@ -233,6 +233,7 @@ public final class ClientVoice {
             case MINE -> new String[]{"mine", "dig", "break", "chop"};
             case BUILD -> new String[]{"build", "construct", "place", "house", "wall", "tower", "bridge", "schematic"};
             case FARM -> new String[]{"farm", "harvest", "crops", "plant", "wheat", "carrot", "potato", "pumpkin", "melon"};
+            case PLANT -> new String[]{"plant", "replant", "sapling", "saplings", "tree", "trees", "forest", "propagule"};
             case PATROL -> new String[]{"patrol", "scout", "scouting", "lookout"};
             case HEAL -> new String[]{"heal", "healing", "health", "bandage"};
             case EQUIP -> new String[]{"equip", "wear", "switch", "pickaxe", "axe", "sword", "shovel", "hoe",

@@ -7,6 +7,7 @@ import com.example.companionmod.entity.ai.CompanionFollowGoal;
 import com.example.companionmod.entity.ai.CompanionFishGoal;
 import com.example.companionmod.entity.ai.CompanionPatrolGoal;
 import com.example.companionmod.entity.ai.CompanionPickupGoal;
+import com.example.companionmod.entity.ai.CompanionPlantGoal;
 import com.example.companionmod.entity.ai.CompanionSeekBlockGoal;
 import com.example.companionmod.entity.ai.CompanionSitGoal;
 import com.example.companionmod.entity.ai.CompanionTargetGoal;
@@ -24,6 +25,7 @@ import net.minecraft.network.syncher.EntityDataSerializers;
 import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.resources.Identifier;
 import net.minecraft.tags.DamageTypeTags;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.entity.ai.memory.MemoryModuleType;
 import com.example.companionmod.world.CompanionRegistry;
 import net.minecraft.server.level.ServerLevel;
@@ -90,6 +92,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     private static final EntityDataAccessor<String> DATA_SKIN = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.STRING);
     private static final EntityDataAccessor<Integer> DATA_FEMININE = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
     private static final EntityDataAccessor<Integer> DATA_PICKUP = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
+    /** Short progress text for the radial menu ("Wood 6/16"); empty when idle. Updated by the server every half second. */
+    private static final EntityDataAccessor<String> DATA_TASK = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.STRING);
     private static final EntityDataAccessor<String> DATA_SPEECH = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.STRING);
     private static final EntityDataAccessor<Integer> DATA_SPEECH_ID = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
     private static final EntityDataAccessor<Integer> DATA_INJURED = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
@@ -152,7 +156,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     private boolean registryChecked;
 
     // job state (time-boxed / schematic-driven behaviours)
-    private long farmUntil, fishUntil;
+    private long farmUntil, fishUntil, plantUntil;
+    private String plantFilter = "";
     private String buildSchematic = "";
     private int selectedToolSlot = 0;          // which tool slot is held in the main hand
     private int targetSinceTick;               // when the current automatic target was acquired
@@ -187,7 +192,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         goalSelector.addGoal(2, new MeleeAttackGoal(this, 1.25, true));
         goalSelector.addGoal(2, new CompanionSeekBlockGoal(this));   // explicit "find diamonds" pre-empts walking
         goalSelector.addGoal(3, new CompanionPickupGoal(this));      // explicit "pick this up" pre-empts walking
-        goalSelector.addGoal(4, new CompanionFarmGoal(this));        // time-boxed jobs (farm / fish / build)
+        goalSelector.addGoal(4, new CompanionFarmGoal(this));
+        goalSelector.addGoal(4, new CompanionPlantGoal(this));        // time-boxed jobs (farm / fish / build)
         goalSelector.addGoal(4, new CompanionFishGoal(this));
         goalSelector.addGoal(4, new CompanionBuildGoal(this));
         goalSelector.addGoal(4, new CompanionPatrolGoal(this));
@@ -209,6 +215,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         builder.define(DATA_SKIN, "");
         builder.define(DATA_FEMININE, 0);
         builder.define(DATA_PICKUP, 0);
+        builder.define(DATA_TASK, "");
         builder.define(DATA_SPEECH, "");
         builder.define(DATA_SPEECH_ID, 0);
         builder.define(DATA_INJURED, 0);
@@ -295,6 +302,12 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     public MineTask mineTask() { return mineTask; }
 
     public long farmUntil() { return farmUntil; }
+    public long plantUntil() { return plantUntil; }
+    public String plantFilter() { return plantFilter; }
+    public void endPlant() { plantUntil = 0; plantFilter = ""; }
+    public String taskText() { return entityData.get(DATA_TASK); }
+    /** Called by work goals whenever they make real progress, so a timed AI plan step is not cut off mid-job. */
+    public void noteMiningProgress() { planner.extendDeadline(tickCount, 600); }
     public long fishUntil() { return fishUntil; }
     public String buildSchematic() { return buildSchematic; }
     /** Clears the current build job (called by the build goal when it finishes). */
@@ -366,7 +379,15 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             case GUARD, DEFEND -> { if (isSitting()) setMoveMode(MoveMode.FOLLOW); setStance(Stance.GUARD); }
             case DEFENSIVE -> { setStance(Stance.DEFENSIVE); forcedTarget = null; setTarget(null); }
             case PASSIVE -> { setStance(Stance.PASSIVE); forcedTarget = null; setTarget(null); getNavigation().stop(); }
-            case COME -> { clearSeekBlock(); if (isSitting()) setMoveMode(MoveMode.FOLLOW); if (from != null) teleportNear(from); }
+            case COME -> {
+                clearSeekBlock();
+                if (isSitting()) setMoveMode(MoveMode.FOLLOW);
+                if (from != null) {
+                    // A "come" that is part of a plan (bringing the loot back) walks like a person; only a spoken "come" warps.
+                    if (applyingPlanStep && from.level() == level() && distanceToSqr(from) < 48 * 48) setMoveMode(MoveMode.FOLLOW);
+                    else teleportNear(from);
+                }
+            }
             case RETREAT, FLEE -> {
                 clearSeekBlock();
                 setStance(Stance.PASSIVE);
@@ -387,7 +408,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             case PICKUP, LOOT, TAKE -> {
                 String filter = target == null ? "" : target.trim();
                 String id = normalizeBlockId(filter);
-                if (!id.isBlank() && !anyMatchingDrops(filter)) {
+                if (!id.isBlank() && !isPlantId(id) && !anyMatchingDrops(filter)) {   // saplings/flowers are items to pick up, never blocks to break
                     clearSeekBlock();
                     setSeekBlock(id);
                     setAnchor(blockPosition());
@@ -437,6 +458,14 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
                 else if (!lastPlanJson.isBlank() && planner.accept(lastPlanJson, this, tickCount)) speak("Restarting the plan.");
                 else speak("There is nothing to continue.");
             }
+            case PLANT -> {
+                clearSeekBlock();
+                plantFilter = target == null ? "" : target.toLowerCase(Locale.ROOT).trim().replace("minecraft:", "")
+                        .replace(' ', '_').replace("saplings", "sapling");
+                plantUntil = level().getGameTime() + 1200;
+                setAnchor(blockPosition());
+                getNavigation().stop();
+            }
             case FARM -> { farmUntil = level().getGameTime() + 600; setAnchor(blockPosition()); speak("Farming."); }
             case FISH -> { fishUntil = level().getGameTime() + 600; setAnchor(blockPosition()); speak("Going fishing."); }
             case BUILD -> {
@@ -466,6 +495,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         clearSeekBlock();
         finishPickup(false);
         farmUntil = 0;
+        plantUntil = 0;
         fishUntil = 0;
         clearBuild();
         forcedTarget = null;
@@ -801,6 +831,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     @Override public void planSay(String text) { speak(text); }
     @Override public boolean planSeekActive() { return !seekBlock().isBlank(); }
+    @Override public boolean planPlantActive() { return plantUntil > level().getGameTime(); }
     @Override public boolean planPickupActive() { return isPickupRequested() || isPickupEnabled(); }
     @Override public boolean planFighting() { LivingEntity t = getTarget(); return t != null && t.isAlive(); }
     @Override public boolean planPaused() { return isInjured(); }
@@ -1148,6 +1179,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             registryChecked = true;
             if (!claimRegistry()) return;       // stale duplicate: it dropped its bag and removed itself
         }
+        if (tickCount % 10 == 0) refreshTaskText();
         if (isSitting()) {
             getNavigation().stop();
             if (tickCount % 40 == 0) heal(1.0f);               // resting heals
@@ -1221,6 +1253,32 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     @Override
     public boolean removeWhenFarAway(double distSq) { return false; }
+
+    // ------------------------------------------------------------------ task text, plants
+
+    private void refreshTaskText() {
+        long now = level().getGameTime();
+        String s = "";
+        if (mineTask.exists()) {
+            String p = prettyBlockId(mineTask.blockId).replace(" ore", "");
+            s = Character.toUpperCase(p.charAt(0)) + p.substring(1) + " " + mineTask.mined + "/" + mineTask.want + (mineTask.paused ? " ||" : "");
+        } else if (plantUntil > now) s = "Planting";
+        else if (farmUntil > now) s = "Farming";
+        else if (fishUntil > now) s = "Fishing";
+        else if (!buildSchematic.isBlank()) s = "Building";
+        if (!s.equals(entityData.get(DATA_TASK))) entityData.set(DATA_TASK, s);
+    }
+
+    private static boolean isPlantId(String id) {
+        if (id.endsWith("_sapling") || id.endsWith("_propagule")) return true;
+        Identifier loc = Identifier.tryParse(id);
+        if (loc == null) return false;
+        return BuiltInRegistries.BLOCK.getOptional(loc).map(b -> {
+            BlockState st = b.defaultBlockState();
+            return st.is(net.minecraft.tags.BlockTags.SAPLINGS) || st.is(net.minecraft.tags.BlockTags.FLOWERS)
+                    || st.is(net.minecraft.tags.BlockTags.CROPS);
+        }).orElse(false);
+    }
 
     // ------------------------------------------------------------------ identity, registry, downed handling
 

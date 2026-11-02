@@ -238,7 +238,12 @@ public final class CompanionRadialScreen extends Screen {
         String title, hint;
         if (hovered >= 0) { title = current.get(hovered).label; hint = current.get(hovered).hint; }
         else if (!stack.isEmpty() && lastDistance < INNER) { title = "Back"; hint = "Click the centre"; }
-        else { title = currentTitle; hint = "Choose an order"; }
+        else {
+            title = currentTitle;
+            com.example.companionmod.entity.CompanionEntity mine = ClientVoice.findCompanion(this.minecraft);
+            String task = mine == null ? "" : mine.taskText();
+            hint = task.isBlank() ? "Choose an order" : task;       // live progress lives here, not in chat
+        }
         g.centeredText(this.font, title, cx, cy - 12, fade(0xFFFFFFFF, alpha));
         g.centeredText(this.font, hint.length() > 16 ? hint.substring(0, 15) + "…" : hint, cx, cy - 1, fade(0xFFA0A0A0, alpha));
         String goal = CompanionAutonomy.currentGoal();

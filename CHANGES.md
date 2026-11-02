@@ -38,3 +38,44 @@ resolved here (no Minecraft jars), so compile once and check the `26.1-CHECK` co
   still need a fake player — not done).
 - Schematics: read off-thread, 2 MB / 20k blocks / ±96 limit, built bottom-up, skip blocks without an item.
 - `findCompanion` is O(1) (registry); client side cached; monster aggro every 2 s, radius 16, max 6, never while passive.
+
+## Speech bubbles (CompanionSubtitles + CompanionRenderer)
+- Stuck / never fading: the timed (no-audio) clock was clamped at the line's duration, so the last words stayed frozen at a young age.
+  It now keeps running; audio mode also falls back to wall time if the "stopped" callback never arrives.
+- Too high: rise 64 px -> 20 px and anchor +0.45 -> +0.2 blocks above the hitbox (was ~2.2 blocks above the head). Words now float up
+  slowly over their whole life instead of snapping up in 0.15 s. Tune `RISE_PX` and the `+ 0.2f` to taste.
+- Fade end no longer flashes opaque (vanilla treats text alpha < 4/255 as fully opaque).
+- Lines of 200-240 chars no longer restart their animation every frame (voice queue clips at 200).
+
+## Mining: climbing with blocks, vein stall (CompanionSeekBlockGoal)
+- NEW scaffolding: a target above reach (birch logs high in the crown, ore up a cave wall) makes the companion jump-pillar with cheap
+  blocks from its bag (dirt family, stone family, cobble, cobbled deepslate, netherrack, planks; never the block being mined, never
+  sand/gravel or tile-entity blocks), clearing leaves overhead first, up to 24 blocks. For SURFACE jobs (wood, stone, dirt...) the blocks
+  are temporary: when nothing is left to mine up there (or the task is done, or the next target is elsewhere) it climbs down by breaking
+  them, top first, and collects them again. For MINING jobs (coal, iron, diamond... anything that descends/branch-mines) every placed
+  block stays, and gaps in a tunnel floor are bridged with a permanent block (max 12 in a row, never over liquid).
+- Vein "staring" fixed: a vein block that was in reach but behind another block was retried forever, because only `oreTarget` was ever
+  marked unreachable. Now: in reach but blocked -> dig out the first blocker (max 8 tries per block, never into liquid), then give up
+  cleanly on that block. Walking to a target counts as arrived on distance alone; line of sight is solved by digging.
+- Trees: leaves in front of a log are broken like any blocker; `scan` prefers blocks reachable from the ground over logs high in the
+  crown; "unreachable" marks are forgotten once after 3 failed wander attempts so a new vantage point retries them.
+- The "That's N logs for you" message and task end now happen after the climb down.
+- Not persisted: if the chunk unloads mid-climb the placed blocks stay where they are.
+
+## Work behaviour round 3 (SeekBlockGoal, new PlantGoal, entity, planner)
+- Freeze then teleport to you: an AI plan step ("seek_block 90 s, then come") timed out while the companion was stuck, then `come`
+  warped it. Now: (1) a staged watchdog: after 8 s without progress it drops the block it is fixated on and re-decides, after 25 s it
+  re-plans (the final "I'm stuck" line names the state: digging / walking / climbing / clearing / planning); (2) real progress extends the
+  plan step's deadline; (3) a `come` that belongs to a plan walks back (FOLLOW) instead of warping when you are within 48 blocks.
+- Block-by-block teleporting: tunnel steps used the pathfinder, which returns nothing while the mob is still in the air after a step-up, and
+  the fallback then warped it. Steps now drive the move control directly (it jumps up one block itself); the warp is only a last resort after
+  3 s. Long walks re-request their path up to 4 times instead of giving up (which also wrongly marked good trees "unreachable"); decisions are
+  postponed until the companion has landed.
+- Reach: measured from the EYES like a player (about 1.6 blocks more upward reach), so fewer blocks need scaffolding at all.
+- Climbing without dirt/cobble: surface jobs may use their own chopped logs as temporary scaffolding (last resort), and if there is nothing
+  placeable it says so instead of silently giving up. Taking scaffold back no longer counts as "mined".
+- Saplings: "pick up the birch saplings" no longer turns into "mine birch_sapling" (it broke the one you placed). Plants/flowers/crops are
+  only ever picked up as drops. NEW `plant` order/plan op/voice action: plants saplings from the bag on nearby soil (3 apart, room to grow,
+  respects protection), ends by itself. NEW: after felling a trunk base on soil the companion silently replants a matching sapling from its bag.
+- Chatter: no more "Got wood! (3/16)" or "Building..."; start, finish and problem lines remain. Progress ("Wood 6/16", Farming, Planting...)
+  is synced to the client and shown in the radial menu hub when nothing is hovered.
