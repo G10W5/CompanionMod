@@ -793,27 +793,20 @@ public class CompanionSeekBlockGoal extends Goal {
             return;
         }
         if (walkMode == WALK_STAND) {
-            // A tunnel / stair step is one block. Staged fallback, villager-style:
-            // 1) let the vanilla pathfinder walk it (it steps up single blocks by itself) for ~1.2 s;
-            // 2) no path / not arriving (tight tunnel, mid-air request, corner): take over with direct move
-            //    control + jump - the move control alone cannot climb a 1-block step;
-            // 3) truly jammed after ~3 s (entity in the way): teleport, the last resort so a tunnel never deadlocks.
-            if (walkTicks <= 25) {
-                if (walkTicks % 20 == 1) nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
-            } else {
+            // OG tunnel-step behaviour (restored): the pathfinder walks the 1-block step, re-issued every 20
+            // ticks; if the path is done/failed but we are not there yet (a step-up the pathfinder cannot
+            // model, a tight corner), teleport as the last resort so a tunnel step never deadlocks. The staged
+            // pathfinder -> move-control+jump -> teleport ladder circled on step-ups instead of advancing.
+            if (walkTicks > 80 || (walkTicks > 5 && nav.isDone())) {
+                mob.setPos(w.getX() + 0.5, w.getY(), w.getZ() + 0.5);
+                mob.resetFallDistance();
                 nav.stop();
-                mob.getMoveControl().setWantedPosition(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
-                mob.getLookControl().setLookAt(w.getX() + 0.5, w.getY() + 1.0, w.getZ() + 0.5);
-                if (w.getY() > mob.blockPosition().getY() && mob.onGround() && walkTicks % 4 == 0) {
-                    mob.getJumpControl().jump();
-                }
-                if (walkTicks > 60) {
-                    mob.setPos(w.getX() + 0.5, w.getY(), w.getZ() + 0.5);
-                    mob.resetFallDistance();
-                    lastProgress = now;
-                    walkTo = null;
-                }
+                lastProgress = now;
+                nextScanAt = 0;
+                walkTo = null;
+                return;
             }
+            if (walkTicks % 20 == 0) nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
             return;
         }
         // Long walks use the pathfinder: re-request the path when it finished early or could not be made (airborne).
