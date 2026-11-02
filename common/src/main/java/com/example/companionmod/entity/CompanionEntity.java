@@ -133,7 +133,9 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     // "go and find/mine this block" job (server side, saved with the entity)
     private final MineTask mineTask = new MineTask();
-    private final com.example.companionmod.entity.ai.CompanionSeekBlockGoal seekGoal = new com.example.companionmod.entity.ai.CompanionSeekBlockGoal(this);
+    // Assigned in registerGoals() - NOT a field initializer: registerGoals runs from the Mob constructor,
+    // before this subclass's field initializers, so an initialized field would still be null there (this-escape).
+    private com.example.companionmod.entity.ai.CompanionSeekBlockGoal seekGoal;
     // "pick this up from the ground" order (server side)
     private String pickupFilter = "";
     private boolean pickupRequested;
@@ -190,6 +192,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         goalSelector.addGoal(1, new CompanionSitGoal(this));
         goalSelector.addGoal(1, new OpenDoorGoal(this, true));   // villager-style: open wooden doors on the path, close behind
         goalSelector.addGoal(2, new MeleeAttackGoal(this, 1.25, true));
+        seekGoal = new com.example.companionmod.entity.ai.CompanionSeekBlockGoal(this);
         goalSelector.addGoal(2, seekGoal);                           // explicit "find diamonds" pre-empts walking
         goalSelector.addGoal(3, new CompanionPickupGoal(this));      // explicit "pick this up" pre-empts walking
         goalSelector.addGoal(4, new CompanionFarmGoal(this));
