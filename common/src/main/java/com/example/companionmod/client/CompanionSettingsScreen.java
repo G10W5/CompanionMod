@@ -58,10 +58,7 @@ public class CompanionSettingsScreen extends Screen {
         // 26.1-CHECK: CycleButton.builder signature
         this.addRenderableWidget(CycleButton.<String>builder(CompanionSettingsScreen::bodyName, config.companionBody == null ? "auto" : config.companionBody)
                 .withValues("auto", "slim", "classic")
-                .create(rx, y, COL_W, 20, Component.literal("Body Type"), (b, v) -> {
-                    config.companionBody = v;
-                    ClientVoice.status("Body type: " + bodyName(v).getString());   // live confirmation in chat
-                }));
+                .create(rx, y, COL_W, 20, Component.literal("Body Type"), (b, v) -> config.companionBody = v));
         y += pitch;
 
         toggle(lx, y, "Memory", config.memoryEnabled, v -> config.memoryEnabled = v);

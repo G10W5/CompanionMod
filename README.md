@@ -127,6 +127,8 @@ Settings → **AI Connection** (or `config/companionmod-client.json`):
      any smart text model (qwen3, llama, deepseek, …).
 - `speechModel` — spoken replies via `/v1/audio/speech` (auto-detected from model capabilities;
   `fallbackSpeechModel` = `phonon`). `speechVoice` picks the voice, `speechVolume` the loudness.
+  **Detect voices** (AI Connection) asks the server which voices the selected speech model supports and
+  lets you pick one from the list instead of typing the id.
 - `temperature` (default 0.7), `historyTurns`, `timeoutSeconds` tune the conversation.
 
 The mod is model-agnostic: as long as Ollama reports the model (or the STT+text pair) works, the

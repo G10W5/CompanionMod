@@ -47,7 +47,10 @@ public class CompanionConnectionScreen extends Screen {
         this.speechField = field(cx, y, w, config.speechModel, "Speech model (empty = auto)");
         y += 34;
         this.voiceField = field(cx, y, w, config.speechVoice, "Voice (optional)");
-        y += 38;
+        y += 24;
+        this.addRenderableWidget(Button.builder(Component.literal("Detect voices from the speech model"), b -> detectVoices())
+                .pos(cx - w / 2, y).size(w, 20).build());
+        y += 32;
 
         this.addRenderableWidget(new AbstractSliderButton(cx - w / 2, y, w, 20,
                 Component.literal("Temperature: " + String.format("%.2f", temperature)), temperature / 1.5) {
@@ -85,6 +88,13 @@ public class CompanionConnectionScreen extends Screen {
                 v -> chatField.setValue(v),
                 v -> speechField.setValue(v),
                 v -> sttField.setValue(v));
+    }
+
+    /** Asks the server which voices the selected speech model supports, then picks one from the list. */
+    private void detectVoices() {
+        String h = hostField.getValue() == null ? "" : hostField.getValue().trim();
+        String m = speechField.getValue() == null ? "" : speechField.getValue().trim();
+        CompanionVoiceScreen.open(this.minecraft, h, m, this, v -> voiceField.setValue(v));
     }
 
     private void save() {
