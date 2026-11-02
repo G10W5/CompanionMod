@@ -162,6 +162,8 @@ in chat or a screen.
 ## Config (`config/companionmod-client.json`)
 
 Key fields: `host`, `chatModel`, `sttModel`, `sttHost`, `speechModel`, `speechVoice`,
+`micDevice`, `outputDevice` (Java Sound input/output device names from Settings → AI Connection; blank =
+system default. Picking an output device routes spoken replies straight to it, bypassing Minecraft's engine),
 `speechVolume`, `speakReplies`, `temperature`, `companionName`, `companionDescription`,
 `companionPersonality`, `companionTraits`, `companionSkin`, `feminineModel`, `autoFeminine`,
 `companionBody`, `memoryEnabled`, `memoryMaxEvents`, `historyTurns`, `maxRecordSeconds`,

@@ -21,6 +21,9 @@ public class CompanionConnectionScreen extends Screen {
     private EditBox sttField;
     private EditBox speechField;
     private EditBox voiceField;
+    private EditBox micField;
+    private EditBox outField;
+    private int micY, outY;
     private float temperature;
 
     public CompanionConnectionScreen(VoiceConfig config, Path configFile, Screen parent) {
@@ -50,6 +53,19 @@ public class CompanionConnectionScreen extends Screen {
         y += 24;
         this.addRenderableWidget(Button.builder(Component.literal("Detect voices from the speech model"), b -> detectVoices())
                 .pos(cx - w / 2, y).size(w, 20).build());
+        y += 26;
+
+        this.micField = deviceField(cx, y, w, config.micDevice, "System default");
+        this.addRenderableWidget(Button.builder(Component.literal("Pick…"), b ->
+                CompanionAudioDeviceScreen.open(this.minecraft, true, this, v -> micField.setValue(v)))
+                .pos(cx + w / 2 - 80, y).size(80, 20).build());
+        micY = y;
+        y += 26;
+        this.outField = deviceField(cx, y, w, config.outputDevice, "System default (Minecraft's audio)");
+        this.addRenderableWidget(Button.builder(Component.literal("Pick…"), b ->
+                CompanionAudioDeviceScreen.open(this.minecraft, false, this, v -> outField.setValue(v)))
+                .pos(cx + w / 2 - 80, y).size(80, 20).build());
+        outY = y;
         y += 32;
 
         this.addRenderableWidget(new AbstractSliderButton(cx - w / 2, y, w, 20,
@@ -82,6 +98,16 @@ public class CompanionConnectionScreen extends Screen {
         return box;
     }
 
+    /** Audio device row: a (prefilled, editable) name field plus a picker button; blank = system default. */
+    private EditBox deviceField(int cx, int y, int w, String value, String hint) {
+        EditBox box = new EditBox(this.font, cx - w / 2, y, w - 90, 20, Component.literal(hint));
+        box.setValue(value == null ? "" : value);
+        box.setHint(Component.literal(hint));
+        box.setMaxLength(240);
+        this.addRenderableWidget(box);
+        return box;
+    }
+
     private void loadModels() {
         String h = hostField.getValue() == null ? "" : hostField.getValue().trim();
         CompanionModelScreen.open(this.minecraft, h, this,
@@ -103,6 +129,8 @@ public class CompanionConnectionScreen extends Screen {
         config.sttModel = sttField.getValue() == null ? "" : sttField.getValue().trim();
         config.speechModel = speechField.getValue() == null ? "" : speechField.getValue().trim();
         config.speechVoice = voiceField.getValue() == null ? "" : voiceField.getValue().trim();
+        config.micDevice = micField.getValue() == null ? "" : micField.getValue().trim();
+        config.outputDevice = outField.getValue() == null ? "" : outField.getValue().trim();
         config.temperature = Math.max(0f, Math.min(1.5f, temperature));
         config.save(configFile);
         back();
@@ -133,6 +161,8 @@ public class CompanionConnectionScreen extends Screen {
         label(g, "Speech-to-text model", cx - w / 2, y + 57);
         label(g, "Text-to-speech model", cx - w / 2, y + 91);
         label(g, "Voice", cx - w / 2, y + 125);
+        label(g, "Input device (mic)", cx - w / 2, micY - 11);
+        label(g, "Output device (spoken replies)", cx - w / 2, outY - 11);
     }
 
     private void label(GuiGraphicsExtractor g, String text, int x, int y) {

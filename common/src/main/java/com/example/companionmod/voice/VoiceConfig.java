@@ -16,6 +16,10 @@ public final class VoiceConfig {
     public String speechModel = "";
     public String fallbackSpeechModel = "phonon";
     public String speechVoice = "";
+    /** Java Sound input device name for push-to-talk. Empty = system default microphone. */
+    public String micDevice = "";
+    /** Java Sound output device for spoken replies (bypasses Minecraft's engine so a specific device can be used). Empty = default. */
+    public String outputDevice = "";
     /** Optional speech-to-text model (Whisper etc.) so a normal text LLM can be used instead of an audio model. */
     public String sttModel = "";
     /** OpenAI-compatible base URL for the STT model. Empty = use {@link #host}. */

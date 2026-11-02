@@ -50,8 +50,8 @@ public final class PushToTalkController {
         this.onReply = onReply;
         this.onStatus = onStatus;
         this.speechListener = speechListener == null ? SpeechPlayer.Listener.NONE : speechListener;
-        this.player = new SpeechPlayer(speakMeter, this.speechListener);
-        this.mic = new MicCapture(micMeter, () -> cfg.maxRecordSeconds);
+        this.player = new SpeechPlayer(speakMeter, this.speechListener, () -> cfg.outputDevice);
+        this.mic = new MicCapture(micMeter, () -> cfg.maxRecordSeconds, () -> cfg.micDevice);
     }
 
     private static Thread daemon(Runnable r, String name) {

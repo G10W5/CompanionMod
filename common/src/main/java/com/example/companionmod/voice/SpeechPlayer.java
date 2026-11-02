@@ -4,13 +4,19 @@ import com.example.companionmod.client.PcmStreamSound;
 
 import javax.sound.sampled.AudioFormat;
 import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.LineUnavailableException;
+import javax.sound.sampled.Mixer;
 import javax.sound.sampled.SourceDataLine;
+import java.util.function.Supplier;
 
 /**
  * Plays WAV replies and reports actual PCM playback progress to the subtitle clock. Prefers Minecraft's
  * own sound engine (OpenAL) so the voice pauses with the game, obeys the audio sliders, and gets any
  * in-world effects installed (e.g. Sound Physics Remastered's echo); a plain {@code SourceDataLine}
  * stays as a fallback for runtimes where the engine can't stream memory PCM.
+ *
+ * <p>When the player picks a specific output device in the settings, the engine path is skipped: OpenAL
+ * cannot target a chosen Java Sound device, so playback goes straight to that device's SourceDataLine.</p>
  */
 public final class SpeechPlayer {
     public interface Listener {
@@ -23,13 +29,16 @@ public final class SpeechPlayer {
 
     private final LevelMeter meter;
     private final Listener listener;
+    private final Supplier<String> outputDevice;   // read on every playback: settings changes apply live
     private volatile boolean playing;
     private volatile boolean stopRequested;
 
     public SpeechPlayer(LevelMeter meter) { this(meter, Listener.NONE); }
-    public SpeechPlayer(LevelMeter meter, Listener listener) {
+    public SpeechPlayer(LevelMeter meter, Listener listener) { this(meter, listener, () -> ""); }
+    public SpeechPlayer(LevelMeter meter, Listener listener, Supplier<String> outputDevice) {
         this.meter = meter;
         this.listener = listener == null ? Listener.NONE : listener;
+        this.outputDevice = outputDevice;
     }
 
     public boolean isPlaying() { return playing; }
@@ -59,7 +68,10 @@ public final class SpeechPlayer {
         listener.onStart(text, duration);
 
         // ---- engine path: OpenAL channel -> pause-aware, slider-obeying, SPR-echoed --------------------
-        if (PcmStreamSound.engineStreamingSupported()) {
+        // Skipped when a specific output device was chosen: OpenAL cannot target a chosen Java Sound device.
+        String dev = outputDevice == null ? "" : outputDevice.get();
+        boolean explicitDevice = dev != null && !dev.isBlank();
+        if (!explicitDevice && PcmStreamSound.engineStreamingSupported()) {
             try {
                 boolean handled = PcmStreamSound.play(data, pcm.sampleRate(), pcm.channels(), 1.0f, duration,
                         () -> stopRequested, new PcmStreamSound.Listener() {
@@ -75,9 +87,9 @@ public final class SpeechPlayer {
             } catch (Throwable ignored) { }   // any engine surprise falls through to the line below
         }
 
-        // ---- fallback: direct SourceDataLine (engine missing / rejected the stream) ----------------
+        // ---- fallback: direct SourceDataLine (engine missing / rejected the stream / explicit device) -
         boolean started = false;
-        try (SourceDataLine out = AudioSystem.getSourceDataLine(fmt)) {
+        try (SourceDataLine out = openOutput(fmt, explicitDevice ? dev : "")) {
             out.open(fmt);
             out.start();
             started = true;
@@ -98,6 +110,19 @@ public final class SpeechPlayer {
             playing = false;
             meter.reset();
         }
+    }
+
+    /** The chosen device's line, or the system default when {@code dev} is blank/unknown. */
+    private static SourceDataLine openOutput(AudioFormat fmt, String dev) throws LineUnavailableException {
+        Mixer.Info wanted = AudioDevices.find(dev);
+        if (wanted != null) {
+            try {
+                return AudioSystem.getSourceDataLine(fmt, wanted);
+            } catch (IllegalArgumentException | LineUnavailableException e) {
+                // chosen mixer vanished or cannot play at this format: fall through to the default line
+            }
+        }
+        return AudioSystem.getSourceDataLine(fmt);
     }
 
     private static byte[] applyGain(byte[] raw, float gain) {

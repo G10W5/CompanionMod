@@ -3,14 +3,16 @@ package com.example.companionmod.voice;
 import javax.sound.sampled.*;
 import java.io.ByteArrayOutputStream;
 import java.util.function.IntSupplier;
+import java.util.function.Supplier;
 
-/** Records 16 kHz mono 16-bit PCM from the default microphone on a daemon thread and feeds a {@link LevelMeter}. */
+/** Records 16 kHz mono 16-bit PCM from the configured microphone (or the system default) on a daemon thread and feeds a {@link LevelMeter}. */
 public final class MicCapture {
     public static final int SAMPLE_RATE = 16000;
     private static final AudioFormat FORMAT = new AudioFormat(SAMPLE_RATE, 16, 1, true, false);
 
     private final LevelMeter meter;
     private final IntSupplier maxSeconds;
+    private final Supplier<String> deviceName;   // read on every start: settings changes apply live
     private volatile int maxBytes;
     private volatile boolean running;
     private volatile String lastError = "";
@@ -22,9 +24,13 @@ public final class MicCapture {
     public MicCapture(LevelMeter meter, int maxSeconds) { this(meter, () -> maxSeconds); }
 
     /** The cap is read on every start, so changing it in the settings screen takes effect immediately. */
-    public MicCapture(LevelMeter meter, IntSupplier maxSeconds) {
+    public MicCapture(LevelMeter meter, IntSupplier maxSeconds) { this(meter, maxSeconds, () -> ""); }
+
+    /** {@code deviceName} is a Java Sound mixer name; blank/null = system default. */
+    public MicCapture(LevelMeter meter, IntSupplier maxSeconds, Supplier<String> deviceName) {
         this.meter = meter;
         this.maxSeconds = maxSeconds;
+        this.deviceName = deviceName;
     }
 
     public String lastError() { return lastError; }
@@ -35,8 +41,15 @@ public final class MicCapture {
         if (running) return true;
         try {
             DataLine.Info info = new DataLine.Info(TargetDataLine.class, FORMAT);
-            if (!AudioSystem.isLineSupported(info)) { lastError = "No microphone supporting 16 kHz mono found"; return false; }
-            line = (TargetDataLine) AudioSystem.getLine(info);
+            line = null;
+            Mixer.Info wanted = AudioDevices.find(deviceName.get());
+            if (wanted != null && AudioSystem.getMixer(wanted).isLineSupported(info)) {
+                line = (TargetDataLine) AudioSystem.getMixer(wanted).getLine(info);
+            }
+            if (line == null) {                                   // unset, unknown (unplugged?) or unsupported: default
+                if (!AudioSystem.isLineSupported(info)) { lastError = "No microphone supporting 16 kHz mono found"; return false; }
+                line = (TargetDataLine) AudioSystem.getLine(info);
+            }
             line.open(FORMAT, SAMPLE_RATE / 5 * 2);
             line.start();
         } catch (Exception e) {
