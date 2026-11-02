@@ -10,7 +10,7 @@ import com.example.companionmod.world.ServerHooks;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
-import net.fabricmc.fabric.api.itemgroup.v1.ItemGroupEvents;
+import net.fabricmc.fabric.api.creativetab.v1.CreativeModeTabEvents;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
@@ -41,7 +41,8 @@ public class CompanionModFabric implements ModInitializer {
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> ServerHooks.onPlayerJoin(handler.getPlayer()));
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> ServerHooks.onPlayerLeave(handler.getPlayer()));
         ServerLifecycleEvents.SERVER_STOPPED.register(server -> ServerHooks.onServerStopped());
-        ItemGroupEvents.modifyEntriesEvent(CreativeModeTabs.FUNCTIONAL_BLOCKS)
-                .register(entries -> entries.accept(ModContent.SHRINE_CORE_ITEM));
+        // 26.1-CHECK: itemgroup.v1.ItemGroupEvents was replaced by creativetab.v1.CreativeModeTabEvents in this Fabric API
+        CreativeModeTabEvents.modifyOutputEvent(CreativeModeTabs.FUNCTIONAL_BLOCKS)
+                .register(output -> output.accept(ModContent.SHRINE_CORE_ITEM));
     }
 }
