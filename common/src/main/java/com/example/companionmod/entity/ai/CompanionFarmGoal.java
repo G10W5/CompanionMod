@@ -1,6 +1,7 @@
 package com.example.companionmod.entity.ai;
 
 import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.entity.CompanionProtection;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.InteractionHand;
@@ -94,6 +95,7 @@ public class CompanionFarmGoal extends Goal {
         BlockPos pos = target;
         target = null;
         if (!(state.getBlock() instanceof CropBlock)) return;
+        if (!CompanionProtection.canModify(level, mob, pos)) return;     // spawn protection / protected area
         mob.swing(InteractionHand.MAIN_HAND);
         level.destroyBlock(pos, true, mob, 512);
         mob.collectNearbyItems();

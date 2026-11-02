@@ -6,12 +6,12 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.entity.EntitySpawnReason;
-import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.phys.Vec3;
@@ -19,19 +19,24 @@ import net.minecraft.world.phys.Vec3;
 public final class ShrineSummoner {
     private ShrineSummoner() {}
 
-    /** One companion per player: reuse the living one (calling it to the shrine) or create a new one. */
+    /**
+     * One companion per player: reuse the living one (calling it to the shrine) or create a new one.
+     * A companion from another dimension is recreated here WITH its bag, name and look; one stranded in an
+     * unloaded chunk is replaced, and when that chunk loads the stale copy drops its bag and removes itself.
+     */
     public static void summon(ServerLevel level, BlockPos shrine, ServerPlayer player) {
+        MinecraftServer server = level.getServer();
         Vec3 spot = findSpot(level, shrine);
-        CompanionEntity existing = ModContent.findCompanion(level.getServer(), player.getUUID());
+        CompanionEntity existing = ModContent.findCompanion(server, player.getUUID());
 
         if (existing != null && existing.level() == level) {
             existing.setPos(spot.x, spot.y, spot.z);
+            existing.resetFallDistance();
             existing.getNavigation().stop();
             player.sendSystemMessage(Component.literal(existing.getName().getString() + " answers the shrine's call."));
             effects(level, spot);
             return;
         }
-        if (existing != null) existing.discard();   // it was in another dimension: replace it (inventory/progress persistence is phase 2)
 
         CompanionEntity c = ModContent.COMPANION.create(level, EntitySpawnReason.MOB_SUMMONED);
         if (c == null) return;
@@ -40,9 +45,14 @@ public final class ShrineSummoner {
         c.setOwner(player.getUUID());
         c.setCustomName(Component.literal("Companion"));
         c.setCustomNameVisible(true);
-        c.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(Items.IRON_SWORD));
+        if (existing != null) c.copyStateFrom(existing);
+        else c.store(new ItemStack(Items.IRON_SWORD));     // goes into the sword slot, so it stays in hand
+        CompanionRegistry.set(server, player.getUUID(), c.getUUID());
+        if (existing != null) existing.discard();          // its bag now lives in the new body
         level.addFreshEntity(c);
-        player.sendSystemMessage(Component.literal("A companion steps out of the light. Hold V to talk to it."));
+        player.sendSystemMessage(Component.literal(existing != null
+                ? "Your companion steps out of the light, carrying everything it had."
+                : "A companion steps out of the light. Hold V to talk to it."));
         effects(level, spot);
     }
 

@@ -73,6 +73,11 @@ public final class PlanParser {
                     case "seek_block" -> { arg = blockId(arg); if (arg.isEmpty()) continue; }
                     case "say" -> { arg = clean(arg, 120); if (arg.isEmpty()) continue; }
                     case "pickup" -> arg = clean(arg, 32).toLowerCase();
+                    case "build" -> {
+                        arg = clean(arg, 40).toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9_\\-]", "_");
+                        if (arg.isEmpty()) continue;
+                    }
+                    case "attack", "hunt" -> arg = clean(arg, 32).toLowerCase(Locale.ROOT);
                     default -> arg = "";
                 }
                 if (sec < 0) sec = defaultSeconds(op);

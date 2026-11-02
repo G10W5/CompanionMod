@@ -46,6 +46,8 @@ public final class ClientVoice {
     private static boolean radialWasDown;
     private static boolean settingsWasDown;
     private static int syncedEntity = -1;
+    private static int cachedCompanionId = -1;
+    private static long nextCompanionScan;
     private static int lastSpeechId = -1;
     private static int pendingSpeechId = -1;
     private static String pendingSpeechLine = "";
@@ -93,7 +95,7 @@ public final class ClientVoice {
 
     public static void send(String action, String say, String target) {
         CompanionCommand command = CompanionCommand.parse(action);
-        if (interruptsPlanning(command)) {
+        if (command.interruptsPlanning() || command == CompanionCommand.CONTINUE) {
             // Invalidate in-flight model requests before the server applies the player's newer intent.
             CompanionAutonomy.onManualOrder();
         }
@@ -104,15 +106,6 @@ public final class ClientVoice {
                 ReplyParser.truncate(target == null ? "" : target, 1024)));
     }
 
-    /** Appearance, UI, memory and revive packets do not represent a new gameplay intent. */
-    private static boolean interruptsPlanning(CompanionCommand command) {
-        return switch (command) {
-            case NONE, PLAN, INVENTORY, SET_NAME, SET_SKIN, FEMININE, MASCULINE,
-                    REMEMBER, FORGET, REVIVE -> false;
-            default -> true;
-        };
-    }
-
     public static void tick(Minecraft mc) {
         if (mc.player == null || mc.level == null) {
             if (controller != null) { if (wasDown) controller.onRelease(); controller.shutdown(); controller = null; }
@@ -121,12 +114,17 @@ public final class ClientVoice {
             settingsWasDown = false;
             syncedEntity = -1;
             lastSpeechId = -1;
+            cachedCompanionId = -1;
             CompanionSubtitles.clear();
             CompanionAutonomy.reset();
             return;
         }
         if (controller == null) init(mc);
         boolean down = mc.screen == null && talkKey().isDown();       // typing "v" in chat must not open the mic
+        if (down && wasDown && controller.state() == VoiceState.LISTENING
+                && controller.listeningMillis() > cfg.maxRecordSeconds * 1000L) {
+            controller.onRelease();             // recording cap reached: send what we have (release and press again to talk more)
+        }
         if (down && !wasDown) controller.onPress();
         else if (!down && wasDown) controller.onRelease();
         wasDown = down;
@@ -281,12 +279,19 @@ public final class ClientVoice {
         mc.execute(() -> { if (mc.player != null) mc.player.sendSystemMessage(Component.literal("[Companion] " + message)); });
     }
 
-    /** Find the player's own companion in the currently loaded level. */
+    /** Find the player's own companion in the currently loaded level (cached: called every tick and every HUD frame). */
     public static CompanionEntity findCompanion(Minecraft mc) {
         if (mc.player == null || mc.level == null) return null;
         String me = mc.player.getStringUUID();
+        if (cachedCompanionId != -1) {
+            if (mc.level.getEntity(cachedCompanionId) instanceof CompanionEntity c && !c.isRemoved() && c.isOwnedBy(me)) return c;
+            cachedCompanionId = -1;
+        }
+        long now = mc.level.getGameTime();
+        if (now < nextCompanionScan) return null;
+        nextCompanionScan = now + 10;
         for (Entity e : mc.level.entitiesForRendering()) {                 // 26.1-CHECK: ClientLevel.entitiesForRendering()
-            if (e instanceof CompanionEntity c && c.isOwnedBy(me)) return c;
+            if (e instanceof CompanionEntity c && c.isOwnedBy(me)) { cachedCompanionId = c.getId(); return c; }
         }
         return null;
     }
@@ -327,34 +332,7 @@ public final class ClientVoice {
         return memory.isBlank() ? context : context + "\nPlayer preferences and past events: " + memory;
     }
 
-    private static String describe(Entity e) {
-        String name = e.getName().getString();
-        if (e instanceof ItemEntity item) name = item.getItem().getHoverName().getString();
-        double dist = Math.sqrt(e.distanceToSqr(Minecraft.getInstance().player));
-        int dx = e.blockPosition().getX() - Minecraft.getInstance().player.blockPosition().getX();
-        int dz = e.blockPosition().getZ() - Minecraft.getInstance().player.blockPosition().getZ();
-        return name + " " + Math.round(dist) + "m " + compass(dx, dz);
-    }
-
-    private static String compass(int dx, int dz) {
-        double angle = Math.toDegrees(Math.atan2(dz, dx));
-        if (angle < 0) angle += 360;
-        if (angle < 45 || angle >= 315) return "E";
-        if (angle < 135) return "S";
-        if (angle < 225) return "W";
-        return "N";
-    }
-
-    private static boolean isInteresting(String name) {
-        String n = name.toLowerCase();
-        return n.contains("ore") || n.contains("water") || n.contains("lava") || n.contains("chest")
-                || n.contains("crafting") || n.contains("furnace") || n.contains("bed") || n.contains("door")
-                || n.contains("log") || n.contains("leaves") || n.contains("crop") || n.contains("flower")
-                || n.contains("shrine");
-    }
-
     public static void renderHud(GuiGraphicsExtractor g, DeltaTracker delta) {
         VoiceHud.render(g, controller, findCompanion(Minecraft.getInstance()));
     }
 }
-

@@ -2,6 +2,7 @@ package com.example.companionmod.voice;
 
 import javax.sound.sampled.*;
 import java.io.ByteArrayOutputStream;
+import java.util.function.IntSupplier;
 
 /** Records 16 kHz mono 16-bit PCM from the default microphone on a daemon thread and feeds a {@link LevelMeter}. */
 public final class MicCapture {
@@ -9,22 +10,27 @@ public final class MicCapture {
     private static final AudioFormat FORMAT = new AudioFormat(SAMPLE_RATE, 16, 1, true, false);
 
     private final LevelMeter meter;
-    private final int maxBytes;
+    private final IntSupplier maxSeconds;
+    private volatile int maxBytes;
     private volatile boolean running;
     private volatile String lastError = "";
     private TargetDataLine line;
     private Thread thread;
     private ByteArrayOutputStream buffer;
-    private long startedAt;
+    private volatile long startedAt;
 
-    public MicCapture(LevelMeter meter, int maxSeconds) {
+    public MicCapture(LevelMeter meter, int maxSeconds) { this(meter, () -> maxSeconds); }
+
+    /** The cap is read on every start, so changing it in the settings screen takes effect immediately. */
+    public MicCapture(LevelMeter meter, IntSupplier maxSeconds) {
         this.meter = meter;
-        this.maxBytes = maxSeconds * SAMPLE_RATE * 2;
+        this.maxSeconds = maxSeconds;
     }
 
     public String lastError() { return lastError; }
     public boolean isRunning() { return running; }
 
+    /** Opens the line: can block for a moment, so call it from a worker thread, never the render thread. */
     public synchronized boolean start() {
         if (running) return true;
         try {
@@ -37,6 +43,7 @@ public final class MicCapture {
             lastError = "Microphone unavailable: " + e.getMessage();
             return false;
         }
+        maxBytes = Math.max(1, maxSeconds.getAsInt()) * SAMPLE_RATE * 2;
         buffer = new ByteArrayOutputStream();
         meter.reset();
         running = true;
@@ -61,7 +68,7 @@ public final class MicCapture {
     public synchronized byte[] stop() {
         if (!running) return new byte[0];
         running = false;
-        try { thread.join(200); } catch (InterruptedException ignored) { }
+        try { thread.join(200); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
         line.stop();
         line.close();
         byte[] out = buffer.toByteArray();

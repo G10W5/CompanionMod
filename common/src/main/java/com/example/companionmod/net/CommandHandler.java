@@ -4,6 +4,7 @@ import com.example.companionmod.command.CompanionCommand;
 import com.example.companionmod.entity.CompanionEntity;
 import com.example.companionmod.registry.ModContent;
 import com.example.companionmod.voice.ReplyParser;
+import com.example.companionmod.world.CompanionRegistry;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -49,7 +50,10 @@ public final class CommandHandler {
 
         CompanionEntity companion = ModContent.findCompanion(player.level().getServer(), player.getUUID());
         if (companion == null) {
-            player.sendSystemMessage(Component.literal("You have no companion. Activate a Companion Shrine to summon one."));
+            boolean exists = CompanionRegistry.get(player.level().getServer(), player.getUUID()) != null;
+            player.sendSystemMessage(Component.literal(exists
+                    ? "Your companion is too far away (its chunk is not loaded). Activate a Companion Shrine to call it."
+                    : "You have no companion. Activate a Companion Shrine to summon one."));
             return;
         }
         companion.applyCommand(cmd, player, target);
@@ -57,4 +61,6 @@ public final class CommandHandler {
     }
 
     public static void forget(UUID player) { BUCKETS.remove(player); }
+
+    public static void forgetAll() { BUCKETS.clear(); }
 }

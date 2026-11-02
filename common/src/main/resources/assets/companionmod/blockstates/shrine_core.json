@@ -1,1 +1,7 @@
-{ "variants": { "": { "model": "companionmod:block/shrine_core" } } }
+{
+  "variants": {
+    "": {
+      "model": "companionmod:block/shrine_core"
+    }
+  }
+}

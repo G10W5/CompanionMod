@@ -21,10 +21,12 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.util.Mth;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.entity.player.PlayerModelType;
 import net.minecraft.world.item.component.ResolvableProfile;
 
 import java.util.List;
+import java.util.UUID;
 
 /**
  * Draws the companion at the same height as a player (the {@code 0.9375} body scale the avatar
@@ -41,7 +43,6 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
     private static final float SUBTITLE_SCALE = 0.025f;
 
     private final PlayerSkinRenderCache skinCache;
-    private String lastDiag = "";               // body-model diagnostic transition guard
     private boolean genderLayerTried;           // Wildfire layer is attached lazily on the first draw
 
     public CompanionRenderer(EntityRendererProvider.Context ctx) {
@@ -116,22 +117,21 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         state.injured = entity.isInjured();
         state.reviveProgress = entity.reviveProgress();
         state.injuredLeft = entity.injuredLeftTicks();
-        resolveSkin(state, entity.skin());
+        resolveSkin(state, entity.skin(), entity.syncedOwner());
         // Wildfire's layer reads its data from the render state. The mod only fills it for players,
         // so we build it from the owner's config; false means the fallback overlay should draw instead.
-        state.wildfireChest = FemaleGenderCompat.populateRenderState(state, entity, entity.getOwnerUuid(), partialTick);
+        state.wildfireChest = FemaleGenderCompat.populateRenderState(state, entity, entity.syncedOwner(), partialTick);
     }
 
-    private void resolveSkin(CompanionRenderState state, String name) {
+    private void resolveSkin(CompanionRenderState state, String name, UUID owner) {
         // 1) Resolve the skin texture. "owner" goes through the local player's RESOLVED profile:
         //    synchronous, and it picks up Quick Skin local skins with the real model type. A raw name
         //    resolves asynchronously and shows Steve (wide) until it completes, which is what made
         //    slim auto-detection unreliable.
         if (name == null || name.isBlank() || "default".equalsIgnoreCase(name)) {
             applyInfo(state, null);
-        } else if ("owner".equalsIgnoreCase(name) && Minecraft.getInstance().player != null) {
-            applyInfo(state, skinCache.getOrDefault(ResolvableProfile.createResolved(
-                    Minecraft.getInstance().player.getGameProfile())));
+        } else if ("owner".equalsIgnoreCase(name)) {
+            applyInfo(state, ownerSkin(owner));       // THIS companion's owner, not whoever is looking at it
         } else {
             applyInfo(state, skinCache.getOrDefault(ResolvableProfile.createUnresolved(name)));
         }
@@ -140,16 +140,15 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         if ("slim".equals(body)) state.slim = true;
         else if ("classic".equals(body)) state.slim = false;
         else state.slim = state.slimSkin;
-        // 3) Diagnostic: announce the resolved body model in chat whenever it changes, so it is visible
-        //    immediately whether slim/classic/auto actually applied (and what the skin resolved to).
-        String diag = "Companion body: " + (state.slim ? "SLIM" : "CLASSIC")
-                + "  [config=" + (body == null ? "auto" : body)
-                + ", skin=" + (name == null || name.isBlank() || "default".equalsIgnoreCase(name) ? "bundled" : name)
-                + ", skinModel=" + (state.slimSkin ? "slim" : "classic") + "]";
-        if (!diag.equals(lastDiag)) {
-            lastDiag = diag;
-            ClientVoice.status(diag);
-        }
+    }
+
+    /** Skin of the companion's owner (the local player for your own companion, the other player in multiplayer). */
+    private PlayerSkinRenderCache.RenderInfo ownerSkin(UUID owner) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null) return null;
+        Player p = owner == null || owner.equals(mc.player.getUUID()) ? mc.player
+                : (mc.level == null ? null : mc.level.getPlayerByUUID(owner));
+        return p == null ? null : skinCache.getOrDefault(ResolvableProfile.createResolved(p.getGameProfile()));
     }
 
     private static void applyInfo(CompanionRenderState state, PlayerSkinRenderCache.RenderInfo info) {

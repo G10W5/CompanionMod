@@ -1,1 +1,6 @@
-{ "model": { "type": "minecraft:model", "model": "companionmod:block/shrine_core" } }
+{
+  "model": {
+    "type": "minecraft:model",
+    "model": "companionmod:block/shrine_core"
+  }
+}

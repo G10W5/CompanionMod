@@ -257,7 +257,7 @@ public final class OllamaVoiceBackend {
         return reply;
     }
 
-    public void clearHistory() { history.clear(); }
+    public synchronized void clearHistory() { history.clear(); }
 
     private static JsonObject msg(String role, String content) {
         JsonObject o = new JsonObject();

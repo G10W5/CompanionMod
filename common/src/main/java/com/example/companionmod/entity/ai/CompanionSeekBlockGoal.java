@@ -1,6 +1,7 @@
 package com.example.companionmod.entity.ai;
 
 import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.entity.CompanionProtection;
 import com.example.companionmod.entity.task.MineTask;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -286,6 +287,11 @@ public class CompanionSeekBlockGoal extends Goal {
     private void startBreak(ServerLevel level, BlockPos pos) {
         BlockState st = level.getBlockState(pos);
         if (st.isAir()) return;
+        if (!CompanionProtection.canModify(level, mob, pos)) {
+            unreachable.add(pos); oreTarget = null; pending.clear(); stepStand = null;
+            say(level, "I'm not allowed to break blocks here.", false);
+            return;
+        }
         mob.equipBestToolFor(st);                                 // hold the right tool: visible swings + correct speed
         float h = st.getDestroySpeed(level, pos);
         if (h < 0) { unreachable.add(pos); oreTarget = null; pending.clear(); stepStand = null; return; }
@@ -427,4 +433,3 @@ public class CompanionSeekBlockGoal extends Goal {
         if (force || now - lastSpeak > 100) { mob.speak(msg); lastSpeak = now; }
     }
 }
-

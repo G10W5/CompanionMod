@@ -6,7 +6,14 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
-/** Hold-to-talk state machine and the single companion speech playback queue. */
+/**
+ * Hold-to-talk state machine and the single companion speech playback queue.
+ *
+ * <p>Thread rules: the game thread only flips the state and queues work. Opening / closing the microphone happens on
+ * its own IO thread (it can block), HTTP and playback on the worker. The state lives in one {@link AtomicReference}
+ * and every transition is a compare-and-set, so the speech thread can never overwrite LISTENING / THINKING
+ * (which used to leave the microphone open).</p>
+ */
 public final class PushToTalkController {
     private final OllamaVoiceBackend backend;
     private final VoiceConfig cfg;
@@ -19,13 +26,11 @@ public final class PushToTalkController {
     private final LevelMeter speakMeter = new LevelMeter();
     private final MicCapture mic;
     private final SpeechPlayer player;
-    private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "companionmod-voice");
-        t.setDaemon(true);
-        return t;
-    });
-    private volatile VoiceState state = VoiceState.IDLE;
+    private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> daemon(r, "companionmod-voice"));
+    private final ExecutorService micIo = Executors.newSingleThreadExecutor(r -> daemon(r, "companionmod-mic-io"));
+    private final AtomicReference<VoiceState> state = new AtomicReference<>(VoiceState.IDLE);
     private volatile boolean probeStarted;
+    private volatile boolean micFailed;
 
     /** Latest line waiting to be spoken; rapid chatter is intentionally coalesced. */
     private final AtomicReference<String> pendingSpeech = new AtomicReference<>();
@@ -46,53 +51,72 @@ public final class PushToTalkController {
         this.onStatus = onStatus;
         this.speechListener = speechListener == null ? SpeechPlayer.Listener.NONE : speechListener;
         this.player = new SpeechPlayer(speakMeter, this.speechListener);
-        this.mic = new MicCapture(micMeter, cfg.maxRecordSeconds);
+        this.mic = new MicCapture(micMeter, () -> cfg.maxRecordSeconds);
     }
 
-    public VoiceState state() { return state; }
+    private static Thread daemon(Runnable r, String name) {
+        Thread t = new Thread(r, name);
+        t.setDaemon(true);
+        return t;
+    }
+
+    public VoiceState state() { return state.get(); }
     public float level() {
-        return switch (state) { case LISTENING -> micMeter.level(); case SPEAKING -> speakMeter.level(); default -> 0f; };
+        return switch (state.get()) { case LISTENING -> micMeter.level(); case SPEAKING -> speakMeter.level(); default -> 0f; };
     }
     public float peak() {
-        return switch (state) { case LISTENING -> micMeter.peak(); case SPEAKING -> speakMeter.peak(); default -> 0f; };
+        return switch (state.get()) { case LISTENING -> micMeter.peak(); case SPEAKING -> speakMeter.peak(); default -> 0f; };
     }
     public long listeningMillis() { return mic.elapsedMillis(); }
 
+    /** Game thread. */
     public void onPress() {
-        if (state == VoiceState.SPEAKING) player.stop();
-        else if (state != VoiceState.IDLE) return;
+        VoiceState s = state.get();
+        if (s == VoiceState.SPEAKING) player.stop();
+        else if (s != VoiceState.IDLE) return;
+        if (!state.compareAndSet(s, VoiceState.LISTENING)) return;     // lost a race with the speech thread: ignore this press
+        micFailed = false;
         if (!probeStarted) {
             probeStarted = true;
             worker.execute(() -> onStatus.accept(backend.probe().message()));
         }
-        if (mic.start()) state = VoiceState.LISTENING;
-        else onStatus.accept(mic.lastError());
+        micIo.execute(() -> {
+            if (!mic.start()) {
+                micFailed = true;
+                state.compareAndSet(VoiceState.LISTENING, VoiceState.IDLE);
+                onStatus.accept(mic.lastError());
+            }
+        });
     }
 
+    /** Game thread. */
     public void onRelease() {
-        if (state != VoiceState.LISTENING) return;
-        long ms = mic.elapsedMillis();
-        byte[] pcm = mic.stop();
-        if (ms < cfg.minRecordMillis || micMeter.maxSeen() < cfg.silenceGate) {
-            state = VoiceState.IDLE;
-            onStatus.accept("I didn't hear anything.");
-            return;
-        }
-        state = VoiceState.THINKING;
-        final String ctx = context.get();
-        final byte[] wav = WavUtil.pcm16ToWav(pcm, MicCapture.SAMPLE_RATE, 1);
-        worker.execute(() -> {
-            VoiceReply reply;
-            try {
-                if (!backend.isProbed()) backend.probe();
-                reply = backend.converse(wav, ctx);
-            } catch (Exception e) {
-                state = VoiceState.IDLE;
-                onStatus.accept(e.getMessage() == null ? e.toString() : e.getMessage());
+        if (state.get() != VoiceState.LISTENING) return;
+        final String ctx = context.get();                               // world snapshot must be taken on the game thread
+        micIo.execute(() -> {
+            if (micFailed) return;
+            long ms = mic.elapsedMillis();
+            byte[] pcm = mic.stop();
+            if (ms < cfg.minRecordMillis || micMeter.maxSeen() < cfg.silenceGate) {
+                state.compareAndSet(VoiceState.LISTENING, VoiceState.IDLE);
+                onStatus.accept("I didn't hear anything.");
                 return;
             }
-            onReply.accept(reply);
-            state = VoiceState.IDLE;
+            if (!state.compareAndSet(VoiceState.LISTENING, VoiceState.THINKING)) return;
+            final byte[] wav = WavUtil.pcm16ToWav(pcm, MicCapture.SAMPLE_RATE, 1);
+            worker.execute(() -> {
+                VoiceReply reply;
+                try {
+                    if (!backend.isProbed()) backend.probe();
+                    reply = backend.converse(wav, ctx);
+                } catch (Exception e) {
+                    state.compareAndSet(VoiceState.THINKING, VoiceState.IDLE);
+                    onStatus.accept(e.getMessage() == null ? e.toString() : e.getMessage());
+                    return;
+                }
+                onReply.accept(reply);
+                state.compareAndSet(VoiceState.THINKING, VoiceState.IDLE);
+            });
         });
     }
 
@@ -116,8 +140,16 @@ public final class PushToTalkController {
                     speechListener.onUnavailable(current);
                     continue;
                 }
-                state = VoiceState.SPEAKING;
+                // Only speak while idle: never talk over the player (LISTENING / THINKING keep their state).
+                if (!state.compareAndSet(VoiceState.IDLE, VoiceState.SPEAKING) && state.get() != VoiceState.SPEAKING) {
+                    speechListener.onUnavailable(current);
+                    continue;
+                }
                 byte[] audio = backend.synthesize(current);
+                if (state.get() != VoiceState.SPEAKING) {          // the player pressed the key while we were synthesizing
+                    speechListener.onUnavailable(current);
+                    continue;
+                }
                 if (audio == null) speechListener.onUnavailable(current);
                 else player.playBlocking(audio, cfg.speechVolume, current);
             }
@@ -126,13 +158,15 @@ public final class PushToTalkController {
             onStatus.accept("Speech failed, continuing in text: " + e.getMessage());
         } finally {
             speechDraining = false;
-            if (state == VoiceState.SPEAKING) state = VoiceState.IDLE;
+            state.compareAndSet(VoiceState.SPEAKING, VoiceState.IDLE);
         }
     }
 
     public void shutdown() {
         player.stop();
-        if (mic.isRunning()) mic.stop();
+        micIo.execute(() -> { if (mic.isRunning()) mic.stop(); });
+        micIo.shutdown();
         worker.shutdownNow();
+        state.set(VoiceState.IDLE);
     }
 }

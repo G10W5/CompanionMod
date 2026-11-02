@@ -23,6 +23,9 @@ import net.minecraft.network.syncher.EntityDataAccessor;
 import net.minecraft.network.syncher.EntityDataSerializers;
 import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.resources.Identifier;
+import net.minecraft.tags.DamageTypeTags;
+import net.minecraft.world.entity.ai.memory.MemoryModuleType;
+import com.example.companionmod.world.CompanionRegistry;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
@@ -146,6 +149,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     // AI plan executor (the model never runs anything itself; it only returns validated plan data).
     private final CompanionPlanner planner = new CompanionPlanner();
     private boolean applyingPlanStep;
+    private boolean registryChecked;
 
     // job state (time-boxed / schematic-driven behaviours)
     private long farmUntil, fishUntil;
@@ -270,7 +274,12 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     public boolean isSitting() { return moveMode() == MoveMode.SIT; }
 
     public String skin() { return entityData.get(DATA_SKIN); }
-    public void setSkin(String skin) { entityData.set(DATA_SKIN, skin == null ? "" : skin); }
+    /** Accepts "", "owner", "default" or a plain Minecraft name; anything else is ignored (every nearby client would look it up). */
+    public void setSkin(String skin) {
+        String s = skin == null ? "" : skin.trim();
+        boolean ok = s.isEmpty() || s.equalsIgnoreCase("owner") || s.equalsIgnoreCase("default") || s.matches("[A-Za-z0-9_]{1,16}");
+        if (ok) entityData.set(DATA_SKIN, s);
+    }
     public boolean isFeminine() { return entityData.get(DATA_FEMININE) != 0; }
     public void setFeminine(boolean value) { entityData.set(DATA_FEMININE, value ? 1 : 0); }
     public boolean isPickupEnabled() { return entityData.get(DATA_PICKUP) != 0; }
@@ -326,7 +335,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     }
 
     public void applyCommand(CompanionCommand cmd, ServerPlayer from, String target) {
-        if (!applyingPlanStep && cmd != CompanionCommand.PLAN && cmd != CompanionCommand.CONTINUE) {
+        if (!applyingPlanStep && cmd.interruptsPlanning()) {
             // One explicit intent at a time: a manual order pauses the AI plan (STOP forgets it entirely).
             planner.notePlayerOrder(tickCount);
         }
@@ -406,7 +415,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
                 }
             }
             case SET_NAME -> {
-                String n = target == null ? "" : target.trim();
+                String n = sanitizeName(target);
                 if (!n.isBlank()) {
                     setCustomName(Component.literal(n));
                     setCustomNameVisible(false);
@@ -415,7 +424,10 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             case SET_SKIN -> setSkin(target == null ? "" : target.trim());
             case FEMININE -> setFeminine(true);
             case MASCULINE -> setFeminine(false);
-            case REVIVE -> revivePulse();
+            case REVIVE -> {
+                // Must be the owner and actually next to the body (the client sends pulses while holding left click).
+                if (from != null && isOwner(from) && from.distanceToSqr(this) <= 49.0) revivePulse();
+            }
             case PLAN -> { lastPlanJson = target == null ? "" : target; planner.accept(target, this, tickCount); }
             case CONTINUE -> {
                 // Resume whatever was interrupted: a paused AI plan first, then a stuck/paused mining job,
@@ -735,6 +747,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         if (isSitting()) setMoveMode(MoveMode.STAY);
         getNavigation().stop();
         speak("I'm down! Hold left click on me to revive me!");
+        makeMobsForgetMe();
     }
 
     /** Called from the REVIVE order while the player holds left mouse button on the companion. */
@@ -757,10 +770,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     /** The 60 s revive window ran out: drop the gear and really die. */
     private void bleedOut() {
         speak("I'm fading...");
-        Containers.dropContents(level(), this, storage);
-        setItemSlot(EquipmentSlot.MAINHAND, ItemStack.EMPTY);
-        setItemSlot(EquipmentSlot.OFFHAND, ItemStack.EMPTY);
-        for (EquipmentSlot slot : ARMOR_SLOTS) setItemSlot(slot, ItemStack.EMPTY);
+        dropStorageAndClear();
         forceDeath = true;
         die(injurySource != null ? injurySource : level().damageSources().generic());
     }
@@ -930,11 +940,13 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
      * retargeting still wins whenever a player (or a fight) is available, and a downed/resting companion is left alone.
      */
     private void aggroMonsters() {
-        if (isInjured() || isSitting()) return;
+        if (isInjured() || isSitting() || stance() == Stance.PASSIVE) return;
         if (!(level() instanceof ServerLevel level)) return;
-        for (Monster m : level.getEntitiesOfClass(Monster.class, getBoundingBox().inflate(24), e -> e.isAlive())) {
+        int claimed = 0;
+        for (Monster m : level.getEntitiesOfClass(Monster.class, getBoundingBox().inflate(16), e -> e.isAlive())) {
             if (m.getTarget() != null || !m.getSensing().hasLineOfSight(this)) continue;
             m.setTarget(this);
+            if (++claimed >= 6) break;            // never pull a whole cave onto the companion in one pass
         }
     }
 
@@ -1132,6 +1144,10 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     public void tick() {
         super.tick();
         if (level().isClientSide()) return;
+        if (!registryChecked) {
+            registryChecked = true;
+            if (!claimRegistry()) return;       // stale duplicate: it dropped its bag and removed itself
+        }
         if (isSitting()) {
             getNavigation().stop();
             if (tickCount % 40 == 0) heal(1.0f);               // resting heals
@@ -1142,10 +1158,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         if (!speech().isBlank() && tickCount - lastSpokenTick > 600) {
             entityData.set(DATA_SPEECH, "");
         }
-        if (tickCount % 20 == 0) {
-            refreshEquipment();
-            aggroMonsters();                     // hostile mobs should see the companion as a target
-        }
+        if (tickCount % 20 == 0) refreshEquipment();
+        if (tickCount % 40 == 0) aggroMonsters();   // hostile mobs should see the companion as a target
         // Drop an automatic target we cannot reach (so mining etc. resumes); player-forced targets persist.
         LivingEntity tgt = getTarget();
         if (tgt != null && tgt != forcedTarget && tgt.isAlive() && tickCount - targetSinceTick > 200
@@ -1156,6 +1170,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             getNavigation().stop();
             setTarget(null);
             setPose(Pose.SWIMMING);                            // Mojang's crawl animation (swimming pose on land)
+            if (tickCount % 10 == 0) makeMobsForgetMe();       // a downed body is not a target
             boolean reviving = isReviving();
             if (reviving) {
                 reviveProgress = Math.min(1f, reviveProgress + 1f / REVIVE_TICKS);
@@ -1174,7 +1189,11 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     @Override
     public boolean hurtServer(ServerLevel level, DamageSource source, float amount) { // 26.1-CHECK: hurt -> hurtServer since 1.21.2
-        if (isInjured()) return false;                              // already down: no further damage
+        if (isInjured()) {
+            // Downed bodies take no normal damage, but /kill and the void must still be able to finish them.
+            if (!source.is(DamageTypeTags.BYPASSES_INVULNERABILITY)) return false;
+            return super.hurtServer(level, source, amount);
+        }
         // Friendly fire enabled: the owner can hurt the companion just like another player can.
         // Lethal damage still uses the normal downed/revive flow (and a downed companion is invulnerable).
         boolean hurt = super.hurtServer(level, source, amount);
@@ -1193,6 +1212,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     @Override
     public void die(DamageSource source) {
         if (!forceDeath && !isInjured()) { injure(source); return; }
+        if (!forceDeath) { dropStorageAndClear(); forceDeath = true; }   // killed while downed (/kill, void): the bag must not vanish
+        if (level() instanceof ServerLevel sl && ownerUuid != null) CompanionRegistry.clear(sl.getServer(), ownerUuid, getUUID());
         super.die(source);
     }
 
@@ -1200,5 +1221,72 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     @Override
     public boolean removeWhenFarAway(double distSq) { return false; }
-}
 
+    // ------------------------------------------------------------------ identity, registry, downed handling
+
+    /** Owner UUID from the synced data: valid on BOTH sides (the {@code ownerUuid} field is server-only). */
+    public UUID syncedOwner() {
+        String s = entityData.get(DATA_OWNER);
+        if (s.isEmpty()) return null;
+        try { return UUID.fromString(s); } catch (IllegalArgumentException e) { return null; }
+    }
+
+    private static String sanitizeName(String raw) {
+        if (raw == null) return "";
+        String s = raw.replaceAll("\\p{Cntrl}", "").trim();
+        return s.length() > 32 ? s.substring(0, 32).trim() : s;
+    }
+
+    /**
+     * One companion per owner: the world's registry says which UUID is the real one. A copy that was left in an
+     * unloaded chunk when the shrine made a new companion drops its bag and removes itself the moment it loads.
+     * @return false when this entity just removed itself
+     */
+    private boolean claimRegistry() {
+        if (ownerUuid == null || !(level() instanceof ServerLevel sl)) return true;
+        UUID registered = CompanionRegistry.get(sl.getServer(), ownerUuid);
+        if (registered == null) { CompanionRegistry.set(sl.getServer(), ownerUuid, getUUID()); return true; }
+        if (registered.equals(getUUID())) return true;
+        dropStorageAndClear();
+        discard();
+        return false;
+    }
+
+    /** Mobs that were already chasing the body (or remember it as their attacker) let go of it. */
+    private void makeMobsForgetMe() {
+        if (!(level() instanceof ServerLevel sl)) return;
+        for (Mob m : sl.getEntitiesOfClass(Mob.class, getBoundingBox().inflate(32), e -> e != this)) {
+            if (m.getTarget() == this) m.setTarget(null);
+            if (m.getLastHurtByMob() == this) m.setLastHurtByMob(null);
+            m.getBrain().getMemory(MemoryModuleType.ATTACK_TARGET).ifPresent(t -> {
+                if (t == this) m.getBrain().eraseMemory(MemoryModuleType.ATTACK_TARGET);
+            });
+        }
+    }
+
+    /** Drops the whole bag and the mirrored gear on the ground, and empties them so nothing can be dropped twice. */
+    private void dropStorageAndClear() {
+        Containers.dropContents(level(), this, storage);
+        storage.clearContent();
+        setItemSlot(EquipmentSlot.MAINHAND, ItemStack.EMPTY);
+        setItemSlot(EquipmentSlot.OFFHAND, ItemStack.EMPTY);
+        for (EquipmentSlot slot : ARMOR_SLOTS) setItemSlot(slot, ItemStack.EMPTY);
+    }
+
+    /** Used when the shrine has to recreate the companion (other dimension): nothing the player gave it is lost. */
+    public void copyStateFrom(CompanionEntity other) {
+        for (int i = 0; i < SIZE; i++) storage.setItem(i, other.storage.getItem(i).copy());
+        if (other.hasCustomName()) setCustomName(other.getCustomName());
+        setSkin(other.skin());
+        setFeminine(other.isFeminine());
+        setStance(other.stance());
+        refreshEquipment();
+    }
+
+    /** A downed companion is not a valid target for any mob. */
+    @Override
+    public boolean canBeSeenAsEnemy() { return !isInjured() && super.canBeSeenAsEnemy(); }
+
+    @Override
+    public boolean canBeSeenByAnyone() { return !isInjured() && super.canBeSeenByAnyone(); }
+}

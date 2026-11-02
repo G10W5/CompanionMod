@@ -209,15 +209,7 @@ public final class CompanionAutonomy {
 
     /** Game-thread snapshot for the model. */
     private static String context(Minecraft mc) {
-        CompanionEntity mine = null;
-        String me = mc.player.getStringUUID();
-        for (Entity e : mc.level.entitiesForRendering()) {
-            if (e instanceof CompanionEntity c && c.isOwnedBy(me)) {
-                mine = c;
-                break;
-            }
-        }
+        CompanionEntity mine = ClientVoice.findCompanion(mc);
         return CompanionWorldContext.build(mc, mine) + "\nMemory: " + CompanionMemory.summary();
     }
 }
-

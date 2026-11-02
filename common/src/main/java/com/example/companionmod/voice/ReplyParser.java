@@ -21,7 +21,7 @@ public final class ReplyParser {
                     JsonObject o = el.getAsJsonObject();
                     String heard = str(o, "heard");
                     String say = str(o, "say");
-                    String target = truncate(clean(str(o, "target")), 60);   // must fit the 64-char packet field
+                    String target = truncate(clean(str(o, "target")), 60);   // the packet field allows 1024; keep model targets short
                     String memory = clean(str(o, "memory"));
                     CompanionCommand cmd = CompanionCommand.parse(str(o, "action"));
                     return new VoiceReply(heard, clean(say), cmd, target, memory);

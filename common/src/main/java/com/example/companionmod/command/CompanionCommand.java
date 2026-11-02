@@ -12,6 +12,15 @@ public enum CompanionCommand {
     SEEK_BLOCK, SET_NAME, REVIVE, PLAN,
     REMEMBER, FORGET, SET_SKIN, FEMININE, MASCULINE;
 
+    /** False for appearance/UI/memory/revive packets: they are not a new gameplay intent and must not pause or cancel a plan. */
+    public boolean interruptsPlanning() {
+        return switch (this) {
+            case NONE, PLAN, CONTINUE, INVENTORY, SET_NAME, SET_SKIN, FEMININE, MASCULINE,
+                    REMEMBER, FORGET, REVIVE -> false;
+            default -> true;
+        };
+    }
+
     /** Lenient parser: accepts the enum name plus common synonyms the model might produce. */
     public static CompanionCommand parse(String raw) {
         if (raw == null) return NONE;
