@@ -1,6 +1,6 @@
 # All Java Sources
 
-Generated from 73 files. Paths are relative to the project root.
+Generated from 72 files. Paths are relative to the project root.
 
 ## common\src\main\java\com\example\companionmod\block\CompanionShrineBlock.java
 
@@ -487,94 +487,6 @@ public final class ClientVoice {
 }
 ```
 
-## common\src\main\java\com\example\companionmod\client\CompanionAudioDeviceScreen.java
-
-```java
-package com.example.companionmod.client;
-
-import com.example.companionmod.voice.AudioDevices;
-import net.minecraft.client.Minecraft;
-import net.minecraft.client.gui.GuiGraphicsExtractor;
-import net.minecraft.client.gui.components.Button;
-import net.minecraft.client.gui.screens.Screen;
-import net.minecraft.network.chat.Component;
-
-import java.util.List;
-import java.util.function.Consumer;
-
-/**
- * Picker for a Java Sound input (microphone) or output (speakers) device. The first row is always
- * "System default" (stores an empty string); the rest come straight from the audio subsystem, so
- * plug/unplug is reflected every time the screen opens. Clicking a row hands the name to the picker
- * consumer and returns to the settings screen.
- */
-public final class CompanionAudioDeviceScreen extends Screen {
-    private static final int ROW = 22;
-
-    private final boolean input;
-    private final Screen parent;
-    private final Consumer<String> picker;
-    private final List<String> devices;
-
-    private CompanionAudioDeviceScreen(boolean input, Screen parent, Consumer<String> picker, List<String> devices) {
-        super(Component.literal(input ? "Pick a Microphone" : "Pick an Output Device"));
-        this.input = input;
-        this.parent = parent;
-        this.picker = picker;
-        this.devices = devices;
-    }
-
-    /** {@code input} true = microphone list, false = speaker list. Runs on the game thread (enumeration is local and fast). */
-    static void open(Minecraft mc, boolean input, Screen parent, Consumer<String> picker) {
-        List<String> devs = new java.util.ArrayList<>();
-        devs.add("");                                    // sentinel: system default
-        devs.addAll(input ? AudioDevices.inputs() : AudioDevices.outputs());
-        mc.setScreen(new CompanionAudioDeviceScreen(input, parent, picker, devs));
-    }
-
-    @Override
-    protected void init() {
-        super.init();
-        int cx = this.width / 2;
-        int listW = Math.min(420, this.width - 60);
-        int y = 74;
-        for (int i = 0; i < devices.size(); i++) {
-            if (y + ROW > this.height - 60) break;       // keep above the footer
-            final String dev = devices.get(i);
-            final boolean isDefault = dev.isEmpty();
-            Button row = Button.builder(Component.literal(isDefault ? "System default" : dev),
-                            b -> { picker.accept(dev); if (this.minecraft != null) this.minecraft.setScreen(parent); })
-                    .pos(cx - listW / 2, y).size(listW, 20).build();
-            this.addRenderableWidget(row);
-            y += ROW;
-        }
-        this.addRenderableWidget(Button.builder(Component.literal("Back"), b -> onClose())
-                .pos(cx - 50, Math.max(y + 6, this.height - 30)).size(100, 20).build());
-    }
-
-    @Override
-    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
-        this.extractMenuBackground(g);
-        super.extractRenderState(g, mouseX, mouseY, partialTick);
-        int cx = this.width / 2;
-        g.centeredText(this.font, this.title, cx, 30, 0xFFFFFFFF);
-        g.centeredText(this.font, input
-                ? "Used for push-to-talk (hold V)."
-                : "Used for spoken replies. Empty = Minecraft's own audio output.", cx, 44, 0xFF9AA6B2);
-        g.centeredText(this.font, (devices.size() - 1) + " device(s) found.", cx, 56, 0xFF9AA6B2);
-        g.centeredText(this.font, "Click a device to select it.", cx, this.height - 24, 0xFF666666);
-    }
-
-    @Override
-    public void onClose() {
-        if (this.minecraft != null) this.minecraft.setScreen(parent);
-    }
-
-    @Override
-    public boolean isPauseScreen() { return false; }
-}
-```
-
 ## common\src\main\java\com\example\companionmod\client\CompanionAutonomy.java
 
 ```java
@@ -795,178 +707,238 @@ public final class CompanionAutonomy {
 }
 ```
 
-## common\src\main\java\com\example\companionmod\client\CompanionConnectionScreen.java
+## common\src\main\java\com\example\companionmod\client\CompanionDropdowns.java
 
 ```java
 package com.example.companionmod.client;
 
-import com.example.companionmod.voice.VoiceConfig;
+import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
-import net.minecraft.client.gui.components.AbstractSliderButton;
 import net.minecraft.client.gui.components.Button;
-import net.minecraft.client.gui.components.EditBox;
-import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 
-import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
+import java.util.function.IntSupplier;
+import java.util.function.Supplier;
 
-/** AI connection settings: Ollama host, chat/STT/speech models and temperature. */
-public class CompanionConnectionScreen extends Screen {
-    private final VoiceConfig config;
-    private final Path configFile;
-    private final Screen parent;
+/**
+ * Dropdown menus built from vanilla {@link Button}s plus one overlay list drawn on top of everything.
+ *
+ * <p>The screen owns the header buttons (so they get vanilla styling, hover, narration and keyboard focus);
+ * this class only keeps the option lists, draws the open list and swallows the clicks / scrolling that belong to it.
+ * Wire it up in the screen with: {@link #extract} at the END of extractRenderState, {@link #mouseClicked} /
+ * {@link #mouseScrolled} / {@link #escape} at the START of the matching overrides.</p>
+ */
+final class CompanionDropdowns {
+    static final int ROW_H = 16;
+    static final int MAX_ROWS = 7;
 
-    private EditBox hostField;
-    private EditBox chatField;
-    private EditBox sttField;
-    private EditBox speechField;
-    private EditBox voiceField;
-    private EditBox micField;
-    private EditBox outField;
-    private int micY, outY;
-    private float temperature;
+    record Option(String value, String label) {}
 
-    public CompanionConnectionScreen(VoiceConfig config, Path configFile, Screen parent) {
-        super(Component.literal("AI Connection"));
-        this.config = config;
-        this.configFile = configFile;
-        this.parent = parent;
-        this.temperature = config.temperature;
+    static final class Dropdown {
+        final String title;
+        final Supplier<String> getter;
+        final Consumer<String> setter;
+        Button button;
+        List<Option> options = List.of();
+        String emptyText = "Nothing found";
+        boolean loading;
+        int scroll;
+
+        Dropdown(String title, Supplier<String> getter, Consumer<String> setter) {
+            this.title = title;
+            this.getter = getter;
+            this.setter = setter;
+        }
     }
 
-    @Override
-    protected void init() {
-        super.init();
-        int cx = this.width / 2;
-        int w = 300;
-        int y = 64;
+    private record Layout(int x, int y, int w, int h, int rows, int total) {}
 
-        this.hostField = field(cx, y, w, config.host, "http://127.0.0.1:11434");
-        y += 34;
-        this.chatField = field(cx, y, w, config.chatModel, "Chat model (e.g. qwen3:8b)");
-        y += 34;
-        this.sttField = field(cx, y, w, config.sttModel, "STT model (optional, e.g. whisper)");
-        y += 34;
-        this.speechField = field(cx, y, w, config.speechModel, "Speech model (empty = auto)");
-        y += 34;
-        this.voiceField = field(cx, y, w, config.speechVoice, "Voice (optional)");
-        y += 24;
-        this.addRenderableWidget(Button.builder(Component.literal("Detect voices from the speech model"), b -> detectVoices())
-                .pos(cx - w / 2, y).size(w, 20).build());
-        y += 26;
+    private final Font font;
+    private final IntSupplier screenHeight;
+    private final List<Dropdown> all = new ArrayList<>();
+    private Dropdown open;
 
-        this.micField = deviceField(cx, y, w, config.micDevice, "System default");
-        this.addRenderableWidget(Button.builder(Component.literal("Pick…"), b ->
-                CompanionAudioDeviceScreen.open(this.minecraft, true, this, v -> micField.setValue(v)))
-                .pos(cx + w / 2 - 80, y).size(80, 20).build());
-        micY = y;
-        y += 26;
-        this.outField = deviceField(cx, y, w, config.outputDevice, "System default (Minecraft's audio)");
-        this.addRenderableWidget(Button.builder(Component.literal("Pick…"), b ->
-                CompanionAudioDeviceScreen.open(this.minecraft, false, this, v -> outField.setValue(v)))
-                .pos(cx + w / 2 - 80, y).size(80, 20).build());
-        outY = y;
-        y += 32;
+    CompanionDropdowns(Font font, IntSupplier screenHeight) {
+        this.font = font;
+        this.screenHeight = screenHeight;
+    }
 
-        this.addRenderableWidget(new AbstractSliderButton(cx - w / 2, y, w, 20,
-                Component.literal("Temperature: " + String.format("%.2f", temperature)), temperature / 1.5) {
-            @Override protected void updateMessage() {
-                temperature = (float) (this.value * 1.5);
-                setMessage(Component.literal("Temperature: " + String.format("%.2f", temperature)));
+    /** Forget every dropdown (call at the start of init(): the header buttons are recreated each time). */
+    void clear() {
+        all.clear();
+        open = null;
+    }
+
+    void register(Dropdown d) {
+        all.add(d);
+        refresh(d);
+    }
+
+    boolean isOpen() { return open != null; }
+
+    void toggle(Dropdown d) {
+        Dropdown previous = open;
+        open = null;
+        if (previous != null) refresh(previous);
+        if (previous != d) {
+            open = d;
+            List<Option> opts = shown(d);
+            int rows = Math.min(Math.max(1, opts.size()), MAX_ROWS);
+            int sel = indexOfCurrent(d, opts);
+            d.scroll = Math.max(0, Math.min(Math.max(0, opts.size() - rows), sel - rows / 2));
+        }
+        refresh(d);
+    }
+
+    void close() {
+        Dropdown d = open;
+        open = null;
+        if (d != null) refresh(d);
+    }
+
+    /** ESC closes an open list first instead of the whole screen. */
+    boolean escape() {
+        if (open == null) return false;
+        close();
+        return true;
+    }
+
+    void refreshAll() {
+        for (Dropdown d : all) refresh(d);
+    }
+
+    // ---- labels -------------------------------------------------------------------------------------------------
+
+    /** Options as displayed: the stored value is always selectable even when the server list does not contain it. */
+    private List<Option> shown(Dropdown d) {
+        String cur = current(d);
+        if (cur.isEmpty()) return d.options;
+        for (Option o : d.options) if (o.value().equals(cur)) return d.options;
+        List<Option> withCur = new ArrayList<>(d.options.size() + 1);
+        withCur.add(new Option(cur, cur));
+        withCur.addAll(d.options);
+        return withCur;
+    }
+
+    private static String current(Dropdown d) {
+        String v = d.getter.get();
+        return v == null ? "" : v;
+    }
+
+    private int indexOfCurrent(Dropdown d, List<Option> opts) {
+        String cur = current(d);
+        for (int i = 0; i < opts.size(); i++) if (opts.get(i).value().equals(cur)) return i;
+        return 0;
+    }
+
+    void refresh(Dropdown d) {
+        if (d.button == null) return;
+        String cur = current(d);
+        String value = null;
+        for (Option o : shown(d)) if (o.value().equals(cur)) { value = o.label(); break; }
+        if (value == null) value = d.loading ? "Loading..." : (cur.isEmpty() ? "-" : cur);
+        String prefix = d.title + ": ";
+        String arrow = open == d ? " \u25B2" : " \u25BC";
+        int room = d.button.getWidth() - 12 - font.width(prefix) - font.width(arrow);
+        if (room > 12 && font.width(value) > room) {
+            value = font.plainSubstrByWidth(value, room - font.width("...")) + "...";
+        }
+        d.button.setMessage(Component.literal(prefix + value + arrow));
+    }
+
+    // ---- layout -------------------------------------------------------------------------------------------------
+
+    private Layout layout(Dropdown d) {
+        Button b = d.button;
+        int total = Math.max(1, shown(d).size());
+        int below = screenHeight.getAsInt() - (b.getY() + b.getHeight()) - 4;
+        int above = b.getY() - 4;
+        boolean up = total * ROW_H + 2 > below && above > below;
+        int room = Math.max(1, ((up ? above : below) - 2) / ROW_H);
+        int rows = Math.max(1, Math.min(Math.min(total, MAX_ROWS), room));
+        int h = rows * ROW_H + 2;
+        int y = up ? b.getY() - h : b.getY() + b.getHeight();
+        return new Layout(b.getX(), y, b.getWidth(), h, rows, total);
+    }
+
+    // ---- drawing ------------------------------------------------------------------------------------------------
+
+    void extract(GuiGraphicsExtractor g, int mx, int my) {
+        if (open == null || open.button == null) return;
+        g.nextStratum();                                   // 26.1-CHECK: draw above widget text; delete this line if it does not exist
+        Dropdown d = open;
+        Layout L = layout(d);
+        List<Option> opts = shown(d);
+        d.scroll = Math.max(0, Math.min(d.scroll, Math.max(0, L.total() - L.rows())));
+        int sbw = L.total() > L.rows() ? 6 : 0;
+
+        g.fill(L.x() - 1, L.y() - 1, L.x() + L.w() + 1, L.y() + L.h() + 1, 0xFF000000);
+        g.fill(L.x(), L.y(), L.x() + L.w(), L.y() + L.h(), 0xFF1B1B1B);
+
+        if (opts.isEmpty()) {
+            g.text(font, d.loading ? "Loading..." : d.emptyText, L.x() + 6, L.y() + 5, 0xFF9A9A9A, true);
+        }
+        String cur = current(d);
+        for (int i = 0; i < L.rows(); i++) {
+            int idx = d.scroll + i;
+            if (idx >= opts.size()) break;
+            Option o = opts.get(idx);
+            int ry = L.y() + 1 + i * ROW_H;
+            boolean hover = mx >= L.x() && mx < L.x() + L.w() - sbw && my >= ry && my < ry + ROW_H;
+            boolean selected = o.value().equals(cur);
+            if (hover) g.fill(L.x() + 1, ry, L.x() + L.w() - 1 - sbw, ry + ROW_H, 0xFF505050);
+            if (selected) g.fill(L.x() + 1, ry + 2, L.x() + 3, ry + ROW_H - 2, 0xFF55FF55);
+            String label = font.plainSubstrByWidth(o.label(), L.w() - 14 - sbw);
+            g.text(font, label, L.x() + 7, ry + 4, selected ? 0xFFFFFF55 : 0xFFFFFFFF, true);
+        }
+        if (sbw > 0) {
+            int tx = L.x() + L.w() - sbw, ty = L.y() + 1, th = L.h() - 2;
+            g.fill(tx, ty, L.x() + L.w() - 1, ty + th, 0xFF000000);
+            int thumb = Math.max(8, th * L.rows() / L.total());
+            int maxScroll = Math.max(1, L.total() - L.rows());
+            int thumbY = ty + (th - thumb) * d.scroll / maxScroll;
+            g.fill(tx + 1, thumbY, L.x() + L.w() - 2, thumbY + thumb, 0xFF9A9A9A);
+        }
+    }
+
+    // ---- input --------------------------------------------------------------------------------------------------
+
+    /** @return true when the click was consumed by an open list (or closed it). */
+    boolean mouseClicked(double mx, double my, int button) {
+        if (open == null || open.button == null) return false;
+        Dropdown d = open;
+        Layout L = layout(d);
+        boolean inList = mx >= L.x() && mx < L.x() + L.w() && my >= L.y() && my < L.y() + L.h();
+        if (inList) {
+            int sbw = L.total() > L.rows() ? 6 : 0;
+            if (button == 0 && mx < L.x() + L.w() - sbw) {
+                int i = (int) ((my - L.y() - 1) / ROW_H);
+                int idx = d.scroll + i;
+                List<Option> opts = shown(d);
+                if (i >= 0 && i < L.rows() && idx >= 0 && idx < opts.size()) {
+                    d.setter.accept(opts.get(idx).value());
+                    close();
+                }
             }
-            @Override protected void applyValue() { }
-        });
-        y += 28;
-
-        this.addRenderableWidget(Button.builder(Component.literal("Load models from server"), b -> loadModels())
-                .pos(cx - w / 2, y).size(w, 20).build());
-        y += 24;
-
-        this.addRenderableWidget(Button.builder(Component.literal("Save"), b -> save())
-                .pos(cx - w / 2, y).size(w, 20).build());
-        y += 24;
-        this.addRenderableWidget(Button.builder(Component.literal("Back"), b -> back())
-                .pos(cx - w / 2, y).size(w, 20).build());
+            return true;
+        }
+        Button b = d.button;
+        if (mx >= b.getX() && mx < b.getX() + b.getWidth() && my >= b.getY() && my < b.getY() + b.getHeight()) {
+            return false;                                  // let the header button run its own press handler (toggles closed)
+        }
+        close();
+        return true;
     }
 
-    private EditBox field(int cx, int y, int w, String value, String hint) {
-        EditBox box = new EditBox(this.font, cx - w / 2, y, w, 20, Component.literal(hint));
-        box.setValue(value == null ? "" : value);
-        box.setHint(Component.literal(hint));
-        box.setMaxLength(240);
-        this.addRenderableWidget(box);
-        return box;
-    }
-
-    /** Audio device row: a (prefilled, editable) name field plus a picker button; blank = system default. */
-    private EditBox deviceField(int cx, int y, int w, String value, String hint) {
-        EditBox box = new EditBox(this.font, cx - w / 2, y, w - 90, 20, Component.literal(hint));
-        box.setValue(value == null ? "" : value);
-        box.setHint(Component.literal(hint));
-        box.setMaxLength(240);
-        this.addRenderableWidget(box);
-        return box;
-    }
-
-    private void loadModels() {
-        String h = hostField.getValue() == null ? "" : hostField.getValue().trim();
-        CompanionModelScreen.open(this.minecraft, h, this,
-                v -> chatField.setValue(v),
-                v -> speechField.setValue(v),
-                v -> sttField.setValue(v));
-    }
-
-    /** Asks the server which voices the selected speech model supports, then picks one from the list. */
-    private void detectVoices() {
-        String h = hostField.getValue() == null ? "" : hostField.getValue().trim();
-        String m = speechField.getValue() == null ? "" : speechField.getValue().trim();
-        CompanionVoiceScreen.open(this.minecraft, h, m, this, v -> voiceField.setValue(v));
-    }
-
-    private void save() {
-        config.host = trim(hostField.getValue(), "http://127.0.0.1:11434");
-        config.chatModel = trim(chatField.getValue(), "lfm3-audio:latest");
-        config.sttModel = sttField.getValue() == null ? "" : sttField.getValue().trim();
-        config.speechModel = speechField.getValue() == null ? "" : speechField.getValue().trim();
-        config.speechVoice = voiceField.getValue() == null ? "" : voiceField.getValue().trim();
-        config.micDevice = micField.getValue() == null ? "" : micField.getValue().trim();
-        config.outputDevice = outField.getValue() == null ? "" : outField.getValue().trim();
-        config.temperature = Math.max(0f, Math.min(1.5f, temperature));
-        config.save(configFile);
-        back();
-    }
-
-    private void back() {
-        if (this.minecraft != null) this.minecraft.setScreen(parent);
-    }
-
-    private static String trim(String value, String fallback) {
-        return value == null || value.isBlank() ? fallback : value.trim();
-    }
-
-    @Override
-    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
-        this.extractMenuBackground(g);
-        int cx = this.width / 2;
-        int w = 300;
-        g.fill(cx - w / 2 - 12, 34, cx + w / 2 + 12, this.height - 28, 0xCC101216);
-        g.fill(cx - w / 2 - 12, 34, cx + w / 2 + 12, 35, 0xFF3D7BB8);
-        super.extractRenderState(g, mouseX, mouseY, partialTick);
-
-        g.centeredText(this.font, "AI Connection", cx, 42, 0xFFFFFFFF);
-        g.centeredText(this.font, "Ollama or any OpenAI-compatible server", cx, 54, 0xFF9AA6B2);
-        int y = 64;
-        label(g, "Server URL", cx - w / 2, y - 11);
-        label(g, "Chat model (hears or reads)", cx - w / 2, y + 23);
-        label(g, "Speech-to-text model", cx - w / 2, y + 57);
-        label(g, "Text-to-speech model", cx - w / 2, y + 91);
-        label(g, "Voice", cx - w / 2, y + 125);
-        label(g, "Input device (mic)", cx - w / 2, micY - 11);
-        label(g, "Output device (spoken replies)", cx - w / 2, outY - 11);
-    }
-
-    private void label(GuiGraphicsExtractor g, String text, int x, int y) {
-        g.text(this.font, text, x, y, 0xFFB8C2CC, true);
+    boolean mouseScrolled(double mx, double my, double scrollY) {
+        if (open == null || open.button == null) return false;
+        Layout L = layout(open);
+        int max = Math.max(0, L.total() - L.rows());
+        open.scroll = Math.max(0, Math.min(max, open.scroll - (int) Math.signum(scrollY)));
+        return true;
     }
 }
 ```
@@ -1492,168 +1464,6 @@ public final class CompanionMemory {
             Files.writeString(file, GSON.toJson(data));
         } catch (IOException ignored) { }
     }
-}
-```
-
-## common\src\main\java\com\example\companionmod\client\CompanionModelScreen.java
-
-```java
-package com.example.companionmod.client;
-
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-import net.minecraft.client.Minecraft;
-import net.minecraft.client.gui.GuiGraphicsExtractor;
-import net.minecraft.client.gui.components.Button;
-import net.minecraft.client.gui.screens.Screen;
-import net.minecraft.network.chat.Component;
-import net.minecraft.network.chat.Style;
-
-import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.function.Consumer;
-
-/**
- * Selection menu for the models exposed by the Ollama server (GET /api/tags). The host and one
- * {@code Consumer<String>} per role (Chat / Speech / STT) are passed in; click a model row to assign it
- * to the currently-selected role. Models are pre-fetched on a worker thread.
- */
-public final class CompanionModelScreen extends Screen {
-    private static final int ROW = 22;
-    private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
-
-    private final String host;
-    private final Map<String, Consumer<String>> assigners;   // role -> what to do with the chosen model
-    private final Screen parent;
-    private final List<String> models;
-    private final String status;
-    private int selected = 0;
-    private Component roleLabel = Component.literal("Assigning to: " + "Chat");
-
-    private CompanionModelScreen(String host, Map<String, Consumer<String>> assigners, List<String> models,
-                                 String status, int selected, Screen parent) {
-        super(Component.literal(models.isEmpty() ? "Pick a Model" : "Pick a Model (" + models.size() + ")"));
-        this.host = host;
-        this.assigners = assigners;
-        this.models = models;
-        this.status = status == null ? "" : status;
-        this.selected = Math.max(0, Math.min(selected, assigners.size() - 1));
-        this.parent = parent;
-    }
-
-    /** Opens the picker. {@code host} may be blank (defaults to the local Ollama URL). */
-    static void open(Minecraft mc, String host, Screen parent,
-                     Consumer<String> pickChat, Consumer<String> pickSpeech, Consumer<String> pickStt) {
-        String url = (host == null || host.isBlank()) ? "http://127.0.0.1:11434" : host;
-        new Thread(() -> {
-            List<String> fetched = fetch(url);
-            mc.execute(() -> {
-                String st = fetched.isEmpty() ? "No models found at " + url : "";
-                Map<String, Consumer<String>> m = new LinkedHashMap<>();
-                m.put("Chat", pickChat); m.put("Speech", pickSpeech); m.put("STT", pickStt);
-                mc.setScreen(new CompanionModelScreen(url, m, fetched, st, 0, parent));
-            });
-        }, "companionmod-models").start();
-    }
-
-    private static List<String> fetch(String host) {
-        try {
-            HttpResponse<String> r = HTTP.send(HttpRequest.newBuilder(URI.create(host + "/api/tags"))
-                    .timeout(Duration.ofSeconds(5)).GET().build(), HttpResponse.BodyHandlers.ofString());
-            if (r.statusCode() != 200) return List.of();
-            JsonObject o = JsonParser.parseString(r.body()).getAsJsonObject();
-            JsonElement arr = o.get("models");
-            if (arr == null || !arr.isJsonArray()) return List.of();
-            List<String> out = new ArrayList<>();
-            for (JsonElement e : arr.getAsJsonArray()) {
-                if (e.isJsonObject()) {
-                    String n = e.getAsJsonObject().has("name") ? e.getAsJsonObject().get("name").getAsString() : "";
-                    if (n != null && !n.isBlank()) out.add(n);
-                }
-            }
-            return out;
-        } catch (IOException | RuntimeException | InterruptedException e) {
-            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
-            return List.of();
-        }
-    }
-
-    private String[] roleKeys() { return assigners.keySet().toArray(String[]::new); }
-
-    @Override
-    protected void init() {
-        super.init();
-        int cx = this.width / 2;
-        int y = 46;
-        String[] keys = roleKeys();
-        int bw = 72, gap = 6;
-        int baseX = cx - (keys.length * bw + (keys.length - 1) * gap) / 2;
-        for (int i = 0; i < keys.length; i++) {
-            final int idx = i;
-            this.addRenderableWidget(Button.builder(Component.literal(keys[i]), b -> {
-                selected = idx;
-                roleLabel = Component.literal("Assigning to: " + keys[idx]);
-            }).pos(baseX + i * (bw + gap), y).size(bw, 20).build());
-        }
-        y += 28;
-
-        int listW = 190, colGap = 14;
-        int cols = models.size() > 12 ? 2 : 1;
-        int rows = (models.size() + cols - 1) / cols;
-        int leftX = cx - (cols * listW + (cols - 1) * colGap) / 2;
-        for (int i = 0; i < models.size(); i++) {
-            int c = i % cols, r = i / cols;
-            int bx = leftX + c * (listW + colGap);
-            int by = y + r * ROW;
-            if (by + ROW > this.height - 80) break;            // keep above the footer
-            final String model = models.get(i);
-            this.addRenderableWidget(Button.builder(Component.literal(model), b -> {
-                assigners.get(roleKeys()[selected]).accept(model);
-                if (this.minecraft != null) this.minecraft.setScreen(parent);
-            }).pos(bx, by).size(listW, 20).build());
-        }
-        y += Math.max(1, rows) * ROW;
-
-        if (models.isEmpty()) {
-            this.addRenderableWidget(Button.builder(Component.literal("Retry"), b -> {
-                if (this.minecraft != null) CompanionModelScreen.open(
-                        this.minecraft, host, parent,
-                        assigners.get("Chat"), assigners.get("Speech"), assigners.get("STT"));
-            }).pos(cx - 40, y).size(80, 20).build());
-            y += ROW;
-        }
-
-        this.addRenderableWidget(Button.builder(Component.literal("Back"), b -> onClose())
-                .pos(cx - 50, Math.max(y + 6, this.height - 30)).size(100, 20).build());
-    }
-
-    @Override
-    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
-        this.extractMenuBackground(g);
-        super.extractRenderState(g, mouseX, mouseY, partialTick);
-        int cx = this.width / 2;
-        g.centeredText(this.font, this.title, cx, 30, 0xFFFFFFFF);
-        if (!status.isBlank()) g.centeredText(this.font, status, cx, 44, 0xFFFF7777);
-        g.centeredText(this.font, roleLabel, cx, 56, 0xFF9AA6B2);
-        g.centeredText(this.font, "Click a model to assign it to " + roleKeys()[selected] + ".", cx, this.height - 24, 0xFF666666);
-    }
-
-    @Override
-    public void onClose() {
-        if (this.minecraft != null) this.minecraft.setScreen(parent);
-    }
-
-    @Override
-    public boolean isPauseScreen() { return false; }
 }
 ```
 
@@ -2427,107 +2237,256 @@ public class CompanionRenderState extends HumanoidRenderState {
 ```java
 package com.example.companionmod.client;
 
+import com.example.companionmod.voice.AudioDevices;
+import com.example.companionmod.voice.LevelMeter;
+import com.example.companionmod.voice.MicCapture;
+import com.example.companionmod.voice.OllamaCatalog;
 import com.example.companionmod.voice.VoiceConfig;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.AbstractSliderButton;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.CycleButton;
+import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.input.KeyEvent;
+import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
+import org.lwjgl.glfw.GLFW;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
+
+import com.example.companionmod.client.CompanionDropdowns.Dropdown;
+import com.example.companionmod.client.CompanionDropdowns.Option;
 
 /**
- * Vanilla-style options screen: centred title, two columns of 150x20 buttons ("Name: Value" cycle buttons and sliders),
- * separator lines, one 200px Done button. Changes apply live and are saved when the screen closes (Done or Esc), like vanilla options.
- * Fields used on VoiceConfig: feminineModel, memoryEnabled, speechVolume, speakReplies, dynamicGoals,
- * autonomyEnabled, autonomyIntervalSeconds, companionBody, companionName, companionSkin.
+ * Voice-Chat-mod style settings: one grey bevelled panel with four tabs (General / AI / Mic / Voice).
+ * Models, voices, microphones and speakers are dropdowns filled from the server / audio system; the Mic tab has a
+ * live level bar. Replaces the old CompanionConnectionScreen, CompanionModelScreen, CompanionVoiceScreen and
+ * CompanionAudioDeviceScreen. Changes apply live and are saved when the screen closes (Done, Esc, or opening a sub-screen).
  */
 public class CompanionSettingsScreen extends Screen {
-    private static final int COL_W = 150, GAP = 8;
+    public enum Tab {
+        GENERAL("General"), AI("AI"), MIC("Mic"), VOICE("Voice");
+        final String label;
+        Tab(String label) { this.label = label; }
+    }
+
+    private static Tab lastTab = Tab.GENERAL;
+
+    private static final int PANEL_W = 300, PAD = 12, ROW = 24;
+    private static final int HEAD_H = 52, CONTENT_H = 132, FOOT_H = 32;
 
     private final VoiceConfig config;
     private final Path configFile;
     private final Screen parent;
     private final boolean initialFeminine;
     private boolean feminine;
+    private Tab tab;
+
+    // geometry (recomputed in init)
+    private int px, py, panelW, panelH, ix, iw, cy;
+
+    private CompanionDropdowns dropdowns;
+    private Dropdown chatDd, sttDd, ttsDd, voiceDd, micDd, spkDd;
+    private EditBox hostBox;
+
+    // server catalog (survives tab switches and resizes)
+    private boolean catalogRequested;
+    private List<String> modelNames = List.of();
+    private List<String> voiceNames = List.of();
+    private boolean modelsLoading, modelsFailed, voicesLoading;
+    private int modelGen, voiceGen;
+    private List<String> inputDevices, outputDevices;
+
+    // mic test (only runs while the Mic tab is showing)
+    private final LevelMeter meter = new LevelMeter();
+    private volatile MicCapture mic;
+    private volatile String micError = "";
 
     public CompanionSettingsScreen(VoiceConfig config, Path configFile) { this(config, configFile, null); }
 
-    public CompanionSettingsScreen(VoiceConfig config, Path configFile, Screen parent) {
+    public CompanionSettingsScreen(VoiceConfig config, Path configFile, Screen parent) { this(config, configFile, parent, lastTab); }
+
+    public CompanionSettingsScreen(VoiceConfig config, Path configFile, Screen parent, Tab tab) {
         super(Component.literal("Companion Settings"));
         this.config = config;
         this.configFile = configFile;
         this.parent = parent;
         this.initialFeminine = config.feminineModel;
         this.feminine = initialFeminine;
+        this.tab = tab == null ? Tab.GENERAL : tab;
     }
+
+    // ---- layout -------------------------------------------------------------------------------------------------
 
     @Override
     protected void init() {
-        int cx = this.width / 2;
-        int lx = cx - COL_W - GAP / 2, rx = cx + GAP / 2;
-        int top = 42, rows = 6;
-        int pitch = Math.max(22, Math.min(24, (this.height - 36 - top - 4) / rows));
-        int y = top;
+        dropdowns = new CompanionDropdowns(this.font, () -> this.height);
+        chatDd = sttDd = ttsDd = voiceDd = micDd = spkDd = null;
+        hostBox = null;
 
-        nav(lx, y, "Personalize Companion...", () -> new CompanionProfileScreen(config, configFile, this));
-        nav(rx, y, "Appearance & Skins...", () -> new CompanionSkinScreen(config, configFile));
-        y += pitch;
+        panelW = Math.min(PANEL_W, this.width - 8);
+        panelH = HEAD_H + CONTENT_H + FOOT_H;
+        px = (this.width - panelW) / 2;
+        py = Math.max(4, (this.height - panelH) / 2);
+        ix = px + PAD;
+        iw = panelW - 2 * PAD;
+        cy = py + HEAD_H;
 
-        nav(lx, y, "AI Connection...", () -> new CompanionConnectionScreen(config, configFile, this));
-        toggle(rx, y, "Dynamic Goals", config.dynamicGoals, v -> config.dynamicGoals = v);
-        y += pitch;
+        int gap = 2, tw = (iw - gap * (Tab.values().length - 1)) / Tab.values().length;
+        for (int i = 0; i < Tab.values().length; i++) {
+            final Tab t = Tab.values()[i];
+            Button b = Button.builder(Component.literal(t.label), x -> switchTab(t))
+                    .pos(ix + i * (tw + gap), py + 22).size(tw, 20).build();
+            b.active = t != tab;
+            this.addRenderableWidget(b);
+        }
 
-        toggle(lx, y, "Feminine Model", feminine, v -> feminine = v);
-        // 26.1-CHECK: CycleButton.builder signature
-        this.addRenderableWidget(CycleButton.<String>builder(CompanionSettingsScreen::bodyName, config.companionBody == null ? "auto" : config.companionBody)
-                .withValues("auto", "slim", "classic")
-                .create(rx, y, COL_W, 20, Component.literal("Body Type"), (b, v) -> config.companionBody = v));
-        y += pitch;
-
-        toggle(lx, y, "Memory", config.memoryEnabled, v -> config.memoryEnabled = v);
-        toggle(rx, y, "Spoken Replies", config.speakReplies, v -> config.speakReplies = v);
-        y += pitch;
-
-        toggle(lx, y, "Autonomy", config.autonomyEnabled, v -> config.autonomyEnabled = v);
-        this.addRenderableWidget(new Slider(rx, y, COL_W, "Think Every", 15, 180, config.autonomyIntervalSeconds, "s",
-                v -> config.autonomyIntervalSeconds = Math.round(v)));
-        y += pitch;
-
-        this.addRenderableWidget(new Slider(lx, y, COL_W * 2 + GAP, "Reply Volume", 0, 100, config.speechVolume * 100f, "%",
-                v -> config.speechVolume = Math.max(0f, Math.min(1f, v / 100f))));
+        switch (tab) {
+            case GENERAL -> buildGeneral();
+            case AI -> buildAi();
+            case MIC -> buildMic();
+            case VOICE -> buildVoice();
+        }
 
         this.addRenderableWidget(Button.builder(CommonComponents.GUI_DONE, b -> onClose())
-                .pos(cx - 100, this.height - 27).size(200, 20).build());
+                .pos(ix, py + panelH - 26).size(iw, 20).build());
+
+        if (tab == Tab.MIC) startMic(); else stopMic();
+        if (!catalogRequested) { catalogRequested = true; loadModels(); loadVoices(); }
+        applyOptions();
+    }
+
+    private void switchTab(Tab t) {
+        lastTab = t;
+        this.tab = t;
+        this.inputDevices = null;                     // re-enumerate: picks up hot-plugged devices
+        this.outputDevices = null;
+        this.rebuildWidgets();
+    }
+
+    private void buildGeneral() {
+        int colW = (iw - 4) / 2, lx = ix, rx = ix + colW + 4, y = cy;
+
+        nav(lx, y, colW, "Personalize...", () -> new CompanionProfileScreen(config, configFile, this));
+        nav(rx, y, colW, "Appearance...", () -> new CompanionSkinScreen(config, configFile));
+        y += ROW;
+
+        toggle(lx, y, colW, "Dynamic Goals", config.dynamicGoals, v -> config.dynamicGoals = v);
+        toggle(rx, y, colW, "Autonomy", config.autonomyEnabled, v -> config.autonomyEnabled = v);
+        y += ROW;
+
+        toggle(lx, y, colW, "Memory", config.memoryEnabled, v -> config.memoryEnabled = v);
+        toggle(rx, y, colW, "Feminine Model", feminine, v -> feminine = v);
+        y += ROW;
+
+        // 26.1-CHECK: CycleButton.builder signature (copied unchanged from the old screen)
+        this.addRenderableWidget(CycleButton.<String>builder(CompanionSettingsScreen::bodyName, config.companionBody == null ? "auto" : config.companionBody)
+                .withValues("auto", "slim", "classic")
+                .create(lx, y, colW, 20, Component.literal("Body Type"), (b, v) -> config.companionBody = v));
+        this.addRenderableWidget(new Slider(rx, y, colW, "Think Every", 15, 180, config.autonomyIntervalSeconds, 0, "s",
+                v -> config.autonomyIntervalSeconds = Math.round(v)));
+    }
+
+    private void buildAi() {
+        int y = cy + 11;                               // "Server URL" label sits above the box
+        hostBox = new EditBox(this.font, ix, y, iw - 24, 20, Component.literal("Server URL"));
+        hostBox.setMaxLength(240);
+        hostBox.setHint(Component.literal(OllamaCatalog.DEFAULT_HOST));
+        hostBox.setValue(config.host == null ? "" : config.host);
+        hostBox.setResponder(v -> config.host = v);
+        this.addRenderableWidget(hostBox);
+        this.addRenderableWidget(Button.builder(Component.literal("\u21BB"), b -> reloadCatalog())
+                .pos(ix + iw - 20, y).size(20, 20).build());
+        y += ROW;
+
+        chatDd = dd(ix, y, iw, "Chat Model", () -> config.chatModel, v -> config.chatModel = v);
+        y += ROW;
+        sttDd = dd(ix, y, iw, "STT Model", () -> config.sttModel, v -> config.sttModel = v);
+        y += ROW;
+        this.addRenderableWidget(new Slider(ix, y, iw, "Temperature", 0f, 1.5f, config.temperature, 2, "",
+                v -> config.temperature = Math.round(v * 100f) / 100f));
+    }
+
+    private void buildMic() {
+        if (inputDevices == null) inputDevices = new ArrayList<>(AudioDevices.inputs());
+        micDd = dd(ix, cy, iw, "Microphone", () -> config.micDevice, v -> { config.micDevice = v; restartMic(); });
+        List<Option> opts = new ArrayList<>();
+        opts.add(new Option("", "System default"));
+        for (String n : inputDevices) opts.add(new Option(n, n));
+        micDd.options = opts;
+
+        int y = cy + 68;
+        this.addRenderableWidget(new Slider(ix, y, iw, "Silence Gate", 0, 50, config.silenceGate * 100f, 0, "%",
+                v -> config.silenceGate = Math.max(0f, Math.min(0.5f, v / 100f))));
+        y += ROW;
+        this.addRenderableWidget(new Slider(ix, y, iw, "Max Recording", 5, 60, config.maxRecordSeconds, 0, "s",
+                v -> config.maxRecordSeconds = Math.round(v)));
+    }
+
+    private void buildVoice() {
+        int y = cy;
+        toggle(ix, y, iw, "Spoken Replies", config.speakReplies, v -> config.speakReplies = v);
+        y += ROW;
+
+        if (outputDevices == null) outputDevices = new ArrayList<>(AudioDevices.outputs());
+        spkDd = dd(ix, y, iw, "Speaker", () -> config.outputDevice, v -> config.outputDevice = v);
+        List<Option> opts = new ArrayList<>();
+        opts.add(new Option("", "System default (Minecraft)"));
+        for (String n : outputDevices) opts.add(new Option(n, n));
+        spkDd.options = opts;
+        y += ROW;
+
+        ttsDd = dd(ix, y, iw, "Speech Model", () -> config.speechModel, v -> { config.speechModel = v; loadVoices(); });
+        y += ROW;
+        voiceDd = dd(ix, y, iw, "Voice", () -> config.speechVoice, v -> config.speechVoice = v);
+        y += ROW;
+
+        this.addRenderableWidget(new Slider(ix, y, iw, "Reply Volume", 0, 100, config.speechVolume * 100f, 0, "%",
+                v -> config.speechVolume = Math.max(0f, Math.min(1f, v / 100f))));
+    }
+
+    // ---- widget helpers -----------------------------------------------------------------------------------------
+
+    private Dropdown dd(int x, int y, int w, String title, Supplier<String> get, Consumer<String> set) {
+        Dropdown d = new Dropdown(title, get, set);
+        d.button = this.addRenderableWidget(Button.builder(Component.literal(title), b -> dropdowns.toggle(d))
+                .pos(x, y).size(w, 20).build());
+        dropdowns.register(d);
+        return d;
+    }
+
+    private void nav(int x, int y, int w, String label, Supplier<Screen> target) {
+        this.addRenderableWidget(Button.builder(Component.literal(label), b -> {
+            if (this.minecraft != null) this.minecraft.setScreen(target.get());
+        }).pos(x, y).size(w, 20).build());
+    }
+
+    private void toggle(int x, int y, int w, String name, boolean value, Consumer<Boolean> apply) {
+        this.addRenderableWidget(CycleButton.onOffBuilder(value)
+                .create(x, y, w, 20, Component.literal(name), (b, v) -> apply.accept(v)));
     }
 
     private static Component bodyName(String v) {
-        return Component.literal(switch (v) { case "slim" -> "Slim"; case "classic" -> "Classic"; default -> "Auto (skin)"; });
+        return Component.literal(switch (v) { case "slim" -> "Slim"; case "classic" -> "Classic"; default -> "Auto"; });
     }
 
-    private void nav(int x, int y, String label, java.util.function.Supplier<Screen> target) {
-        this.addRenderableWidget(Button.builder(Component.literal(label), b -> {
-            if (this.minecraft != null) this.minecraft.setScreen(target.get());
-        }).pos(x, y).size(COL_W, 20).build());
-    }
-
-    private void toggle(int x, int y, String name, boolean value, Consumer<Boolean> apply) {
-        this.addRenderableWidget(CycleButton.onOffBuilder(value)
-                .create(x, y, COL_W, 20, Component.literal(name), (b, v) -> apply.accept(v)));
-    }
-
-    /** Vanilla-looking slider with a "Name: value" label. */
+    /** Vanilla slider with a "Name: value" label. */
     private static final class Slider extends AbstractSliderButton {
         private final String label, unit;
         private final float min, max;
+        private final int decimals;
         private final Consumer<Float> apply;
 
-        Slider(int x, int y, int w, String label, float min, float max, float cur, String unit, Consumer<Float> apply) {
+        Slider(int x, int y, int w, String label, float min, float max, float cur, int decimals, String unit, Consumer<Float> apply) {
             super(x, y, w, 20, Component.empty(), max > min ? Math.max(0, Math.min(1, (cur - min) / (max - min))) : 0);
-            this.label = label; this.unit = unit; this.min = min; this.max = max; this.apply = apply;
+            this.label = label; this.unit = unit; this.min = min; this.max = max; this.decimals = decimals; this.apply = apply;
             updateMessage();
         }
 
@@ -2535,11 +2494,148 @@ public class CompanionSettingsScreen extends Screen {
 
         @Override protected void updateMessage() {
             if (label == null) return;                       // super() calls this before our fields exist
-            setMessage(Component.literal(label + ": " + Math.round(val()) + unit));
+            String s = decimals == 0 ? String.valueOf(Math.round(val())) : String.format(java.util.Locale.ROOT, "%." + decimals + "f", val());
+            setMessage(Component.literal(label + ": " + s + unit));
         }
 
         @Override protected void applyValue() { apply.accept(val()); }
     }
+
+    // ---- server catalog -----------------------------------------------------------------------------------------
+
+    private void reloadCatalog() {
+        loadModels();
+        loadVoices();
+    }
+
+    private void loadModels() {
+        final int gen = ++modelGen;
+        modelsLoading = true;
+        modelsFailed = false;
+        applyOptions();
+        final String host = config.host;
+        final Minecraft mc = this.minecraft;
+        Thread t = new Thread(() -> {
+            List<String> r = OllamaCatalog.models(host);
+            mc.execute(() -> {
+                if (gen != modelGen) return;
+                modelsLoading = false;
+                modelsFailed = r == null;
+                modelNames = r == null ? List.of() : r;
+                applyOptions();
+            });
+        }, "companionmod-models");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void loadVoices() {
+        final int gen = ++voiceGen;
+        voicesLoading = true;
+        applyOptions();
+        final String host = config.host, model = config.speechModel;
+        final Minecraft mc = this.minecraft;
+        Thread t = new Thread(() -> {
+            List<String> r = OllamaCatalog.voices(host, model);
+            mc.execute(() -> {
+                if (gen != voiceGen) return;
+                voicesLoading = false;
+                voiceNames = r;
+                applyOptions();
+            });
+        }, "companionmod-voices");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private List<Option> modelOptions(String noneLabel) {
+        List<Option> out = new ArrayList<>();
+        if (noneLabel != null) out.add(new Option("", noneLabel));
+        for (String m : modelNames) out.add(new Option(m, m));
+        return out;
+    }
+
+    /** Pushes the freshest lists into whichever dropdowns the current tab has. */
+    private void applyOptions() {
+        if (dropdowns == null) return;
+        String modelEmpty = modelsFailed ? "Server unreachable" : "No models installed";
+        if (chatDd != null) { chatDd.options = modelOptions(null); chatDd.loading = modelsLoading; chatDd.emptyText = modelEmpty; }
+        if (sttDd != null) { sttDd.options = modelOptions("None (audio model)"); sttDd.loading = modelsLoading; sttDd.emptyText = modelEmpty; }
+        if (ttsDd != null) { ttsDd.options = modelOptions("Auto"); ttsDd.loading = modelsLoading; ttsDd.emptyText = modelEmpty; }
+        if (voiceDd != null) {
+            List<Option> v = new ArrayList<>();
+            v.add(new Option("", "Server default"));
+            for (String n : voiceNames) v.add(new Option(n, n));
+            voiceDd.options = v;
+            voiceDd.loading = voicesLoading;
+            if (!voicesLoading) voiceDd.emptyText = "No voices answered - is the speech model installed? (ollama pull "
+                    + ((config.speechModel == null || config.speechModel.isBlank()) ? "phonon" : config.speechModel) + ")";
+        }
+        dropdowns.refreshAll();
+    }
+
+    // ---- mic test -----------------------------------------------------------------------------------------------
+
+    private void startMic() {
+        if (mic != null) return;
+        beginMic(null);
+    }
+
+    private void restartMic() {
+        beginMic(mic);
+    }
+
+    /** Opens a fresh capture on a worker thread, after closing {@code old}, so two lines never fight over one device. */
+    private void beginMic(MicCapture old) {
+        final MicCapture m = new MicCapture(meter, () -> 1, () -> config.micDevice);
+        mic = m;
+        micError = "";
+        Thread t = new Thread(() -> {
+            if (old != null) old.stop();
+            meter.reset();
+            if (mic != m) return;
+            if (!m.start()) { micError = m.lastError(); return; }
+            if (mic != m) m.stop();                      // tab was left while the line was still opening
+        }, "companionmod-mictest");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void stopMic() {
+        final MicCapture m = mic;
+        mic = null;
+        if (m == null) return;
+        Thread t = new Thread(() -> { m.stop(); meter.reset(); }, "companionmod-mictest-stop");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    // ---- input --------------------------------------------------------------------------------------------------
+
+    @Override
+    public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+        if (dropdowns.mouseClicked(event.x(), event.y(), event.button())) return true;
+        return super.mouseClicked(event, doubleClick);
+    }
+
+    @Override
+    public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+        if (dropdowns.mouseScrolled(mouseX, mouseY, scrollY)) return true;
+        return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+    }
+
+    @Override
+    public boolean keyPressed(KeyEvent event) {
+        int k = event.key();
+        if (k == GLFW.GLFW_KEY_ESCAPE && dropdowns.escape()) return true;
+        if ((k == GLFW.GLFW_KEY_ENTER || k == GLFW.GLFW_KEY_KP_ENTER) && hostBox != null && hostBox.isFocused()) {
+            reloadCatalog();
+            return true;
+        }
+        return super.keyPressed(event);
+    }
+
+    // ---- lifecycle ----------------------------------------------------------------------------------------------
 
     @Override
     public void onClose() {
@@ -2549,6 +2645,15 @@ public class CompanionSettingsScreen extends Screen {
     /** Runs on Done, Esc and when a sub-screen opens: persist and push changes to the server. */
     @Override
     public void removed() {
+        stopMic();
+        config.host = OllamaCatalog.normalize(config.host);
+        if (config.chatModel == null || config.chatModel.isBlank()) config.chatModel = "lfm3-audio:latest";
+        if (config.sttModel == null) config.sttModel = "";
+        if (config.speechModel == null) config.speechModel = "";
+        if (config.speechVoice == null) config.speechVoice = "";
+        if (config.micDevice == null) config.micDevice = "";
+        if (config.outputDevice == null) config.outputDevice = "";
+        config.temperature = Math.max(0f, Math.min(1.5f, config.temperature));
         config.feminineModel = feminine;
         config.speechVolume = Math.max(0f, Math.min(1f, config.speechVolume));
         config.save(configFile);
@@ -2558,16 +2663,52 @@ public class CompanionSettingsScreen extends Screen {
     }
 
     @Override
+    public boolean isPauseScreen() { return false; }
+
+    // ---- rendering ----------------------------------------------------------------------------------------------
+
+    /** The panel is drawn as part of the background so the vanilla blur / darkening can never paint over it. */
+    @Override
+    public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        super.extractBackground(g, mouseX, mouseY, partialTick);
+        CompanionUi.panel(g, px, py, px + panelW, py + panelH);
+    }
+
+    @Override
     public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
-        this.extractMenuBackground(g);
-        super.extractRenderState(g, mouseX, mouseY, partialTick);
+        super.extractRenderState(g, mouseX, mouseY, partialTick);       // background + panel + widgets
+
         int cx = this.width / 2;
-        g.centeredText(this.font, this.title, cx, 10, 0xFFFFFFFF);
-        g.centeredText(this.font, "V = talk   R = wheel   O = settings", cx, 22, 0xFFA0A0A0);
-        g.fill(0, 32, this.width, 33, 0xFF000000);                       // header separator
-        g.fill(0, 33, this.width, 34, 0xFF373737);
-        g.fill(0, this.height - 33, this.width, this.height - 32, 0xFF000000);      // footer separator
-        g.fill(0, this.height - 32, this.width, this.height - 31, 0xFF373737);
+        centered(g, this.title.getString(), cx, py + 8, CompanionUi.TEXT_DARK);
+
+        switch (tab) {
+            case GENERAL -> centered(g, "V = talk   R = wheel   O = settings", cx, cy + 4 * ROW + 6, CompanionUi.TEXT_MUTED);
+            case AI -> {
+                text(g, "Server URL (Ollama or OpenAI-compatible)", ix, cy, CompanionUi.TEXT_DARK);
+                int sy = cy + 108;
+                if (modelsLoading) text(g, "Contacting server...", ix, sy, CompanionUi.TEXT_MUTED);
+                else if (modelsFailed) text(g, "Could not reach the server. Press the refresh button.", ix, sy, CompanionUi.TEXT_ERROR);
+                else text(g, modelNames.size() + " model(s) on the server", ix, sy, CompanionUi.TEXT_MUTED);
+            }
+            case MIC -> {
+                text(g, "Input level - speak to test", ix, cy + 27, CompanionUi.TEXT_DARK);
+                CompanionUi.levelBar(g, ix, cy + 40, iw, 10, meter.level(), meter.peak(), config.silenceGate);
+                String err = micError;
+                if (err != null && !err.isEmpty()) text(g, this.font.plainSubstrByWidth(err, iw), ix, cy + 55, CompanionUi.TEXT_ERROR);
+                else text(g, "Red mark = silence gate (quieter is ignored)", ix, cy + 55, CompanionUi.TEXT_MUTED);
+            }
+            case VOICE -> { }
+        }
+
+        dropdowns.extract(g, mouseX, mouseY);                           // open list goes on top of everything
+    }
+
+    private void text(GuiGraphicsExtractor g, String s, int x, int y, int color) {
+        g.text(this.font, s, x, y, color, false);
+    }
+
+    private void centered(GuiGraphicsExtractor g, String s, int cx, int y, int color) {
+        g.text(this.font, s, cx - this.font.width(s) / 2, y, color, false);
     }
 }
 ```
@@ -2887,181 +3028,58 @@ final class CompanionSubtitles {
 }
 ```
 
-## common\src\main\java\com\example\companionmod\client\CompanionVoiceScreen.java
+## common\src\main\java\com\example\companionmod\client\CompanionUi.java
 
 ```java
 package com.example.companionmod.client;
 
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
-import net.minecraft.client.gui.components.Button;
-import net.minecraft.client.gui.screens.Screen;
-import net.minecraft.network.chat.Component;
 
-import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
-import java.util.ArrayList;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Set;
-import java.util.function.Consumer;
+/** Drawing helpers for the vanilla-grey "Voice Chat mod" look: bevelled panel and the green-to-orange level bar. */
+final class CompanionUi {
+    static final int TEXT_DARK = 0xFF404040;   // title / labels on the grey panel
+    static final int TEXT_MUTED = 0xFF6B6B6B;
+    static final int TEXT_ERROR = 0xFFAA0000;
 
-/**
- * Voice picker for the selected TTS model. Detects which voices the Ollama server exposes for the chosen
- * speech model (GET /v1/audio/voices, falling back to the native GET /api/voices) and lists them as
- * clickable rows; clicking one assigns it to the Voice field. Voices are pre-fetched on a worker thread.
- */
-public final class CompanionVoiceScreen extends Screen {
-    private static final int ROW = 22;
-    private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
+    private CompanionUi() {}
 
-    private final String host;
-    private final String model;
-    private final Screen parent;
-    private final Consumer<String> picker;
-    private final List<String> voices;
-    private final String status;
-
-    private CompanionVoiceScreen(String host, String model, Screen parent, Consumer<String> picker,
-                                 List<String> voices, String status) {
-        super(Component.literal(voices.isEmpty() ? "Pick a Voice" : "Pick a Voice (" + voices.size() + ")"));
-        this.host = host;
-        this.model = model;
-        this.parent = parent;
-        this.picker = picker;
-        this.voices = voices;
-        this.status = status == null ? "" : status;
+    /** Light-grey bevelled container, like vanilla inventory screens and the Voice Chat settings. */
+    static void panel(GuiGraphicsExtractor g, int x0, int y0, int x1, int y1) {
+        g.fill(x0, y0, x1, y1, 0xFF000000);                         // outer border
+        g.fill(x0 + 1, y0 + 1, x1 - 1, y1 - 1, 0xFFC6C6C6);         // body
+        g.fill(x0 + 1, y0 + 1, x1 - 2, y0 + 3, 0xFFFFFFFF);         // top highlight
+        g.fill(x0 + 1, y0 + 1, x0 + 3, y1 - 2, 0xFFFFFFFF);         // left highlight
+        g.fill(x0 + 2, y1 - 3, x1 - 1, y1 - 1, 0xFF555555);         // bottom shadow
+        g.fill(x1 - 3, y0 + 2, x1 - 1, y1 - 1, 0xFF555555);         // right shadow
     }
 
-    /** Opens the picker. {@code model} is the selected speech model (blank = list every voice the server has). */
-    static void open(Minecraft mc, String host, String model, Screen parent, Consumer<String> picker) {
-        String url = (host == null || host.isBlank()) ? "http://127.0.0.1:11434" : host;
-        String m = model == null ? "" : model.trim();
-        new Thread(() -> {
-            List<String> fetched = fetch(url, m);
-            String st = fetched.isEmpty()
-                    ? "No voices answered at " + url + ". Is the speech model installed? (ollama pull "
-                        + (m.isBlank() ? "phonon" : m) + ")"
-                    : "";
-            mc.execute(() -> mc.setScreen(new CompanionVoiceScreen(url, m, parent, picker, fetched, st)));
-        }, "companionmod-voices").start();
-    }
-
-    private static List<String> fetch(String host, String model) {
-        List<String[]> all = new ArrayList<>();           // {voiceId, model}
-        collect(all, get(host + "/v1/audio/voices"), "data", "id");        // OpenAI-compatible
-        if (all.isEmpty()) collect(all, get(host + "/api/voices"), "voices", "name");   // Ollama native
-        if (model.isEmpty()) return ids(all);
-        List<String> matching = new ArrayList<>();
-        for (String[] v : all) {
-            if (matchesModel(v[1], model)) matching.add(v[0]);
+    /** Horizontal level bar. level/peak are 0..1; gate is the silence-threshold marker (0..1, or negative to hide). */
+    static void levelBar(GuiGraphicsExtractor g, int x, int y, int w, int h, float level, float peak, float gate) {
+        g.fill(x - 1, y - 1, x + w + 1, y + h + 1, 0xFF000000);
+        g.fill(x, y, x + w, y + h, 0xFF2B2B2B);
+        int lit = Math.round(Math.max(0f, Math.min(1f, level)) * w);
+        for (int i = 0; i < lit; i += 2) {                          // 2px columns: cheap horizontal gradient
+            g.fill(x + i, y, x + Math.min(i + 2, lit), y + h, gradient((i + 1f) / w));
         }
-        return matching.isEmpty() ? ids(all) : matching;   // filter unsure? show everything rather than nothing
-    }
-
-    /** Equal, or one is a tag-less prefix of the other ("phonon" vs "phonon:latest"). */
-    private static boolean matchesModel(String entryModel, String model) {
-        if (entryModel == null || entryModel.isBlank()) return true;
-        return entryModel.equals(model) || entryModel.startsWith(model) || model.startsWith(entryModel);
-    }
-
-    private static List<String> ids(List<String[]> all) {
-        List<String> out = new ArrayList<>();
-        for (String[] v : all) out.add(v[0]);
-        return out;
-    }
-
-    private static String get(String url) {
-        try {
-            HttpResponse<String> r = HTTP.send(HttpRequest.newBuilder(URI.create(url))
-                    .timeout(Duration.ofSeconds(5)).GET().build(), HttpResponse.BodyHandlers.ofString());
-            return r.statusCode() == 200 ? r.body() : null;
-        } catch (IOException | RuntimeException | InterruptedException e) {
-            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
-            return null;
+        int p = Math.round(Math.max(0f, Math.min(1f, peak)) * w);
+        if (p > 1) g.fill(x + p - 1, y, x + p, y + h, 0xFFFFFFFF);
+        if (gate >= 0f) {
+            int gx = x + Math.round(Math.min(1f, gate) * w);
+            g.fill(gx, y - 2, gx + 1, y + h + 2, 0xFFFF3030);        // threshold tick
         }
     }
 
-    /** Reads a JSON array of voice objects (top-level array, or nested under {@code arrayKey}). */
-    private static void collect(List<String[]> out, String body, String arrayKey, String idKey) {
-        if (body == null || body.isBlank()) return;
-        try {
-            JsonElement root = JsonParser.parseString(body);
-            JsonElement arr = root.isJsonArray() ? root : (root.isJsonObject() ? root.getAsJsonObject().get(arrayKey) : null);
-            if (arr == null || !arr.isJsonArray()) return;
-            for (JsonElement e : arr.getAsJsonArray()) {
-                if (!e.isJsonObject()) continue;
-                JsonObject v = e.getAsJsonObject();
-                String id = str(v, idKey);
-                if (id == null || id.isBlank()) continue;
-                out.add(new String[]{id, str(v, "model")});
-            }
-        } catch (RuntimeException ignored) { }
+    /** Green -> yellow -> orange. */
+    private static int gradient(float f) {
+        int r, gr;
+        if (f < 0.6f) { float t = f / 0.6f; r = lerp(0x20, 0xE8, t); gr = lerp(0xC8, 0xE0, t); }
+        else { float t = (f - 0.6f) / 0.4f; r = lerp(0xE8, 0xFF, t); gr = lerp(0xE0, 0x7A, t); }
+        return 0xFF000000 | (r << 16) | (gr << 8);
     }
 
-    private static String str(JsonObject o, String key) {
-        return o.has(key) && !o.get(key).isJsonNull() ? o.get(key).getAsString() : null;
+    private static int lerp(int a, int b, float t) {
+        return Math.round(a + (b - a) * Math.max(0f, Math.min(1f, t)));
     }
-
-    @Override
-    protected void init() {
-        super.init();
-        int cx = this.width / 2;
-        int y = 74;
-        int listW = 190, colGap = 14;
-        int cols = voices.size() > 12 ? 2 : 1;
-        int rows = (voices.size() + cols - 1) / cols;
-        int leftX = cx - (cols * listW + (cols - 1) * colGap) / 2;
-        for (int i = 0; i < voices.size(); i++) {
-            int c = i % cols, r = i / cols;
-            int bx = leftX + c * (listW + colGap);
-            int by = y + r * ROW;
-            if (by + ROW > this.height - 80) break;            // keep above the footer
-            final String voice = voices.get(i);
-            this.addRenderableWidget(Button.builder(Component.literal(voice), b -> {
-                picker.accept(voice);
-                if (this.minecraft != null) this.minecraft.setScreen(parent);
-            }).pos(bx, by).size(listW, 20).build());
-        }
-        y += Math.max(1, rows) * ROW;
-
-        if (voices.isEmpty()) {
-            this.addRenderableWidget(Button.builder(Component.literal("Retry"), b -> {
-                if (this.minecraft != null) CompanionVoiceScreen.open(this.minecraft, host, model, parent, picker);
-            }).pos(cx - 40, y).size(80, 20).build());
-            y += ROW;
-        }
-
-        this.addRenderableWidget(Button.builder(Component.literal("Back"), b -> onClose())
-                .pos(cx - 50, Math.max(y + 6, this.height - 30)).size(100, 20).build());
-    }
-
-    @Override
-    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
-        this.extractMenuBackground(g);
-        super.extractRenderState(g, mouseX, mouseY, partialTick);
-        int cx = this.width / 2;
-        g.centeredText(this.font, this.title, cx, 30, 0xFFFFFFFF);
-        if (!status.isBlank()) g.centeredText(this.font, status, cx, 44, 0xFFFF7777);
-        g.centeredText(this.font, model.isBlank() ? "All voices on the server" : "Voices for '" + model + "'",
-                cx, 56, 0xFF9AA6B2);
-        g.centeredText(this.font, "Click a voice to use it for spoken replies.", cx, this.height - 24, 0xFF666666);
-    }
-
-    @Override
-    public void onClose() {
-        if (this.minecraft != null) this.minecraft.setScreen(parent);
-    }
-
-    @Override
-    public boolean isPauseScreen() { return false; }
 }
 ```
 
@@ -8258,6 +8276,114 @@ public final class MicCapture {
     }
 
     public long elapsedMillis() { return running ? System.currentTimeMillis() - startedAt : 0; }
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\OllamaCatalog.java
+
+```java
+package com.example.companionmod.voice;
+
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Blocking lookups of the models and voices an Ollama / OpenAI-compatible server exposes.
+ * Replaces the fetch code that used to live inside CompanionModelScreen and CompanionVoiceScreen.
+ * Always call from a worker thread, never the render thread.
+ */
+public final class OllamaCatalog {
+    public static final String DEFAULT_HOST = "http://127.0.0.1:11434";
+    private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
+
+    private OllamaCatalog() {}
+
+    public static String normalize(String host) {
+        String h = host == null ? "" : host.trim();
+        if (h.isEmpty()) return DEFAULT_HOST;
+        if (!h.contains("://")) h = "http://" + h;
+        while (h.endsWith("/")) h = h.substring(0, h.length() - 1);
+        return h;
+    }
+
+    /** Installed model names (GET /api/tags). {@code null} = server unreachable; empty = reachable but no models. */
+    public static List<String> models(String host) {
+        String body = get(normalize(host) + "/api/tags");
+        if (body == null) return null;
+        List<String> out = new ArrayList<>();
+        try {
+            JsonElement arr = JsonParser.parseString(body).getAsJsonObject().get("models");
+            if (arr != null && arr.isJsonArray()) {
+                for (JsonElement e : arr.getAsJsonArray()) {
+                    String n = e.isJsonObject() ? str(e.getAsJsonObject(), "name") : null;
+                    if (n != null && !n.isBlank()) out.add(n);
+                }
+            }
+        } catch (RuntimeException ignored) { }
+        return out;
+    }
+
+    /** Voices for a speech model (GET /v1/audio/voices, then /api/voices). Blank model = every voice. Never null. */
+    public static List<String> voices(String host, String model) {
+        String h = normalize(host);
+        String m = model == null ? "" : model.trim();
+        List<String[]> all = new ArrayList<>();                                   // {voiceId, model}
+        collect(all, get(h + "/v1/audio/voices"), "data", "id");
+        if (all.isEmpty()) collect(all, get(h + "/api/voices"), "voices", "name");
+        List<String> matching = new ArrayList<>(), everything = new ArrayList<>();
+        for (String[] v : all) {
+            everything.add(v[0]);
+            if (m.isEmpty() || matchesModel(v[1], m)) matching.add(v[0]);
+        }
+        return matching.isEmpty() ? everything : matching;                        // unsure filter: show everything, not nothing
+    }
+
+    private static boolean matchesModel(String entryModel, String model) {
+        if (entryModel == null || entryModel.isBlank()) return true;
+        return entryModel.equals(model) || entryModel.startsWith(model) || model.startsWith(entryModel);
+    }
+
+    private static String get(String url) {
+        try {
+            HttpResponse<String> r = HTTP.send(HttpRequest.newBuilder(URI.create(url))
+                    .timeout(Duration.ofSeconds(5)).GET().build(), HttpResponse.BodyHandlers.ofString());
+            return r.statusCode() == 200 ? r.body() : null;
+        } catch (IOException | RuntimeException e) {
+            return null;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        }
+    }
+
+    private static void collect(List<String[]> out, String body, String arrayKey, String idKey) {
+        if (body == null || body.isBlank()) return;
+        try {
+            JsonElement root = JsonParser.parseString(body);
+            JsonElement arr = root.isJsonArray() ? root : (root.isJsonObject() ? root.getAsJsonObject().get(arrayKey) : null);
+            if (arr == null || !arr.isJsonArray()) return;
+            for (JsonElement e : arr.getAsJsonArray()) {
+                if (!e.isJsonObject()) continue;
+                JsonObject v = e.getAsJsonObject();
+                String id = str(v, idKey);
+                if (id != null && !id.isBlank()) out.add(new String[]{id, str(v, "model")});
+            }
+        } catch (RuntimeException ignored) { }
+    }
+
+    private static String str(JsonObject o, String key) {
+        return o.has(key) && !o.get(key).isJsonNull() ? o.get(key).getAsString() : null;
+    }
 }
 ```
 
