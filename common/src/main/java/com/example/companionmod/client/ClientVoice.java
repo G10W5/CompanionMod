@@ -193,6 +193,9 @@ public final class ClientVoice {
                     if (command == CompanionCommand.SEEK_BLOCK && mat == null) command = CompanionCommand.NONE;   // no material named: not a mine order
                 }
             }
+            // "dig up to the surface" must never become a blind mining order: the model loves to invent an ore
+            // target for it. Surface request with no material named -> the real SURFACE order (staircase up).
+            if (command == CompanionCommand.SEEK_BLOCK && surfaceRequest(r.heard())) command = CompanionCommand.SURFACE;
             if (!r.memory().isBlank()) CompanionMemory.remember(r.memory());
             if (command == CompanionCommand.REMEMBER)
                 CompanionMemory.remember(target.isBlank() ? r.say() : target);
@@ -228,6 +231,7 @@ public final class ClientVoice {
         if (words(s, "sit")) return CompanionCommand.SIT;
         if (words(s, "stay", "hold position", "wait here", "wait")) return CompanionCommand.STAY;
         if (words(s, "stand", "stand up", "get up")) return CompanionCommand.STAND;
+        if (words(s, "to the surface", "the surface", "surface", "daylight", "to the top", "reach the top")) return CompanionCommand.SURFACE;
         if (words(s, "come", "come here", "to me", "over here")) return CompanionCommand.COME;
         if (words(s, "attack", "kill", "fight", "hit", "smash", "destroy")) return CompanionCommand.ATTACK;
         if (words(s, "guard", "protect", "defend")) return CompanionCommand.GUARD;
@@ -239,6 +243,14 @@ public final class ClientVoice {
         if (words(s, "inventory", "bag")) return CompanionCommand.INVENTORY;
         if (words(s, "heal", "bandage")) return CompanionCommand.HEAL;
         return CompanionCommand.NONE;
+    }
+
+    /** True when the heard sentence asks for the surface/daylight and names no material ("dig up to the surface"). */
+    private static boolean surfaceRequest(String heard) {
+        if (heard == null || heard.isBlank()) return false;
+        String s = heard.toLowerCase(java.util.Locale.ROOT);
+        if (!(s.contains("surface") || s.contains("daylight"))) return false;
+        return heardMaterial(heard) == null;      // a named material ("dig up iron") stays a mining order
     }
 
     /** Whole-word match for any of the phrases (padded so "sit" never matches "situation"). */
@@ -295,6 +307,7 @@ public final class ClientVoice {
             case BUILD -> new String[]{"build", "construct", "place", "house", "wall", "tower", "bridge", "schematic"};
             case FARM -> new String[]{"farm", "harvest", "crops", "plant", "wheat", "carrot", "potato", "pumpkin", "melon"};
             case PLANT -> new String[]{"plant", "replant", "sapling", "saplings", "tree", "trees", "forest", "propagule"};
+            case SURFACE -> new String[]{"surface", "daylight", "to the surface", "dig up", "up to the top"};
             case PATROL -> new String[]{"patrol", "scout", "scouting", "lookout"};
             case HEAL -> new String[]{"heal", "healing", "health", "bandage"};
             case EQUIP -> new String[]{"equip", "wear", "switch", "pickaxe", "axe", "sword", "shovel", "hoe",

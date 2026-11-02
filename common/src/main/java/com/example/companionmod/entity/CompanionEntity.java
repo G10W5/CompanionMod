@@ -471,6 +471,13 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
                 setAnchor(blockPosition());
                 getNavigation().stop();
             }
+            case SURFACE -> {
+                clearSeekBlock();
+                mineTask.beginSurface(getDirection().get2DDataValue());
+                setAnchor(blockPosition());
+                getNavigation().stop();
+                speak("Digging up.");
+            }
             case FARM -> { farmUntil = level().getGameTime() + 600; setAnchor(blockPosition()); speak("Farming."); }
             case FISH -> { fishUntil = level().getGameTime() + 600; setAnchor(blockPosition()); speak("Going fishing."); }
             case BUILD -> {
@@ -1277,7 +1284,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             com.mojang.logging.LogUtils.getLogger().warn("[companionmod] mining task active but the seek goal is NOT selected (sitting? injured? target locked? paused?)");
         }
         String s = "";
-        if (mineTask.exists()) {
+        if (mineTask.phase == MineTask.Phase.ASCEND) s = "Digging up";
+        else if (mineTask.exists()) {
             String p = prettyBlockId(mineTask.blockId).replace(" ore", "");
             s = Character.toUpperCase(p.charAt(0)) + p.substring(1) + " " + mineTask.mined + "/" + mineTask.want;
             if (mineTask.paused) s += " || say 'continue'";

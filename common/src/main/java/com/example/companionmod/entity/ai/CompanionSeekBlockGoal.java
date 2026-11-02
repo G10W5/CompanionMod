@@ -81,6 +81,7 @@ public class CompanionSeekBlockGoal extends Goal {
     private int walkRetries;
     private int branchBoxed;         // consecutive fully-blocked branch steps: rotate the leg before ending it
     private long lastDiagLog;
+    private int lastTaskSerial;      // MineTask.serial at the last tick: a new order drops stale state same-tick
     private Vec3 lastHeartbeatPos = new Vec3(0, -10000, 0);   // movement-gated progress heartbeat
     private boolean selected;        // goal selector has us running (see selected())
 
@@ -138,6 +139,10 @@ public class CompanionSeekBlockGoal extends Goal {
         if (!(mob.level() instanceof ServerLevel level)) return;
         MineTask t = mob.mineTask();
         long now = level.getGameTime();
+        if (t.serial != lastTaskSerial) {          // a NEW order arrived while we were selected: drop stale walk/break/pillar state this tick
+            lastTaskSerial = t.serial;
+            resetTransient();
+        }
 
         long idle = now - lastProgress;
         if (idle > 200 && now - lastDiagLog > 200) {      // diagnostics FIRST: the watchdog branches below return early
@@ -252,7 +257,29 @@ public class CompanionSeekBlockGoal extends Goal {
                 }
             }
             case BRANCH -> branch(level, t);
+            case ASCEND -> ascend(level, t);
         }
+    }
+
+    /** "Dig up to the surface": staircase up until the terrain heightmap is at or below us, then done. */
+    private void ascend(ServerLevel level, MineTask t) {
+        if (atSurface(level)) {
+            t.finish();
+            mob.speak("I'm up.");
+            resetTransient();                       // the follow goal walks the companion back, no warp
+            return;
+        }
+        if (!planStep(level, t, Direction.from2DDataValue(t.dirData), 1, true)) {
+            t.dirData = Direction.from2DDataValue(t.dirData).getClockWise().get2DDataValue();
+            if (++stuck >= 4) { t.pause(); say(level, "I can't dig up safely here. Move me and say 'continue'.", true); }
+        }
+    }
+
+    /** At the terrain surface: the no-leaves heightmap at our feet is at or below us, or the sky is visible. */
+    private boolean atSurface(ServerLevel level) {
+        BlockPos p = mob.blockPosition();
+        int surf = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, p.getX(), p.getZ());
+        return p.getY() >= surf - 1 || level.canSeeSky(p.above());
     }
 
     private void branch(ServerLevel level, MineTask t) {

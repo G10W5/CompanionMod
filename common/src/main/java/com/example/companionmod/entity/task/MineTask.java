@@ -9,13 +9,19 @@ import net.minecraft.world.level.storage.ValueOutput;
  * stopping and restarting the goal never loses anything. A new order pauses the task, "continue" resumes it.
  */
 public final class MineTask {
-    public enum Phase { SEARCH, DESCEND, BRANCH }
+    public enum Phase { SEARCH, DESCEND, BRANCH, ASCEND }
     public static final int NO_DESCEND = Integer.MIN_VALUE;
 
     public String blockId = "";
     public int want, mined, ty = NO_DESCEND, dirData, leg, legLen;
     public Phase phase = Phase.SEARCH;
     public boolean paused;
+    /**
+     * Bumped by every begin()/beginSurface(): the seek goal compares it each tick and drops its stale transient
+     * state (walk, break, pillar) the same tick a new order arrives - without it the goal kept finishing the
+     * previous task's walk for up to 8 s after a new order, which looked like a freeze. Transient on purpose.
+     */
+    public int serial;
 
     public void begin(String id, boolean nether, int facingDirData) {
         blockId = id;
@@ -27,14 +33,29 @@ public final class MineTask {
         leg = 0;
         legLen = 0;
         paused = false;
+        serial++;
     }
 
-    public boolean exists() { return !blockId.isEmpty(); }
+    /** "Dig up to the surface": a staircase job with no block id, finished by reaching daylight. */
+    public void beginSurface(int facingDirData) {
+        blockId = "";
+        want = 1;
+        mined = 0;
+        ty = NO_DESCEND;
+        phase = Phase.ASCEND;
+        dirData = facingDirData;
+        leg = 0;
+        legLen = 0;
+        paused = false;
+        serial++;
+    }
+
+    public boolean exists() { return !blockId.isEmpty() || phase == Phase.ASCEND; }
     public boolean running() { return exists() && !paused; }
     public boolean deep() { return ty != NO_DESCEND; }
     public void pause() { paused = true; }
     public boolean resume() { if (!exists()) return false; paused = false; return true; }
-    public void finish() { blockId = ""; paused = false; mined = 0; }
+    public void finish() { blockId = ""; paused = false; mined = 0; phase = Phase.SEARCH; }
     public String describe() { return "mining " + blockId.replace('_', ' ') + " (" + mined + "/" + want + ")"; }
 
     /** Best Y level to branch-mine for. NO_DESCEND = surface target (logs, stone, emeralds...). Tweak freely. */

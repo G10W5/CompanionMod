@@ -131,7 +131,8 @@ public final class CompanionRadialScreen extends Screen {
                 order("Come", "Teleport to me", "come", Items.ENDER_PEARL),
                 order("Patrol", "Walk a patrol ring", "patrol", Items.SPYGLASS),
                 order("Wander", "Roam nearby", "wander", Items.OAK_SAPLING),
-                order("Explore", "Explore the area", "explore", Items.MAP))));
+                order("Explore", "Explore the area", "explore", Items.MAP),
+                order("Dig Up", "Staircase to the surface", "surface", Items.LADDER))));
         e.add(sub("Behavior", "How to fight", Items.DIAMOND_SWORD, List.of(
                 order("Aggressive", "Attack nearby hostiles", "guard", Items.DIAMOND_SWORD),
                 order("Defensive", "Only fight back", "defensive", Items.SHIELD),

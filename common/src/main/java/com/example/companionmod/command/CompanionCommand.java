@@ -10,7 +10,7 @@ public enum CompanionCommand {
     GIVE, TAKE, DROP, PICKUP, OPEN, CLOSE, CRAFT, SMELT, BREW, ENCHANT,
     FISH, COOK, FIGHT, FLEE, HIDE, SEEK, FIND, SEARCH, TRACK, HUNT,
     SEEK_BLOCK, SET_NAME, REVIVE, PLAN,
-    REMEMBER, FORGET, SET_SKIN, FEMININE, MASCULINE, PLANT;
+    REMEMBER, FORGET, SET_SKIN, FEMININE, MASCULINE, PLANT, SURFACE;
 
     /** False for appearance/UI/memory/revive packets: they are not a new gameplay intent and must not pause or cancel a plan. */
     public boolean interruptsPlanning() {
@@ -44,6 +44,7 @@ public enum CompanionCommand {
             case "build": case "construct": case "place": case "build_structure": return BUILD;
             case "farm": case "farming": case "harvest_crops": return FARM;
             case "plant": case "replant": case "plant_sapling": case "plant_saplings": case "plant_trees": case "reforest": return PLANT;
+            case "surface": case "dig_up": case "come_up": case "to_the_surface": case "reach_the_surface": case "daylight": return SURFACE;
             case "patrol": case "scout": case "scouting": case "lookout": return PATROL;
             case "heal": case "healing": case "rest_heal": return HEAL;
             case "equip": case "equipment": case "gear": case "armor": return EQUIP;
