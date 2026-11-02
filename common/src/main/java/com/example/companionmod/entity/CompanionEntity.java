@@ -1194,6 +1194,11 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     @Override
     public void tick() {
         super.tick();
+        // 26.1-CHECK: vanilla only advances the swing clock from Player.tick - LivingEntity.updateSwingTime has
+        // no mob caller - so a mob's attackAnim stays 0 and HumanoidModel.setupAttackAnimation early-returns
+        // (if attackTime <= 0): every swing() we broadcast arrived, but nothing ever played it. Players advance
+        // the clock every tick; do the same here, BEFORE the client early-out (the client is what renders it).
+        updateSwingTime();
         if (level().isClientSide()) return;
         if (!registryChecked) {
             registryChecked = true;

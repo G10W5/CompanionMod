@@ -267,6 +267,9 @@ public final class ClientVoice {
                     if (command == CompanionCommand.SEEK_BLOCK && mat == null) command = CompanionCommand.NONE;   // no material named: not a mine order
                 }
             }
+            // "dig up to the surface" must never become a blind mining order: the model loves to invent an ore
+            // target for it. Surface request with no material named -> the real SURFACE order (staircase up).
+            if (command == CompanionCommand.SEEK_BLOCK && surfaceRequest(r.heard())) command = CompanionCommand.SURFACE;
             if (!r.memory().isBlank()) CompanionMemory.remember(r.memory());
             if (command == CompanionCommand.REMEMBER)
                 CompanionMemory.remember(target.isBlank() ? r.say() : target);
@@ -302,6 +305,7 @@ public final class ClientVoice {
         if (words(s, "sit")) return CompanionCommand.SIT;
         if (words(s, "stay", "hold position", "wait here", "wait")) return CompanionCommand.STAY;
         if (words(s, "stand", "stand up", "get up")) return CompanionCommand.STAND;
+        if (words(s, "to the surface", "the surface", "surface", "daylight", "to the top", "reach the top")) return CompanionCommand.SURFACE;
         if (words(s, "come", "come here", "to me", "over here")) return CompanionCommand.COME;
         if (words(s, "attack", "kill", "fight", "hit", "smash", "destroy")) return CompanionCommand.ATTACK;
         if (words(s, "guard", "protect", "defend")) return CompanionCommand.GUARD;
@@ -313,6 +317,14 @@ public final class ClientVoice {
         if (words(s, "inventory", "bag")) return CompanionCommand.INVENTORY;
         if (words(s, "heal", "bandage")) return CompanionCommand.HEAL;
         return CompanionCommand.NONE;
+    }
+
+    /** True when the heard sentence asks for the surface/daylight and names no material ("dig up to the surface"). */
+    private static boolean surfaceRequest(String heard) {
+        if (heard == null || heard.isBlank()) return false;
+        String s = heard.toLowerCase(java.util.Locale.ROOT);
+        if (!(s.contains("surface") || s.contains("daylight"))) return false;
+        return heardMaterial(heard) == null;      // a named material ("dig up iron") stays a mining order
     }
 
     /** Whole-word match for any of the phrases (padded so "sit" never matches "situation"). */
@@ -369,6 +381,7 @@ public final class ClientVoice {
             case BUILD -> new String[]{"build", "construct", "place", "house", "wall", "tower", "bridge", "schematic"};
             case FARM -> new String[]{"farm", "harvest", "crops", "plant", "wheat", "carrot", "potato", "pumpkin", "melon"};
             case PLANT -> new String[]{"plant", "replant", "sapling", "saplings", "tree", "trees", "forest", "propagule"};
+            case SURFACE -> new String[]{"surface", "daylight", "to the surface", "dig up", "up to the top"};
             case PATROL -> new String[]{"patrol", "scout", "scouting", "lookout"};
             case HEAL -> new String[]{"heal", "healing", "health", "bandage"};
             case EQUIP -> new String[]{"equip", "wear", "switch", "pickaxe", "axe", "sword", "shovel", "hoe",
@@ -1900,7 +1913,8 @@ public final class CompanionRadialScreen extends Screen {
                 order("Come", "Teleport to me", "come", Items.ENDER_PEARL),
                 order("Patrol", "Walk a patrol ring", "patrol", Items.SPYGLASS),
                 order("Wander", "Roam nearby", "wander", Items.OAK_SAPLING),
-                order("Explore", "Explore the area", "explore", Items.MAP))));
+                order("Explore", "Explore the area", "explore", Items.MAP),
+                order("Dig Up", "Staircase to the surface", "surface", Items.LADDER))));
         e.add(sub("Behavior", "How to fight", Items.DIAMOND_SWORD, List.of(
                 order("Aggressive", "Attack nearby hostiles", "guard", Items.DIAMOND_SWORD),
                 order("Defensive", "Only fight back", "defensive", Items.SHIELD),
@@ -3589,7 +3603,7 @@ public enum CompanionCommand {
     GIVE, TAKE, DROP, PICKUP, OPEN, CLOSE, CRAFT, SMELT, BREW, ENCHANT,
     FISH, COOK, FIGHT, FLEE, HIDE, SEEK, FIND, SEARCH, TRACK, HUNT,
     SEEK_BLOCK, SET_NAME, REVIVE, PLAN,
-    REMEMBER, FORGET, SET_SKIN, FEMININE, MASCULINE, PLANT;
+    REMEMBER, FORGET, SET_SKIN, FEMININE, MASCULINE, PLANT, SURFACE;
 
     /** False for appearance/UI/memory/revive packets: they are not a new gameplay intent and must not pause or cancel a plan. */
     public boolean interruptsPlanning() {
@@ -3623,6 +3637,7 @@ public enum CompanionCommand {
             case "build": case "construct": case "place": case "build_structure": return BUILD;
             case "farm": case "farming": case "harvest_crops": return FARM;
             case "plant": case "replant": case "plant_sapling": case "plant_saplings": case "plant_trees": case "reforest": return PLANT;
+            case "surface": case "dig_up": case "come_up": case "to_the_surface": case "reach_the_surface": case "daylight": return SURFACE;
             case "patrol": case "scout": case "scouting": case "lookout": return PATROL;
             case "heal": case "healing": case "rest_heal": return HEAL;
             case "equip": case "equipment": case "gear": case "armor": return EQUIP;
@@ -4630,15 +4645,24 @@ public class CompanionSeekBlockGoal extends Goal {
     private static final org.slf4j.Logger LOG = LogUtils.getLogger();
     private static final double REACH_SQ = 4.5 * 4.5;
     private static final int LEG_LEN = 36, SIDE_LEN = 3, MAX_LEGS = 8;
-    private static final int WALK_STAND = 0, WALK_REACH = 1, WALK_FREE = 2;
+    private static final int WALK_STAND = 0, WALK_REACH = 1, WALK_FREE = 2, WALK_EXPLORE = 3;
+    private static final int MAX_EXPLORE_LEGS = 30, SIGHT_RADIUS = 56, SIGHT_MIN = 16;
 
     private final CompanionEntity mob;
     private final Deque<BlockPos> pending = new ArrayDeque<>();   // cells to clear before the next step
     private final Deque<BlockPos> vein = new ArrayDeque<>();
     private final Set<BlockPos> unreachable = new HashSet<>();
     private BlockPos breaking, walkTo, oreTarget, stepStand;
-    private int walkMode, breakProgress, breakNeed, walkTicks, scanCooldown, stuck, wanderTries, torchCooldown;
+    private int walkMode, breakProgress, breakNeed, walkTicks, stuck, wanderTries, torchCooldown;
     private long lastProgress, lastSpeak;
+
+    // --- surface search: time-based rescans, long-range heightmap "sight", exploration memory
+    private long nextScanAt, nextSightAt, nextExploreAt, lastUnreachableClear;
+    private final Deque<BlockPos> explored = new ArrayDeque<>();   // where we already looked (explore memory)
+
+    // cache: does Block X match the current task? (replaces a registry lookup + string compare per scanned block)
+    private static final Map<Block, Boolean> MATCH_CACHE = new HashMap<>();
+    private static String matchCacheId = "";
 
     // --- scaffolding: climb with blocks from the bag, take them back afterwards; plus per-target bookkeeping
     private static final int MAX_SCAFFOLD = 24;
@@ -4651,6 +4675,7 @@ public class CompanionSeekBlockGoal extends Goal {
     private int walkRetries;
     private int branchBoxed;         // consecutive fully-blocked branch steps: rotate the leg before ending it
     private long lastDiagLog;
+    private int lastTaskSerial;      // MineTask.serial at the last tick: a new order drops stale state same-tick
     private Vec3 lastHeartbeatPos = new Vec3(0, -10000, 0);   // movement-gated progress heartbeat
     private boolean selected;        // goal selector has us running (see selected())
 
@@ -4691,7 +4716,9 @@ public class CompanionSeekBlockGoal extends Goal {
         pending.clear();
         vein.clear();
         breaking = walkTo = oreTarget = stepStand = null;
-        breakProgress = walkTicks = scanCooldown = stuck = wanderTries = 0;
+        breakProgress = walkTicks = stuck = wanderTries = 0;
+        nextScanAt = nextSightAt = nextExploreAt = 0;
+        explored.clear();
         approachTries.clear();
         approachTarget = pillarTarget = jumpCell = bridgeCell = null;
         pillarAir = 0;
@@ -4706,6 +4733,10 @@ public class CompanionSeekBlockGoal extends Goal {
         if (!(mob.level() instanceof ServerLevel level)) return;
         MineTask t = mob.mineTask();
         long now = level.getGameTime();
+        if (t.serial != lastTaskSerial) {          // a NEW order arrived while we were selected: drop stale walk/break/pillar state this tick
+            lastTaskSerial = t.serial;
+            resetTransient();
+        }
 
         long idle = now - lastProgress;
         if (idle > 200 && now - lastDiagLog > 200) {      // diagnostics FIRST: the watchdog branches below return early
@@ -4720,6 +4751,7 @@ public class CompanionSeekBlockGoal extends Goal {
             if (approachTarget != null) giveUp(approachTarget);
             pending.clear();
             stepStand = walkTo = null;
+            nextScanAt = 0;                // re-decide from scratch: rescan immediately
             endPillar();
             bridgeCell = null;
             mob.getNavigation().stop();      // else it keeps steering the old route while we re-decide
@@ -4740,7 +4772,7 @@ public class CompanionSeekBlockGoal extends Goal {
             t.dirData = Direction.from2DDataValue(t.dirData).getClockWise().get2DDataValue();
             return;
         }
-        if (now % 600 == 0) unreachable.clear();       // "unreachable" marks are retried every 30 s: never a permanent blacklist
+        if (now - lastUnreachableClear >= 600) { lastUnreachableClear = now; unreachable.clear(); }   // "unreachable" marks are retried every 30 s: never a permanent blacklist
         // Underground it gets dark: drop a torch from the bag every so often so the tunnels stay lit.
         if (t.phase != MineTask.Phase.SEARCH && --torchCooldown <= 0) {
             torchCooldown = 60;
@@ -4785,12 +4817,13 @@ public class CompanionSeekBlockGoal extends Goal {
         while (!vein.isEmpty() && !matches(t, level.getBlockState(vein.peek()))) vein.poll();
         if (!vein.isEmpty()) { approach(level, t, vein.peek()); return; }
 
-        if (--scanCooldown <= 0) {
-            scanCooldown = 12;
+        long now = level.getGameTime();
+        if (oreTarget != null && !matches(t, level.getBlockState(oreTarget))) { oreTarget = null; nextScanAt = 0; }
+        if (oreTarget == null && now >= nextScanAt) {        // time based, and reset after every break/arrival
+            nextScanAt = now + 10;
             oreTarget = scan(level, t);
             if (oreTarget != null) wanderTries = 0;
         }
-        if (oreTarget != null && !matches(t, level.getBlockState(oreTarget))) oreTarget = null;
         if (oreTarget != null) { approach(level, t, oreTarget); return; }
 
         if (cleanupScaffold(level)) return;         // nothing left to mine from up here: climb down, take our blocks back
@@ -4803,7 +4836,7 @@ public class CompanionSeekBlockGoal extends Goal {
                     say(level, "Nothing on the surface. Heading down to y=" + t.ty + ".", true);
                 } else if (t.deep()) {
                     t.phase = MineTask.Phase.BRANCH;
-                } else wanderSearch(level, t);
+                } else searchSurface(level, t);
             }
             case DESCEND -> {
                 if (y <= t.ty || y <= level.getMinY() + 6) {            // 26.1-CHECK: LevelReader.getMinY()
@@ -4818,7 +4851,29 @@ public class CompanionSeekBlockGoal extends Goal {
                 }
             }
             case BRANCH -> branch(level, t);
+            case ASCEND -> ascend(level, t);
         }
+    }
+
+    /** "Dig up to the surface": staircase up until the terrain heightmap is at or below us, then done. */
+    private void ascend(ServerLevel level, MineTask t) {
+        if (atSurface(level)) {
+            t.finish();
+            mob.speak("I'm up.");
+            resetTransient();                       // the follow goal walks the companion back, no warp
+            return;
+        }
+        if (!planStep(level, t, Direction.from2DDataValue(t.dirData), 1, true)) {
+            t.dirData = Direction.from2DDataValue(t.dirData).getClockWise().get2DDataValue();
+            if (++stuck >= 4) { t.pause(); say(level, "I can't dig up safely here. Move me and say 'continue'.", true); }
+        }
+    }
+
+    /** At the terrain surface: the no-leaves heightmap at our feet is at or below us, or the sky is visible. */
+    private boolean atSurface(ServerLevel level) {
+        BlockPos p = mob.blockPosition();
+        int surf = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, p.getX(), p.getZ());
+        return p.getY() >= surf - 1 || level.canSeeSky(p.above());
     }
 
     private void branch(ServerLevel level, MineTask t) {
@@ -4869,24 +4924,97 @@ public class CompanionSeekBlockGoal extends Goal {
         t.legLen = len;                                                 // truly boxed in: end this leg early
     }
 
-    private void wanderSearch(ServerLevel level, MineTask t) {
-        if (wanderTries == 3) unreachable.clear();   // new vantage point: give previously unreachable blocks another chance
-        if (++wanderTries > 10) {
+    /** Surface search: first look far with the heightmap (trees show up as log columns), else explore somewhere new. */
+    private void searchSurface(ServerLevel level, MineTask t) {
+        long now = level.getGameTime();
+        if (now >= nextSightAt) {
+            nextSightAt = now + 40;
+            BlockPos seen = farSight(level, t);
+            if (seen != null) {
+                BlockPos me = mob.blockPosition();
+                BlockPos foot = groundBelow(level, t, seen).above();
+                double dx = foot.getX() - me.getX(), dz = foot.getZ() - me.getZ();
+                double hd = Math.sqrt(dx * dx + dz * dz);
+                BlockPos wp = foot;
+                if (hd > 24) {   // the pathfinder is limited by follow range: go in hops, the near scan takes over on arrival
+                    int wx = me.getX() + (int) (dx / hd * 24), wz = me.getZ() + (int) (dz / hd * 24);
+                    if (level.hasChunk(wx >> 4, wz >> 4)) {
+                        wp = new BlockPos(wx, level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, wx, wz), wz);
+                    }
+                }
+                Path p = mob.getNavigation().createPath(wp, 2);
+                if (p != null && p.canReach()) { startExplore(wp, p); return; }
+                unreachable.add(seen.immutable());   // cannot walk there (water, cliff): look at the next candidate next time
+            }
+        }
+        exploreSomewhereNew(level, t);
+    }
+
+    /** Nearest matching block at the top of a loaded column (trees are the highest non-leaf block of their column). */
+    private BlockPos farSight(ServerLevel level, MineTask t) {
+        BlockPos o = mob.blockPosition();
+        BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
+        BlockPos best = null;
+        double bestD = Double.MAX_VALUE, minSq = SIGHT_MIN * SIGHT_MIN;
+        for (int x = o.getX() - SIGHT_RADIUS; x <= o.getX() + SIGHT_RADIUS; x++) {
+            for (int z = o.getZ() - SIGHT_RADIUS; z <= o.getZ() + SIGHT_RADIUS; z++) {
+                double d = (double) (x - o.getX()) * (x - o.getX()) + (double) (z - o.getZ()) * (z - o.getZ());
+                if (d < minSq || d >= bestD) continue;
+                if (!level.hasChunk(x >> 4, z >> 4)) continue;          // never force-load chunks // 26.1-CHECK: LevelReader.hasChunk(int,int)
+                int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z) - 1;
+                m.set(x, y, z);
+                if (!matches(t, level.getBlockState(m)) || unreachable.contains(m)) continue;
+                bestD = d;
+                best = m.immutable();
+            }
+        }
+        return best;
+    }
+
+    private void exploreSomewhereNew(ServerLevel level, MineTask t) {
+        long now = level.getGameTime();
+        if (now < nextExploreAt) return;
+        if (wanderTries == 4) unreachable.clear();               // new vantage point: retry old "unreachable" marks
+        if (++wanderTries > MAX_EXPLORE_LEGS) {
             t.pause();
             say(level, "I can't find any " + CompanionEntity.prettyBlockId(t.blockId) + " around here.", true);
             return;
         }
         BlockPos me = mob.blockPosition();
-        int x = me.getX() + mob.getRandom().nextIntBetweenInclusive(-18, 18);
-        int z = me.getZ() + mob.getRandom().nextIntBetweenInclusive(-18, 18);
-        BlockPos dest = new BlockPos(x, level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z), z);
-        Path p = mob.getNavigation().createPath(dest, 1);
-        if (p != null && p.canReach()) {
-            walkTo = dest;
-            walkMode = WALK_FREE;
-            walkTicks = 0;
-            mob.getNavigation().moveTo(p, 1.0);
+        remember(me);
+
+        record Cand(BlockPos pos, double score) { }
+        List<Cand> cands = new ArrayList<>();
+        for (int i = 0; i < 14; i++) {
+            double ang = mob.getRandom().nextDouble() * Math.PI * 2;
+            double dist = 20 + mob.getRandom().nextDouble() * 16 + Math.min(wanderTries, 10);
+            int x = me.getX() + (int) (Math.cos(ang) * dist), z = me.getZ() + (int) (Math.sin(ang) * dist);
+            if (!level.hasChunk(x >> 4, z >> 4)) continue;
+            BlockPos dest = new BlockPos(x, level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z), z);
+            if (!level.getFluidState(dest).isEmpty() || !level.getFluidState(dest.below()).isEmpty()) continue;   // no lakes / lava
+            double nearest = 48;
+            for (BlockPos e : explored) nearest = Math.min(nearest, Math.sqrt(e.distSqr(dest)));
+            cands.add(new Cand(dest, nearest + mob.getRandom().nextDouble() * 6));   // prefer spots far from everywhere we looked
         }
+        cands.sort((a, b) -> Double.compare(b.score(), a.score()));
+        for (int i = 0; i < Math.min(4, cands.size()); i++) {
+            Path p = mob.getNavigation().createPath(cands.get(i).pos(), 2);
+            if (p != null && p.canReach()) { startExplore(cands.get(i).pos(), p); return; }
+        }
+        nextExploreAt = now + 20;                                  // nothing reachable this time: pause a second, retry
+    }
+
+    private void startExplore(BlockPos dest, Path p) {
+        remember(dest);
+        walkTo = dest;
+        walkMode = WALK_EXPLORE;
+        walkTicks = 0;
+        mob.getNavigation().moveTo(p, 1.0);
+    }
+
+    private void remember(BlockPos p) {
+        explored.addLast(p.immutable());
+        while (explored.size() > 24) explored.pollFirst();
     }
 
     // ------------------------------------------------------------------ approaching and tunnelling
@@ -4898,7 +5026,7 @@ public class CompanionSeekBlockGoal extends Goal {
             // Close enough but something is in the way (stone, leaves...): dig it out the way a player would.
             BlockPos blocker = firstBlocker(level, target);
             if (blocker == null) { startBreak(level, target); return; }
-            if (approachTries.merge(target.immutable(), 1, Integer::sum) <= 8 && safeToBreak(level, blocker)) {
+            if (approachTries.merge(target.immutable(), 1, Integer::sum) <= 12 && safeToBreak(level, blocker)) {   // big canopies can have several leaf layers in front of a log
                 pending.add(blocker);
             } else {
                 giveUp(target);
@@ -5115,6 +5243,10 @@ public class CompanionSeekBlockGoal extends Goal {
     private void tunnelToward(ServerLevel level, MineTask t, BlockPos target) {
         BlockPos me = mob.blockPosition();
         int dx = target.getX() - me.getX(), dy = target.getY() - me.getY(), dz = target.getZ() - me.getZ();
+        if (!t.deep() && dy >= 2) {          // surface job, target high above (top of a tall trunk): pillar or skip, never dig stairs into the ground
+            if (!tryScaffold(level, t, target)) giveUp(target);
+            return;
+        }
         Direction d;
         if (dx == 0 && dz == 0) d = Direction.from2DDataValue(t.dirData);
         else if (Math.abs(dx) >= Math.abs(dz)) d = dx > 0 ? Direction.EAST : Direction.WEST;
@@ -5223,6 +5355,7 @@ public class CompanionSeekBlockGoal extends Goal {
         level.destroyBlockProgress(mob.getId(), pos, -1);
         level.destroyBlock(pos, true, mob, 512);
         breaking = null;
+        nextScanAt = 0;      // always look for the next block immediately: this is what stops the "wander after the first tree" bug
         lastProgress = now;
         stuck = 0;
         mob.collectNearbyItems();
@@ -5253,36 +5386,48 @@ public class CompanionSeekBlockGoal extends Goal {
         BlockPos w = walkTo;
         boolean arrived = switch (walkMode) {
             case WALK_REACH -> inReach(Vec3.atCenterOf(w));     // line of sight is handled by approach(): it digs the blocker out
-            case WALK_FREE -> mob.distanceToSqr(Vec3.atCenterOf(w)) < 4.0;
+            case WALK_FREE, WALK_EXPLORE -> mob.distanceToSqr(Vec3.atCenterOf(w)) < 4.0;
             // Must be standing IN the cell: the old 1.2 vertical tolerance let a mob pushing the wall BELOW a
             // 1-block step-up count as "arrived" (dy=1.0) without ever mounting it -> infinite plan-walk loop.
             default -> Math.abs(mob.getX() - (w.getX() + 0.5)) < 0.7 && Math.abs(mob.getZ() - (w.getZ() + 0.5)) < 0.7
                     && Math.abs(mob.getY() - w.getY()) < 0.5;
         };
-        if (arrived) { walkTo = null; lastProgress = now; mob.getNavigation().stop(); return; }
+        if (arrived) { walkTo = null; nextScanAt = 0; lastProgress = now; mob.getNavigation().stop(); return; }
         PathNavigation nav = mob.getNavigation();
-        if (walkMode == WALK_STAND) {
-            // A tunnel / stair step is one block. Staged fallback, villager-style:
-            // 1) let the vanilla pathfinder walk it (it steps up single blocks by itself) for ~1.2 s;
-            // 2) no path / not arriving (tight tunnel, mid-air request, corner): take over with direct move
-            //    control + jump - the move control alone cannot climb a 1-block step;
-            // 3) truly jammed after ~3 s (entity in the way): teleport, the last resort so a tunnel never deadlocks.
-            if (walkTicks <= 25) {
-                if (walkTicks % 20 == 1) nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
-            } else {
-                nav.stop();
-                mob.getMoveControl().setWantedPosition(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
-                mob.getLookControl().setLookAt(w.getX() + 0.5, w.getY() + 1.0, w.getZ() + 0.5);
-                if (w.getY() > mob.blockPosition().getY() && mob.onGround() && walkTicks % 4 == 0) {
-                    mob.getJumpControl().jump();
-                }
-                if (walkTicks > 60) {
-                    mob.setPos(w.getX() + 0.5, w.getY(), w.getZ() + 0.5);
-                    mob.resetFallDistance();
-                    lastProgress = now;
+        if (walkMode == WALK_EXPLORE) {
+            // Look around while walking: the moment something matching is in sight, stop exploring and go for it.
+            if (walkTicks % 10 == 0) {
+                BlockPos found = scan(level, mob.mineTask());
+                if (found != null) {
+                    oreTarget = found;
+                    wanderTries = 0;
                     walkTo = null;
+                    nav.stop();
+                    lastProgress = now;
+                    return;
                 }
             }
+            if ((walkTicks > 10 && nav.isDone()) || walkTicks > 400) {   // end of path (even a partial one) = this leg is done
+                walkTo = null;
+                nextScanAt = 0;
+            }
+            return;
+        }
+        if (walkMode == WALK_STAND) {
+            // OG tunnel-step behaviour (restored): the pathfinder walks the 1-block step, re-issued every 20
+            // ticks; if the path is done/failed but we are not there yet (a step-up the pathfinder cannot
+            // model, a tight corner), teleport as the last resort so a tunnel step never deadlocks. The staged
+            // pathfinder -> move-control+jump -> teleport ladder circled on step-ups instead of advancing.
+            if (walkTicks > 80 || (walkTicks > 5 && nav.isDone())) {
+                mob.setPos(w.getX() + 0.5, w.getY(), w.getZ() + 0.5);
+                mob.resetFallDistance();
+                nav.stop();
+                lastProgress = now;
+                nextScanAt = 0;
+                walkTo = null;
+                return;
+            }
+            if (walkTicks % 20 == 0) nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
             return;
         }
         // Long walks use the pathfinder: re-request the path when it finished early or could not be made (airborne).
@@ -5298,6 +5443,7 @@ public class CompanionSeekBlockGoal extends Goal {
                 walkTicks, walkMode, walkTo, mob.blockPosition(), mob.onGround());
         if (walkMode == WALK_REACH && approachTarget != null) giveUp(approachTarget);
         walkTo = null;
+        nextScanAt = 0;
     }
 
     /** Block reach is measured from the eyes (like a player), not from the feet: 1.6 blocks more upward reach. */
@@ -5341,24 +5487,31 @@ public class CompanionSeekBlockGoal extends Goal {
     /**
      * Nearest match a player could actually see. Exposed blocks (air on at least one face) are preferred, but
      * the bonus is capped at ~12 blocks of distance so a seeable ore far away never hijacks the job from buried
-     * ore right next to the companion (that made it walk off across caves after the first vein was cleared).
-     * Buried blocks only count when close, and the crown height penalty keeps high-up blocks from stealing
-     * the target.
+     * ore right next to the companion. Buried blocks only count when close, and the crown height penalty keeps
+     * high-up blocks from stealing the target. Columns outside loaded chunks are skipped, never force-loaded.
      */
     private BlockPos scan(ServerLevel level, MineTask t) {
         int r = t.phase == MineTask.Phase.SEARCH ? 22 : 10;
+        int down = Math.min(r, 12), up = Math.min(r, 8);
         BlockPos o = mob.blockPosition();
+        BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
         BlockPos best = null;
         double bestD = Double.MAX_VALUE;
-        for (BlockPos p : BlockPos.betweenClosed(o.offset(-r, -Math.min(r, 12), -r), o.offset(r, Math.min(r, 8), r))) {
-            if (!matches(t, level.getBlockState(p)) || unreachable.contains(p)) continue;
-            double d = mob.distanceToSqr(Vec3.atCenterOf(p));
-            boolean exp = exposed(level, p);
-            if (d > 9.0 && !exp) continue;                              // buried blocks only count when close
-            double score = d + Math.max(0, p.getY() - (o.getY() + 2)) * 6.0 - (exp ? Math.min(12.0, d) : 0);
-            if (score >= bestD) continue;
-            bestD = score;
-            best = p.immutable();
+        for (int x = o.getX() - r; x <= o.getX() + r; x++) {
+            for (int z = o.getZ() - r; z <= o.getZ() + r; z++) {
+                if (!level.hasChunk(x >> 4, z >> 4)) continue;         // never force-load/generate chunks from a scan
+                for (int y = o.getY() - down; y <= o.getY() + up; y++) {
+                    m.set(x, y, z);
+                    if (!matches(t, level.getBlockState(m)) || unreachable.contains(m)) continue;
+                    double d = mob.distanceToSqr(x + 0.5, y + 0.5, z + 0.5);
+                    boolean exp = exposed(level, m);
+                    if (d > 9.0 && !exp) continue;                      // buried blocks only count when close
+                    double score = d + Math.max(0, y - (o.getY() + 2)) * 6.0 - (exp ? Math.min(12.0, d) : 0);
+                    if (score >= bestD) continue;
+                    bestD = score;
+                    best = m.immutable();
+                }
+            }
         }
         return best;
     }
@@ -5381,10 +5534,15 @@ public class CompanionSeekBlockGoal extends Goal {
         return true;
     }
 
+    /** Cached per-block match (the cache is only touched from the server thread, so a plain HashMap is fine). */
     private static boolean matches(MineTask t, BlockState state) {
         if (state.isAir()) return false;
-        String path = BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath();
-        String bid = t.blockId;
+        if (!t.blockId.equals(matchCacheId)) { MATCH_CACHE.clear(); matchCacheId = t.blockId; }
+        return MATCH_CACHE.computeIfAbsent(state.getBlock(), b -> matchesSlow(t.blockId, b));
+    }
+
+    private static boolean matchesSlow(String bid, Block block) {
+        String path = BuiltInRegistries.BLOCK.getKey(block).getPath();
         if (path.equals(bid)) return true;
         if (bid.endsWith("_ore") && path.endsWith(bid)) return true;          // diamond_ore also matches deepslate_diamond_ore
         return switch (bid) {                                                 // family ids from "wood"/"planks"/... orders
@@ -6027,6 +6185,13 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
                 plantUntil = level().getGameTime() + 1200;
                 setAnchor(blockPosition());
                 getNavigation().stop();
+            }
+            case SURFACE -> {
+                clearSeekBlock();
+                mineTask.beginSurface(getDirection().get2DDataValue());
+                setAnchor(blockPosition());
+                getNavigation().stop();
+                speak("Digging up.");
             }
             case FARM -> { farmUntil = level().getGameTime() + 600; setAnchor(blockPosition()); speak("Farming."); }
             case FISH -> { fishUntil = level().getGameTime() + 600; setAnchor(blockPosition()); speak("Going fishing."); }
@@ -6744,6 +6909,11 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     @Override
     public void tick() {
         super.tick();
+        // 26.1-CHECK: vanilla only advances the swing clock from Player.tick - LivingEntity.updateSwingTime has
+        // no mob caller - so a mob's attackAnim stays 0 and HumanoidModel.setupAttackAnimation early-returns
+        // (if attackTime <= 0): every swing() we broadcast arrived, but nothing ever played it. Players advance
+        // the clock every tick; do the same here, BEFORE the client early-out (the client is what renders it).
+        updateSwingTime();
         if (level().isClientSide()) return;
         if (!registryChecked) {
             registryChecked = true;
@@ -6834,7 +7004,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             com.mojang.logging.LogUtils.getLogger().warn("[companionmod] mining task active but the seek goal is NOT selected (sitting? injured? target locked? paused?)");
         }
         String s = "";
-        if (mineTask.exists()) {
+        if (mineTask.phase == MineTask.Phase.ASCEND) s = "Digging up";
+        else if (mineTask.exists()) {
             String p = prettyBlockId(mineTask.blockId).replace(" ore", "");
             s = Character.toUpperCase(p.charAt(0)) + p.substring(1) + " " + mineTask.mined + "/" + mineTask.want;
             if (mineTask.paused) s += " || say 'continue'";
@@ -7211,13 +7382,19 @@ import net.minecraft.world.level.storage.ValueOutput;
  * stopping and restarting the goal never loses anything. A new order pauses the task, "continue" resumes it.
  */
 public final class MineTask {
-    public enum Phase { SEARCH, DESCEND, BRANCH }
+    public enum Phase { SEARCH, DESCEND, BRANCH, ASCEND }
     public static final int NO_DESCEND = Integer.MIN_VALUE;
 
     public String blockId = "";
     public int want, mined, ty = NO_DESCEND, dirData, leg, legLen;
     public Phase phase = Phase.SEARCH;
     public boolean paused;
+    /**
+     * Bumped by every begin()/beginSurface(): the seek goal compares it each tick and drops its stale transient
+     * state (walk, break, pillar) the same tick a new order arrives - without it the goal kept finishing the
+     * previous task's walk for up to 8 s after a new order, which looked like a freeze. Transient on purpose.
+     */
+    public int serial;
 
     public void begin(String id, boolean nether, int facingDirData) {
         blockId = id;
@@ -7229,14 +7406,29 @@ public final class MineTask {
         leg = 0;
         legLen = 0;
         paused = false;
+        serial++;
     }
 
-    public boolean exists() { return !blockId.isEmpty(); }
+    /** "Dig up to the surface": a staircase job with no block id, finished by reaching daylight. */
+    public void beginSurface(int facingDirData) {
+        blockId = "";
+        want = 1;
+        mined = 0;
+        ty = NO_DESCEND;
+        phase = Phase.ASCEND;
+        dirData = facingDirData;
+        leg = 0;
+        legLen = 0;
+        paused = false;
+        serial++;
+    }
+
+    public boolean exists() { return !blockId.isEmpty() || phase == Phase.ASCEND; }
     public boolean running() { return exists() && !paused; }
     public boolean deep() { return ty != NO_DESCEND; }
     public void pause() { paused = true; }
     public boolean resume() { if (!exists()) return false; paused = false; return true; }
-    public void finish() { blockId = ""; paused = false; mined = 0; }
+    public void finish() { blockId = ""; paused = false; mined = 0; phase = Phase.SEARCH; }
     public String describe() { return "mining " + blockId.replace('_', ' ') + " (" + mined + "/" + want + ")"; }
 
     /** Best Y level to branch-mine for. NO_DESCEND = surface target (logs, stone, emeralds...). Tweak freely. */
@@ -8237,6 +8429,7 @@ public final class OllamaVoiceBackend {
              + "{\"heard\":\"<what the player said>\",\"say\":\"<your short in-character reply>\","
              + "\"action\":\"<action>\",\"target\":\"<target or empty>\",\"memory\":\"<one fact to remember or empty>\"}\n"
              + "action must be exactly one of: follow, stay, sit, stand, attack, guard, defensive, passive, come, stop, continue (resume interrupted work), "
+             + "surface (dig a staircase up to the daylight; target empty), "
              + "inventory (only when the player asks to SEE your bag), "
              + "pickup (walk to a dropped item ON THE GROUND and store it; put the item name in target, e.g. bone, diamond, rotten_flesh - only for items already lying around), "
              + "seek_block (walk to the named block and mine it; target = a vanilla block id: oak_log or log for wood/trees, stone, cobblestone, dirt, coal_ore, iron_ore, gold_ore, redstone_ore, lapis_ore, emerald_ore, diamond_ore, copper_ore, ancient_debris; 'wood', 'logs' and 'planks' mean the whole family), "
@@ -8253,6 +8446,7 @@ public final class OllamaVoiceBackend {
              + "'pick up this bone'/'grab that diamond' -> pickup, target bone/diamond. "
              + "'call yourself Alex' -> set_name, target Alex. "
              + "'build the house' -> build, target house. "
+             + "'dig up to the surface'/'to the daylight' -> surface, target empty (never a block id). "
              + "Leave target empty for toggle commands.\n"
              + "Your bag has 4 armor slots (auto-worn so they protect you), 4 tool slots (you automatically hold the best tool for the block you are mining) "
              + "and 18 storage slots; pickup/store puts items where they belong and you can also be given items via the "
