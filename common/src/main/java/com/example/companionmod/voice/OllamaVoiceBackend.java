@@ -159,7 +159,7 @@ public final class OllamaVoiceBackend {
              + "Greetings, small talk, questions, or comments about the world are action none - just reply in character. "
              + "Never start mining, gathering, building, fighting or exploring unless the player explicitly asked for it in this message. "
              + "A bare order (stay, come, sit, follow, stop, wait, defend) is that action with an empty target. "
-             + "Reply with ONE JSON object and nothing else:\n"
+             + "Reply with ONE JSON object and nothing else. The say field is REQUIRED: always answer with a short in-character line, even for bare orders (a word is enough):\n"
              + "{\"heard\":\"<what the player said>\",\"say\":\"<your short in-character reply>\","
              + "\"action\":\"<action>\",\"target\":\"<target or empty>\",\"memory\":\"<one fact to remember or empty>\"}\n"
              + "action must be exactly one of: follow, stay, sit, stand, attack, guard, defensive, passive, come, stop, continue (resume interrupted work), "

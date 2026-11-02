@@ -35,6 +35,7 @@ public final class PushToTalkController {
     /** Latest line waiting to be spoken; rapid chatter is intentionally coalesced. */
     private final AtomicReference<String> pendingSpeech = new AtomicReference<>();
     private volatile boolean speechDraining;
+    private volatile long lastSpeechProbe;      // speech-model recovery: re-probe at most once a minute
 
     public PushToTalkController(OllamaVoiceBackend backend, VoiceConfig cfg, Supplier<String> context,
                                 Consumer<VoiceReply> onReply, Consumer<String> onStatus) {
@@ -137,8 +138,17 @@ public final class PushToTalkController {
                 if (current == null) break;
                 if (!backend.isProbed()) backend.probe();
                 if (backend.speechModel() == null) {
-                    speechListener.onUnavailable(current);
-                    continue;
+                    // The startup probe may have run before the speech model was pulled (or it 404'd later).
+                    // Re-probe at most once a minute so speech recovers without a relog.
+                    long nowMs = System.currentTimeMillis();
+                    if (nowMs - lastSpeechProbe > 60_000) {
+                        lastSpeechProbe = nowMs;
+                        try { backend.probe(); } catch (RuntimeException ignored) { }
+                    }
+                    if (backend.speechModel() == null) {
+                        speechListener.onUnavailable(current);
+                        continue;
+                    }
                 }
                 // Only speak while idle: never talk over the player (LISTENING / THINKING keep their state).
                 if (!state.compareAndSet(VoiceState.IDLE, VoiceState.SPEAKING) && state.get() != VoiceState.SPEAKING) {
