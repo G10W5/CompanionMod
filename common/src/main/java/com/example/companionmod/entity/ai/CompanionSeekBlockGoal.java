@@ -3,6 +3,7 @@ package com.example.companionmod.entity.ai;
 import com.example.companionmod.entity.CompanionEntity;
 import com.example.companionmod.entity.CompanionProtection;
 import com.example.companionmod.entity.task.MineTask;
+import com.mojang.logging.LogUtils;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -47,6 +48,7 @@ import java.util.Set;
  * companion re-plans, and after four failed re-plans it pauses and asks to be told to continue.</p>
  */
 public class CompanionSeekBlockGoal extends Goal {
+    private static final org.slf4j.Logger LOG = LogUtils.getLogger();
     private static final double REACH_SQ = 4.5 * 4.5;
     private static final int LEG_LEN = 36, SIDE_LEN = 3, MAX_LEGS = 8;
     private static final int WALK_STAND = 0, WALK_REACH = 1, WALK_FREE = 2;
@@ -68,6 +70,8 @@ public class CompanionSeekBlockGoal extends Goal {
     private BlockPos bridgeCell;
     private long softRecoverAt;
     private int walkRetries;
+    private int branchBoxed;         // consecutive fully-blocked branch steps: rotate the leg before ending it
+    private long lastDiagLog;
 
     public CompanionSeekBlockGoal(CompanionEntity mob) {
         this.mob = mob;
@@ -104,7 +108,8 @@ public class CompanionSeekBlockGoal extends Goal {
         approachTries.clear();
         approachTarget = pillarTarget = jumpCell = bridgeCell = null;
         pillarAir = 0;
-        if (unreachable.size() > 200) unreachable.clear();
+        branchBoxed = 0;
+        unreachable.clear();       // a fresh task retries every block: old "unreachable" marks must not leak into it
     }
 
     // ------------------------------------------------------------------ main loop
@@ -140,6 +145,12 @@ public class CompanionSeekBlockGoal extends Goal {
             }
             t.dirData = Direction.from2DDataValue(t.dirData).getClockWise().get2DDataValue();
             return;
+        }
+        if (now % 600 == 0) unreachable.clear();       // "unreachable" marks are retried every 30 s: never a permanent blacklist
+        if (idle > 200 && now - lastDiagLog > 200) {
+            lastDiagLog = now;
+            LOG.warn("[companionmod] mining stall ({}t idle): phase={} ore={} walk={} mode={} breaking={} pending={} pillar={} ground={} marked={}",
+                    idle, t.phase, oreTarget, walkTo, walkMode, breaking, pending.size(), pillarTarget, mob.onGround(), unreachable.size());
         }
         // Underground it gets dark: drop a torch from the bag every so often so the tunnels stay lit.
         if (t.phase != MineTask.Phase.SEARCH && --torchCooldown <= 0) {
@@ -236,13 +247,14 @@ public class CompanionSeekBlockGoal extends Goal {
             t.dirData = d.getClockWise().get2DDataValue();
             return;
         }
-        if (planStep(level, t, d, 0, false)) { t.legLen++; return; }
+        if (planStep(level, t, d, 0, false)) { t.legLen++; branchBoxed = 0; return; }
         // Blocked ahead (lava pocket, bedrock bump): mine at a slight angle or step over it before ending the leg.
         // Without this one blocked cell ended the leg instantly, all 8 legs burned in seconds and the task paused.
         if (planStep(level, t, d.getClockWise(), 0, false)
                 || planStep(level, t, d.getCounterClockWise(), 0, false)
                 || planStep(level, t, d, -1, false) || planStep(level, t, d, 1, false)) {
             t.legLen++;
+            branchBoxed = 0;
             return;
         }
         // Open space ahead (a cavern crossing the leg line): the tunnel logic refuses holes in the floor, so
@@ -255,8 +267,16 @@ public class CompanionSeekBlockGoal extends Goal {
             walkTicks = 0;
             mob.getNavigation().moveTo(p, 1.0);
             t.legLen += 4;                          // credit progress: the leg keeps going, it does not exhaust
+            branchBoxed = 0;
             return;
         }
+        // Boxed in (lava pocket, bedrock wall): rotate the leg and mine at an angle to escape the pocket
+        // instead of ending the leg - two rotations (90 then 180) before the leg really ends.
+        if (branchBoxed++ < 2) {
+            t.dirData = d.getClockWise().get2DDataValue();
+            return;
+        }
+        branchBoxed = 0;
         t.legLen = len;                                                 // truly boxed in: end this leg early
     }
 
@@ -684,7 +704,8 @@ public class CompanionSeekBlockGoal extends Goal {
     /** Block reach is measured from the eyes (like a player), not from the feet: 1.6 blocks more upward reach. */
     private boolean inReach(Vec3 c) { return mob.getEyePosition().distanceToSqr(c) <= REACH_SQ; }
 
-    private String stateName() {
+    /** What the goal is doing right now ("digging", "walking", ...) - shown in the radial hub next to the task. */
+    public String stateName() {
         return breaking != null ? "digging" : walkTo != null ? "walking" : pillarTarget != null ? "climbing"
                 : !pending.isEmpty() ? "clearing" : "planning";
     }

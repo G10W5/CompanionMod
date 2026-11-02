@@ -133,6 +133,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     // "go and find/mine this block" job (server side, saved with the entity)
     private final MineTask mineTask = new MineTask();
+    private final com.example.companionmod.entity.ai.CompanionSeekBlockGoal seekGoal = new com.example.companionmod.entity.ai.CompanionSeekBlockGoal(this);
     // "pick this up from the ground" order (server side)
     private String pickupFilter = "";
     private boolean pickupRequested;
@@ -189,7 +190,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         goalSelector.addGoal(1, new CompanionSitGoal(this));
         goalSelector.addGoal(1, new OpenDoorGoal(this, true));   // villager-style: open wooden doors on the path, close behind
         goalSelector.addGoal(2, new MeleeAttackGoal(this, 1.25, true));
-        goalSelector.addGoal(2, new CompanionSeekBlockGoal(this));   // explicit "find diamonds" pre-empts walking
+        goalSelector.addGoal(2, seekGoal);                           // explicit "find diamonds" pre-empts walking
         goalSelector.addGoal(3, new CompanionPickupGoal(this));      // explicit "pick this up" pre-empts walking
         goalSelector.addGoal(4, new CompanionFarmGoal(this));
         goalSelector.addGoal(4, new CompanionPlantGoal(this));        // time-boxed jobs (farm / fish / build)
@@ -1260,7 +1261,12 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         String s = "";
         if (mineTask.exists()) {
             String p = prettyBlockId(mineTask.blockId).replace(" ore", "");
-            s = Character.toUpperCase(p.charAt(0)) + p.substring(1) + " " + mineTask.mined + "/" + mineTask.want + (mineTask.paused ? " ||" : "");
+            s = Character.toUpperCase(p.charAt(0)) + p.substring(1) + " " + mineTask.mined + "/" + mineTask.want;
+            if (mineTask.paused) s += " || say 'continue'";
+            else {
+                String st = seekGoal.stateName();
+                if (st != null && !st.isBlank()) s += " - " + st;
+            }
         } else if (plantUntil > now) s = "Planting";
         else if (farmUntil > now) s = "Farming";
         else if (fishUntil > now) s = "Fishing";
