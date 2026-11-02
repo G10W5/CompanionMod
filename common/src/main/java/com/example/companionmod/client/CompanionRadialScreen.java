@@ -245,7 +245,17 @@ public final class CompanionRadialScreen extends Screen {
             hint = task.isBlank() ? "Choose an order" : task;       // live progress lives here, not in chat
         }
         g.centeredText(this.font, title, cx, cy - 12, fade(0xFFFFFFFF, alpha));
-        g.centeredText(this.font, hint.length() > 16 ? hint.substring(0, 15) + "…" : hint, cx, cy - 1, fade(0xFFA0A0A0, alpha));
+        // Long hints (the live task text "Iron 6/16 - digging" and friends) are scaled down, not cut off.
+        String hintText = hint.length() > 26 ? hint.substring(0, 25) + "…" : hint;
+        if (hintText.length() > 16) {
+            g.pose().pushMatrix();
+            g.pose().translate(cx, cy - 1);
+            g.pose().scale(0.65f, 0.65f);
+            g.centeredText(this.font, hintText, 0, 0, fade(0xFFA0A0A0, alpha));
+            g.pose().popMatrix();
+        } else {
+            g.centeredText(this.font, hintText, cx, cy - 1, fade(0xFFA0A0A0, alpha));
+        }
         String goal = CompanionAutonomy.currentGoal();
         if (!goal.isBlank()) {
             String s = "Goal: " + (goal.length() > 14 ? goal.substring(0, 13) + "…" : goal);

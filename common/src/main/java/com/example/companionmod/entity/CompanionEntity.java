@@ -164,6 +164,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     private int selectedToolSlot = 0;          // which tool slot is held in the main hand
     private int targetSinceTick;               // when the current automatic target was acquired
     private long lastOuchTick;                 // hurt chatter throttle
+    private long lastNoToolNudge;              // "give me a tool" throttle
     private String lastPlanJson = "";          // last plan, so "continue" can resume it
 
     public CompanionEntity(EntityType<? extends CompanionEntity> type, Level level) {
@@ -990,6 +991,14 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         if (bestSlot < 0) {
             selectedToolSlot = -1;
             refreshEquipment();
+            // Bare-hand mining is ~10x slower: nudge the player to put a tool in the bag (throttled).
+            if (state.getDestroySpeed(level(), blockPosition()) > 1.0f && tickCount - lastNoToolNudge > 6000) {
+                lastNoToolNudge = tickCount;
+                String tool = state.is(net.minecraft.tags.BlockTags.MINEABLE_WITH_PICKAXE) ? "pickaxe"
+                        : state.is(net.minecraft.tags.BlockTags.MINEABLE_WITH_SHOVEL) ? "shovel"
+                        : state.is(net.minecraft.tags.BlockTags.MINEABLE_WITH_AXE) ? "axe" : "tool";
+                speak("Mining bare-handed is slow - give me a " + tool + " in my bag.");
+            }
             return;
         }
         selectTool(bestSlot);
