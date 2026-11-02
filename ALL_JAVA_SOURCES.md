@@ -1,6 +1,6 @@
 # All Java Sources
 
-Generated from 68 files. Paths are relative to the project root.
+Generated from 73 files. Paths are relative to the project root.
 
 ## common\src\main\java\com\example\companionmod\block\CompanionShrineBlock.java
 
@@ -10,18 +10,35 @@ package com.example.companionmod.block;
 import com.example.companionmod.world.ShrineSummoner;
 import com.mojang.serialization.MapCodec;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.util.RandomSource;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
 
-/** Right-click to summon your companion, or call it back if it is already out there. */
+/**
+ * The shrine: ONE block with a 3D model (plinth, step, pillar, cup with four prongs, floating crystal).
+ * Right-click to summon your companion, or call it back if it is already out there.
+ * The hitbox below follows the model in models/block/shrine_core.json.
+ */
 public class CompanionShrineBlock extends Block {
     public static final MapCodec<CompanionShrineBlock> CODEC = simpleCodec(CompanionShrineBlock::new);
+
+    private static final VoxelShape SHAPE = Shapes.or(
+            Block.box(1, 0, 1, 15, 2, 15),     // plinth
+            Block.box(3, 2, 3, 13, 4, 13),     // step
+            Block.box(5, 4, 5, 11, 10, 11),    // pillar
+            Block.box(4, 10, 4, 12, 11, 12),   // cup
+            Block.box(6, 11, 6, 10, 15, 10));  // crystal + prongs (rounded up to one box)
 
     public CompanionShrineBlock(Properties properties) { super(properties); }
 
@@ -29,9 +46,25 @@ public class CompanionShrineBlock extends Block {
     protected MapCodec<? extends Block> codec() { return CODEC; }
 
     @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return SHAPE;
+    }
+
+    @Override
     protected InteractionResult useWithoutItem(BlockState state, Level level, BlockPos pos, Player player, BlockHitResult hit) {
         if (level instanceof ServerLevel sl && player instanceof ServerPlayer sp) ShrineSummoner.summon(sl, pos, sp);
         return InteractionResult.SUCCESS;
+    }
+
+    /** Little motes rising off the crystal (client side only; this method is only ever called by the client). */
+    @Override
+    public void animateTick(BlockState state, Level level, BlockPos pos, RandomSource random) {
+        if (random.nextInt(5) != 0) return;
+        level.addParticle(ParticleTypes.END_ROD,
+                pos.getX() + 0.5 + (random.nextDouble() - 0.5) * 0.3,
+                pos.getY() + 0.95,
+                pos.getZ() + 0.5 + (random.nextDouble() - 0.5) * 0.3,
+                0.0, 0.02, 0.0);
     }
 }
 ```
@@ -87,6 +120,8 @@ public final class ClientVoice {
     private static boolean radialWasDown;
     private static boolean settingsWasDown;
     private static int syncedEntity = -1;
+    private static int cachedCompanionId = -1;
+    private static long nextCompanionScan;
     private static int lastSpeechId = -1;
     private static int pendingSpeechId = -1;
     private static String pendingSpeechLine = "";
@@ -134,7 +169,7 @@ public final class ClientVoice {
 
     public static void send(String action, String say, String target) {
         CompanionCommand command = CompanionCommand.parse(action);
-        if (interruptsPlanning(command)) {
+        if (command.interruptsPlanning() || command == CompanionCommand.CONTINUE) {
             // Invalidate in-flight model requests before the server applies the player's newer intent.
             CompanionAutonomy.onManualOrder();
         }
@@ -145,15 +180,6 @@ public final class ClientVoice {
                 ReplyParser.truncate(target == null ? "" : target, 1024)));
     }
 
-    /** Appearance, UI, memory and revive packets do not represent a new gameplay intent. */
-    private static boolean interruptsPlanning(CompanionCommand command) {
-        return switch (command) {
-            case NONE, PLAN, INVENTORY, SET_NAME, SET_SKIN, FEMININE, MASCULINE,
-                    REMEMBER, FORGET, REVIVE -> false;
-            default -> true;
-        };
-    }
-
     public static void tick(Minecraft mc) {
         if (mc.player == null || mc.level == null) {
             if (controller != null) { if (wasDown) controller.onRelease(); controller.shutdown(); controller = null; }
@@ -162,12 +188,17 @@ public final class ClientVoice {
             settingsWasDown = false;
             syncedEntity = -1;
             lastSpeechId = -1;
+            cachedCompanionId = -1;
             CompanionSubtitles.clear();
             CompanionAutonomy.reset();
             return;
         }
         if (controller == null) init(mc);
         boolean down = mc.screen == null && talkKey().isDown();       // typing "v" in chat must not open the mic
+        if (down && wasDown && controller.state() == VoiceState.LISTENING
+                && controller.listeningMillis() > cfg.maxRecordSeconds * 1000L) {
+            controller.onRelease();             // recording cap reached: send what we have (release and press again to talk more)
+        }
         if (down && !wasDown) controller.onPress();
         else if (!down && wasDown) controller.onRelease();
         wasDown = down;
@@ -225,13 +256,24 @@ public final class ClientVoice {
             if (!r.heard().isBlank()) { subtitle = "You: " + r.heard(); subtitleUntil = System.currentTimeMillis() + 4000; }
             // Hard-stop phrases are deterministic. Safety/control must not depend on the LLM's JSON choice.
             CompanionCommand command = isHardStopPhrase(r.heard()) ? CompanionCommand.STOP : gateCommand(r.command(), r.heard());
+            String target = r.target();
+            if (command == CompanionCommand.NONE) {
+                // Model talked but forgot the JSON action: plain order words still work. Mining / pickup orders
+                // also carry their material ("find me some coal" -> seek_block coal_ore / pickup filter "coal").
+                command = heardOrder(r.heard());
+                if ((command == CompanionCommand.SEEK_BLOCK || command == CompanionCommand.PICKUP) && target.isBlank()) {
+                    String mat = heardMaterial(r.heard());
+                    if (mat != null) target = mat;
+                    if (command == CompanionCommand.SEEK_BLOCK && mat == null) command = CompanionCommand.NONE;   // no material named: not a mine order
+                }
+            }
             if (!r.memory().isBlank()) CompanionMemory.remember(r.memory());
             if (command == CompanionCommand.REMEMBER)
-                CompanionMemory.remember(r.target().isBlank() ? r.say() : r.target());
+                CompanionMemory.remember(target.isBlank() ? r.say() : target);
             if (command == CompanionCommand.FORGET)
-                CompanionMemory.forget(r.target().isBlank() ? r.say() : r.target());
-            if (command != CompanionCommand.NONE || !r.say().isBlank() || !r.target().isBlank())
-                send(command.name(), r.say(), r.target());
+                CompanionMemory.forget(target.isBlank() ? r.say() : target);
+            if (command != CompanionCommand.NONE || !r.say().isBlank() || !target.isBlank())
+                send(command.name(), r.say(), target == null ? "" : target);
             if (cfg.dynamicGoals && command == CompanionCommand.NONE && !r.heard().isBlank())
                 CompanionAutonomy.onVoiceHeard(r.heard());
         });
@@ -245,6 +287,56 @@ public final class ClientVoice {
                     "cancel the task", "never mind", "nevermind", "halt", "abort" -> true;
             default -> false;
         };
+    }
+
+    /**
+     * Last-resort deterministic order detection. A chatty or non-compliant model sometimes answers in prose
+     * and forgets the JSON action object, so "kill the zombie" would otherwise stay just talk. Only unambiguous
+     * order words (whole words, not substrings) are mapped here; anything fuzzy stays NONE and the companion
+     * just replies. The server still resolves targets (attack with no target = what you aim at, then nearest).
+     */
+    private static CompanionCommand heardOrder(String heard) {
+        if (heard == null || heard.isBlank()) return CompanionCommand.NONE;
+        String s = heard.toLowerCase(java.util.Locale.ROOT);
+        if (words(s, "follow", "come along", "come with me")) return CompanionCommand.FOLLOW;
+        if (words(s, "sit")) return CompanionCommand.SIT;
+        if (words(s, "stay", "hold position", "wait here", "wait")) return CompanionCommand.STAY;
+        if (words(s, "stand", "stand up", "get up")) return CompanionCommand.STAND;
+        if (words(s, "come", "come here", "to me", "over here")) return CompanionCommand.COME;
+        if (words(s, "attack", "kill", "fight", "hit", "smash", "destroy")) return CompanionCommand.ATTACK;
+        if (words(s, "guard", "protect", "defend")) return CompanionCommand.GUARD;
+        if (words(s, "patrol")) return CompanionCommand.PATROL;
+        if (words(s, "wander", "roam")) return CompanionCommand.WANDER;
+        if (words(s, "pick up", "pickup", "grab", "collect")) return CompanionCommand.PICKUP;
+        if (words(s, "find", "mine", "dig", "get", "gather", "seek", "chop", "search", "look for")) return CompanionCommand.SEEK_BLOCK;
+        if (words(s, "drop")) return CompanionCommand.DROP;
+        if (words(s, "inventory", "bag")) return CompanionCommand.INVENTORY;
+        if (words(s, "heal", "bandage")) return CompanionCommand.HEAL;
+        return CompanionCommand.NONE;
+    }
+
+    /** Whole-word match for any of the phrases (padded so "sit" never matches "situation"). */
+    private static boolean words(String text, String... phrases) {
+        for (String p : phrases) {
+            if (java.util.regex.Pattern.compile("(?<![a-z])" + java.util.regex.Pattern.quote(p) + "(?![a-z])")
+                    .matcher(text).find()) return true;
+        }
+        return false;
+    }
+
+    /**
+     * First block / material word in what the player said, as a block id or family id
+     * ("find me some coal" -> "coal_ore", "get wood" -> "wood", "some diamonds" -> "diamond_ore").
+     * Null when nothing in the sentence names a block: a bare "find something" must not become a blind mine order.
+     */
+    private static String heardMaterial(String heard) {
+        if (heard == null || heard.isBlank()) return null;
+        for (String tok : heard.toLowerCase(java.util.Locale.ROOT).replaceAll("[^a-z0-9 ]+", " ").split(" ")) {
+            if (tok.isBlank()) continue;
+            String id = CompanionEntity.normalizeBlockId(tok);   // fillers/unknown words come back blank
+            if (!id.isBlank()) return id;
+        }
+        return null;
     }
 
     /**
@@ -276,6 +368,7 @@ public final class ClientVoice {
             case MINE -> new String[]{"mine", "dig", "break", "chop"};
             case BUILD -> new String[]{"build", "construct", "place", "house", "wall", "tower", "bridge", "schematic"};
             case FARM -> new String[]{"farm", "harvest", "crops", "plant", "wheat", "carrot", "potato", "pumpkin", "melon"};
+            case PLANT -> new String[]{"plant", "replant", "sapling", "saplings", "tree", "trees", "forest", "propagule"};
             case PATROL -> new String[]{"patrol", "scout", "scouting", "lookout"};
             case HEAL -> new String[]{"heal", "healing", "health", "bandage"};
             case EQUIP -> new String[]{"equip", "wear", "switch", "pickaxe", "axe", "sword", "shovel", "hoe",
@@ -322,12 +415,19 @@ public final class ClientVoice {
         mc.execute(() -> { if (mc.player != null) mc.player.sendSystemMessage(Component.literal("[Companion] " + message)); });
     }
 
-    /** Find the player's own companion in the currently loaded level. */
+    /** Find the player's own companion in the currently loaded level (cached: called every tick and every HUD frame). */
     public static CompanionEntity findCompanion(Minecraft mc) {
         if (mc.player == null || mc.level == null) return null;
         String me = mc.player.getStringUUID();
+        if (cachedCompanionId != -1) {
+            if (mc.level.getEntity(cachedCompanionId) instanceof CompanionEntity c && !c.isRemoved() && c.isOwnedBy(me)) return c;
+            cachedCompanionId = -1;
+        }
+        long now = mc.level.getGameTime();
+        if (now < nextCompanionScan) return null;
+        nextCompanionScan = now + 10;
         for (Entity e : mc.level.entitiesForRendering()) {                 // 26.1-CHECK: ClientLevel.entitiesForRendering()
-            if (e instanceof CompanionEntity c && c.isOwnedBy(me)) return c;
+            if (e instanceof CompanionEntity c && c.isOwnedBy(me)) { cachedCompanionId = c.getId(); return c; }
         }
         return null;
     }
@@ -368,35 +468,97 @@ public final class ClientVoice {
         return memory.isBlank() ? context : context + "\nPlayer preferences and past events: " + memory;
     }
 
-    private static String describe(Entity e) {
-        String name = e.getName().getString();
-        if (e instanceof ItemEntity item) name = item.getItem().getHoverName().getString();
-        double dist = Math.sqrt(e.distanceToSqr(Minecraft.getInstance().player));
-        int dx = e.blockPosition().getX() - Minecraft.getInstance().player.blockPosition().getX();
-        int dz = e.blockPosition().getZ() - Minecraft.getInstance().player.blockPosition().getZ();
-        return name + " " + Math.round(dist) + "m " + compass(dx, dz);
-    }
-
-    private static String compass(int dx, int dz) {
-        double angle = Math.toDegrees(Math.atan2(dz, dx));
-        if (angle < 0) angle += 360;
-        if (angle < 45 || angle >= 315) return "E";
-        if (angle < 135) return "S";
-        if (angle < 225) return "W";
-        return "N";
-    }
-
-    private static boolean isInteresting(String name) {
-        String n = name.toLowerCase();
-        return n.contains("ore") || n.contains("water") || n.contains("lava") || n.contains("chest")
-                || n.contains("crafting") || n.contains("furnace") || n.contains("bed") || n.contains("door")
-                || n.contains("log") || n.contains("leaves") || n.contains("crop") || n.contains("flower")
-                || n.contains("shrine");
-    }
-
     public static void renderHud(GuiGraphicsExtractor g, DeltaTracker delta) {
         VoiceHud.render(g, controller, findCompanion(Minecraft.getInstance()));
     }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionAudioDeviceScreen.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.voice.AudioDevices;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.network.chat.Component;
+
+import java.util.List;
+import java.util.function.Consumer;
+
+/**
+ * Picker for a Java Sound input (microphone) or output (speakers) device. The first row is always
+ * "System default" (stores an empty string); the rest come straight from the audio subsystem, so
+ * plug/unplug is reflected every time the screen opens. Clicking a row hands the name to the picker
+ * consumer and returns to the settings screen.
+ */
+public final class CompanionAudioDeviceScreen extends Screen {
+    private static final int ROW = 22;
+
+    private final boolean input;
+    private final Screen parent;
+    private final Consumer<String> picker;
+    private final List<String> devices;
+
+    private CompanionAudioDeviceScreen(boolean input, Screen parent, Consumer<String> picker, List<String> devices) {
+        super(Component.literal(input ? "Pick a Microphone" : "Pick an Output Device"));
+        this.input = input;
+        this.parent = parent;
+        this.picker = picker;
+        this.devices = devices;
+    }
+
+    /** {@code input} true = microphone list, false = speaker list. Runs on the game thread (enumeration is local and fast). */
+    static void open(Minecraft mc, boolean input, Screen parent, Consumer<String> picker) {
+        List<String> devs = new java.util.ArrayList<>();
+        devs.add("");                                    // sentinel: system default
+        devs.addAll(input ? AudioDevices.inputs() : AudioDevices.outputs());
+        mc.setScreen(new CompanionAudioDeviceScreen(input, parent, picker, devs));
+    }
+
+    @Override
+    protected void init() {
+        super.init();
+        int cx = this.width / 2;
+        int listW = Math.min(420, this.width - 60);
+        int y = 74;
+        for (int i = 0; i < devices.size(); i++) {
+            if (y + ROW > this.height - 60) break;       // keep above the footer
+            final String dev = devices.get(i);
+            final boolean isDefault = dev.isEmpty();
+            Button row = Button.builder(Component.literal(isDefault ? "System default" : dev),
+                            b -> { picker.accept(dev); if (this.minecraft != null) this.minecraft.setScreen(parent); })
+                    .pos(cx - listW / 2, y).size(listW, 20).build();
+            this.addRenderableWidget(row);
+            y += ROW;
+        }
+        this.addRenderableWidget(Button.builder(Component.literal("Back"), b -> onClose())
+                .pos(cx - 50, Math.max(y + 6, this.height - 30)).size(100, 20).build());
+    }
+
+    @Override
+    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        this.extractMenuBackground(g);
+        super.extractRenderState(g, mouseX, mouseY, partialTick);
+        int cx = this.width / 2;
+        g.centeredText(this.font, this.title, cx, 30, 0xFFFFFFFF);
+        g.centeredText(this.font, input
+                ? "Used for push-to-talk (hold V)."
+                : "Used for spoken replies. Empty = Minecraft's own audio output.", cx, 44, 0xFF9AA6B2);
+        g.centeredText(this.font, (devices.size() - 1) + " device(s) found.", cx, 56, 0xFF9AA6B2);
+        g.centeredText(this.font, "Click a device to select it.", cx, this.height - 24, 0xFF666666);
+    }
+
+    @Override
+    public void onClose() {
+        if (this.minecraft != null) this.minecraft.setScreen(parent);
+    }
+
+    @Override
+    public boolean isPauseScreen() { return false; }
 }
 ```
 
@@ -614,14 +776,7 @@ public final class CompanionAutonomy {
 
     /** Game-thread snapshot for the model. */
     private static String context(Minecraft mc) {
-        CompanionEntity mine = null;
-        String me = mc.player.getStringUUID();
-        for (Entity e : mc.level.entitiesForRendering()) {
-            if (e instanceof CompanionEntity c && c.isOwnedBy(me)) {
-                mine = c;
-                break;
-            }
-        }
+        CompanionEntity mine = ClientVoice.findCompanion(mc);
         return CompanionWorldContext.build(mc, mine) + "\nMemory: " + CompanionMemory.summary();
     }
 }
@@ -653,6 +808,9 @@ public class CompanionConnectionScreen extends Screen {
     private EditBox sttField;
     private EditBox speechField;
     private EditBox voiceField;
+    private EditBox micField;
+    private EditBox outField;
+    private int micY, outY;
     private float temperature;
 
     public CompanionConnectionScreen(VoiceConfig config, Path configFile, Screen parent) {
@@ -679,7 +837,23 @@ public class CompanionConnectionScreen extends Screen {
         this.speechField = field(cx, y, w, config.speechModel, "Speech model (empty = auto)");
         y += 34;
         this.voiceField = field(cx, y, w, config.speechVoice, "Voice (optional)");
-        y += 38;
+        y += 24;
+        this.addRenderableWidget(Button.builder(Component.literal("Detect voices from the speech model"), b -> detectVoices())
+                .pos(cx - w / 2, y).size(w, 20).build());
+        y += 26;
+
+        this.micField = deviceField(cx, y, w, config.micDevice, "System default");
+        this.addRenderableWidget(Button.builder(Component.literal("Pick…"), b ->
+                CompanionAudioDeviceScreen.open(this.minecraft, true, this, v -> micField.setValue(v)))
+                .pos(cx + w / 2 - 80, y).size(80, 20).build());
+        micY = y;
+        y += 26;
+        this.outField = deviceField(cx, y, w, config.outputDevice, "System default (Minecraft's audio)");
+        this.addRenderableWidget(Button.builder(Component.literal("Pick…"), b ->
+                CompanionAudioDeviceScreen.open(this.minecraft, false, this, v -> outField.setValue(v)))
+                .pos(cx + w / 2 - 80, y).size(80, 20).build());
+        outY = y;
+        y += 32;
 
         this.addRenderableWidget(new AbstractSliderButton(cx - w / 2, y, w, 20,
                 Component.literal("Temperature: " + String.format("%.2f", temperature)), temperature / 1.5) {
@@ -711,6 +885,16 @@ public class CompanionConnectionScreen extends Screen {
         return box;
     }
 
+    /** Audio device row: a (prefilled, editable) name field plus a picker button; blank = system default. */
+    private EditBox deviceField(int cx, int y, int w, String value, String hint) {
+        EditBox box = new EditBox(this.font, cx - w / 2, y, w - 90, 20, Component.literal(hint));
+        box.setValue(value == null ? "" : value);
+        box.setHint(Component.literal(hint));
+        box.setMaxLength(240);
+        this.addRenderableWidget(box);
+        return box;
+    }
+
     private void loadModels() {
         String h = hostField.getValue() == null ? "" : hostField.getValue().trim();
         CompanionModelScreen.open(this.minecraft, h, this,
@@ -719,12 +903,21 @@ public class CompanionConnectionScreen extends Screen {
                 v -> sttField.setValue(v));
     }
 
+    /** Asks the server which voices the selected speech model supports, then picks one from the list. */
+    private void detectVoices() {
+        String h = hostField.getValue() == null ? "" : hostField.getValue().trim();
+        String m = speechField.getValue() == null ? "" : speechField.getValue().trim();
+        CompanionVoiceScreen.open(this.minecraft, h, m, this, v -> voiceField.setValue(v));
+    }
+
     private void save() {
         config.host = trim(hostField.getValue(), "http://127.0.0.1:11434");
         config.chatModel = trim(chatField.getValue(), "lfm3-audio:latest");
         config.sttModel = sttField.getValue() == null ? "" : sttField.getValue().trim();
         config.speechModel = speechField.getValue() == null ? "" : speechField.getValue().trim();
         config.speechVoice = voiceField.getValue() == null ? "" : voiceField.getValue().trim();
+        config.micDevice = micField.getValue() == null ? "" : micField.getValue().trim();
+        config.outputDevice = outField.getValue() == null ? "" : outField.getValue().trim();
         config.temperature = Math.max(0f, Math.min(1.5f, temperature));
         config.save(configFile);
         back();
@@ -755,6 +948,8 @@ public class CompanionConnectionScreen extends Screen {
         label(g, "Speech-to-text model", cx - w / 2, y + 57);
         label(g, "Text-to-speech model", cx - w / 2, y + 91);
         label(g, "Voice", cx - w / 2, y + 125);
+        label(g, "Input device (mic)", cx - w / 2, micY - 11);
+        label(g, "Output device (spoken replies)", cx - w / 2, outY - 11);
     }
 
     private void label(GuiGraphicsExtractor g, String text, int x, int y) {
@@ -1794,7 +1989,12 @@ public final class CompanionRadialScreen extends Screen {
         String title, hint;
         if (hovered >= 0) { title = current.get(hovered).label; hint = current.get(hovered).hint; }
         else if (!stack.isEmpty() && lastDistance < INNER) { title = "Back"; hint = "Click the centre"; }
-        else { title = currentTitle; hint = "Choose an order"; }
+        else {
+            title = currentTitle;
+            com.example.companionmod.entity.CompanionEntity mine = ClientVoice.findCompanion(this.minecraft);
+            String task = mine == null ? "" : mine.taskText();
+            hint = task.isBlank() ? "Choose an order" : task;       // live progress lives here, not in chat
+        }
         g.centeredText(this.font, title, cx, cy - 12, fade(0xFFFFFFFF, alpha));
         g.centeredText(this.font, hint.length() > 16 ? hint.substring(0, 15) + "…" : hint, cx, cy - 1, fade(0xFFA0A0A0, alpha));
         String goal = CompanionAutonomy.currentGoal();
@@ -1902,10 +2102,12 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.util.Mth;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.entity.player.PlayerModelType;
 import net.minecraft.world.item.component.ResolvableProfile;
 
 import java.util.List;
+import java.util.UUID;
 
 /**
  * Draws the companion at the same height as a player (the {@code 0.9375} body scale the avatar
@@ -1922,7 +2124,6 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
     private static final float SUBTITLE_SCALE = 0.025f;
 
     private final PlayerSkinRenderCache skinCache;
-    private String lastDiag = "";               // body-model diagnostic transition guard
     private boolean genderLayerTried;           // Wildfire layer is attached lazily on the first draw
 
     public CompanionRenderer(EntityRendererProvider.Context ctx) {
@@ -1997,22 +2198,21 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         state.injured = entity.isInjured();
         state.reviveProgress = entity.reviveProgress();
         state.injuredLeft = entity.injuredLeftTicks();
-        resolveSkin(state, entity.skin());
+        resolveSkin(state, entity.skin(), entity.syncedOwner());
         // Wildfire's layer reads its data from the render state. The mod only fills it for players,
         // so we build it from the owner's config; false means the fallback overlay should draw instead.
-        state.wildfireChest = FemaleGenderCompat.populateRenderState(state, entity, entity.getOwnerUuid(), partialTick);
+        state.wildfireChest = FemaleGenderCompat.populateRenderState(state, entity, entity.syncedOwner(), partialTick);
     }
 
-    private void resolveSkin(CompanionRenderState state, String name) {
+    private void resolveSkin(CompanionRenderState state, String name, UUID owner) {
         // 1) Resolve the skin texture. "owner" goes through the local player's RESOLVED profile:
         //    synchronous, and it picks up Quick Skin local skins with the real model type. A raw name
         //    resolves asynchronously and shows Steve (wide) until it completes, which is what made
         //    slim auto-detection unreliable.
         if (name == null || name.isBlank() || "default".equalsIgnoreCase(name)) {
             applyInfo(state, null);
-        } else if ("owner".equalsIgnoreCase(name) && Minecraft.getInstance().player != null) {
-            applyInfo(state, skinCache.getOrDefault(ResolvableProfile.createResolved(
-                    Minecraft.getInstance().player.getGameProfile())));
+        } else if ("owner".equalsIgnoreCase(name)) {
+            applyInfo(state, ownerSkin(owner));       // THIS companion's owner, not whoever is looking at it
         } else {
             applyInfo(state, skinCache.getOrDefault(ResolvableProfile.createUnresolved(name)));
         }
@@ -2021,16 +2221,15 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         if ("slim".equals(body)) state.slim = true;
         else if ("classic".equals(body)) state.slim = false;
         else state.slim = state.slimSkin;
-        // 3) Diagnostic: announce the resolved body model in chat whenever it changes, so it is visible
-        //    immediately whether slim/classic/auto actually applied (and what the skin resolved to).
-        String diag = "Companion body: " + (state.slim ? "SLIM" : "CLASSIC")
-                + "  [config=" + (body == null ? "auto" : body)
-                + ", skin=" + (name == null || name.isBlank() || "default".equalsIgnoreCase(name) ? "bundled" : name)
-                + ", skinModel=" + (state.slimSkin ? "slim" : "classic") + "]";
-        if (!diag.equals(lastDiag)) {
-            lastDiag = diag;
-            ClientVoice.status(diag);
-        }
+    }
+
+    /** Skin of the companion's owner (the local player for your own companion, the other player in multiplayer). */
+    private PlayerSkinRenderCache.RenderInfo ownerSkin(UUID owner) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null) return null;
+        Player p = owner == null || owner.equals(mc.player.getUUID()) ? mc.player
+                : (mc.level == null ? null : mc.level.getPlayerByUUID(owner));
+        return p == null ? null : skinCache.getOrDefault(ResolvableProfile.createResolved(p.getGameProfile()));
     }
 
     private static void applyInfo(CompanionRenderState state, PlayerSkinRenderCache.RenderInfo info) {
@@ -2087,7 +2286,7 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         if (words.isEmpty()) return;
 
         poseStack.pushPose();
-        poseStack.translate(0.0, state.boundingBoxHeight + 0.45f, 0.0);   // just above the head, not floating mid-air
+        poseStack.translate(0.0, state.boundingBoxHeight + 0.2f, 0.0);    // starts right above the head (was +0.45)
         poseStack.mulPose(camera.orientation);
         poseStack.scale(SUBTITLE_SCALE, -SUBTITLE_SCALE, SUBTITLE_SCALE);
 
@@ -2244,10 +2443,7 @@ public class CompanionSettingsScreen extends Screen {
         // 26.1-CHECK: CycleButton.builder signature
         this.addRenderableWidget(CycleButton.<String>builder(CompanionSettingsScreen::bodyName, config.companionBody == null ? "auto" : config.companionBody)
                 .withValues("auto", "slim", "classic")
-                .create(rx, y, COL_W, 20, Component.literal("Body Type"), (b, v) -> {
-                    config.companionBody = v;
-                    ClientVoice.status("Body type: " + bodyName(v).getString());   // live confirmation in chat
-                }));
+                .create(rx, y, COL_W, 20, Component.literal("Body Type"), (b, v) -> config.companionBody = v));
         y += pitch;
 
         toggle(lx, y, "Memory", config.memoryEnabled, v -> config.memoryEnabled = v);
@@ -2437,7 +2633,7 @@ final class CompanionSubtitles {
 
     private static final long LIFE_MS = 1500;
     private static final long POP_MS = 260;
-    private static final float RISE_PX = 64f;
+    private static final float RISE_PX = 20f;     // was 64: bubbles climbed ~1.6 blocks above an already high anchor
     private static final long FADE_MS = 450;
     /** Extra smoothing factor: how much of the audio-clock's coarse jump we accept per rendered frame. */
     private static final float CLOCK_EASE = 0.45f;
@@ -2535,9 +2731,8 @@ final class CompanionSubtitles {
             if (age < 0) break;
             if (age >= LIFE_MS) continue;
             float life = age / (float) LIFE_MS;
-            float travel = (age / (float) POP_MS) * 1.6f;
-            travel = Math.min(1, travel);
-            float walk = (1 - (1 - travel) * (1 - travel));                 // eased rise/drift fraction
+            float travel = Math.min(1, age / (float) LIFE_MS);              // float up slowly for the word's whole life
+            float walk = (1 - (1 - travel) * (1 - travel));                 // ease-out rise/drift fraction
             float lift = RISE_PX * a.liftMul[i] * walk;
             float pop = Math.min(1, age / (float) POP_MS);
             float scale = (0.2f + 0.8f * popIn(pop)) * a.sizeMul[i];        // small -> big with a bounce
@@ -2546,6 +2741,7 @@ final class CompanionSubtitles {
             float fade = age > LIFE_MS - FADE_MS
                     ? 1 - (age - (LIFE_MS - FADE_MS)) / (float) FADE_MS : 1;
             float alpha = Math.min(1, age / 70f) * fade;
+            if (alpha < 0.03f) continue;     // vanilla text treats alpha < 4/255 as fully OPAQUE: skip instead of flashing at the end of the fade
             float flash = Math.max(0, 1 - age / 150f);                      // bright right at the pop
             int argb = blend(((int) (alpha * 255) << 24) | (PALETTE[i % PALETTE.length] & 0xFFFFFF), flash);
             float rot = a.rotDeg[i] + wobble;
@@ -2579,11 +2775,20 @@ final class CompanionSubtitles {
     }
 
     private static synchronized long elapsed(String text) {
-        if (text == null || !text.equals(clockText) || clockText.isBlank()) return -1;
+        if (text == null || !sameLine(text, clockText) || clockText.isBlank()) return -1;
         long now = System.currentTimeMillis();
         if (finishedAt != 0) return durationMs + now - finishedAt;
-        if (fallback) return Math.min(durationMs, now - startedAt);
-        return (long) (progress * durationMs);
+        long wall = now - startedAt;
+        // The timed estimate used to be clamped at durationMs, which froze the last words at a young age forever
+        // (no fade, stuck above the head). Time now keeps running so every word ages out and fades.
+        if (fallback) return wall;
+        // Audio mode: if the "stopped" callback never arrives, fall back to wall time after a grace period.
+        return wall > durationMs + 2000 ? wall : (long) (progress * durationMs);
+    }
+
+    /** The voice queue clips lines to 200 chars, so the audio clock may carry a prefix of the synced line. */
+    private static boolean sameLine(String text, String clock) {
+        return text.equals(clock) || (clock.length() >= 200 && text.startsWith(clock));
     }
 
     /** Exponential approach to the raw audio clock; snaps on any backward jump (new line / rewind). */
@@ -2637,6 +2842,184 @@ final class CompanionSubtitles {
             a.phase[i] = rng.nextFloat() * 6.283f;
         }
     }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionVoiceScreen.java
+
+```java
+package com.example.companionmod.client;
+
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.network.chat.Component;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.function.Consumer;
+
+/**
+ * Voice picker for the selected TTS model. Detects which voices the Ollama server exposes for the chosen
+ * speech model (GET /v1/audio/voices, falling back to the native GET /api/voices) and lists them as
+ * clickable rows; clicking one assigns it to the Voice field. Voices are pre-fetched on a worker thread.
+ */
+public final class CompanionVoiceScreen extends Screen {
+    private static final int ROW = 22;
+    private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
+
+    private final String host;
+    private final String model;
+    private final Screen parent;
+    private final Consumer<String> picker;
+    private final List<String> voices;
+    private final String status;
+
+    private CompanionVoiceScreen(String host, String model, Screen parent, Consumer<String> picker,
+                                 List<String> voices, String status) {
+        super(Component.literal(voices.isEmpty() ? "Pick a Voice" : "Pick a Voice (" + voices.size() + ")"));
+        this.host = host;
+        this.model = model;
+        this.parent = parent;
+        this.picker = picker;
+        this.voices = voices;
+        this.status = status == null ? "" : status;
+    }
+
+    /** Opens the picker. {@code model} is the selected speech model (blank = list every voice the server has). */
+    static void open(Minecraft mc, String host, String model, Screen parent, Consumer<String> picker) {
+        String url = (host == null || host.isBlank()) ? "http://127.0.0.1:11434" : host;
+        String m = model == null ? "" : model.trim();
+        new Thread(() -> {
+            List<String> fetched = fetch(url, m);
+            String st = fetched.isEmpty()
+                    ? "No voices answered at " + url + ". Is the speech model installed? (ollama pull "
+                        + (m.isBlank() ? "phonon" : m) + ")"
+                    : "";
+            mc.execute(() -> mc.setScreen(new CompanionVoiceScreen(url, m, parent, picker, fetched, st)));
+        }, "companionmod-voices").start();
+    }
+
+    private static List<String> fetch(String host, String model) {
+        List<String[]> all = new ArrayList<>();           // {voiceId, model}
+        collect(all, get(host + "/v1/audio/voices"), "data", "id");        // OpenAI-compatible
+        if (all.isEmpty()) collect(all, get(host + "/api/voices"), "voices", "name");   // Ollama native
+        if (model.isEmpty()) return ids(all);
+        List<String> matching = new ArrayList<>();
+        for (String[] v : all) {
+            if (matchesModel(v[1], model)) matching.add(v[0]);
+        }
+        return matching.isEmpty() ? ids(all) : matching;   // filter unsure? show everything rather than nothing
+    }
+
+    /** Equal, or one is a tag-less prefix of the other ("phonon" vs "phonon:latest"). */
+    private static boolean matchesModel(String entryModel, String model) {
+        if (entryModel == null || entryModel.isBlank()) return true;
+        return entryModel.equals(model) || entryModel.startsWith(model) || model.startsWith(entryModel);
+    }
+
+    private static List<String> ids(List<String[]> all) {
+        List<String> out = new ArrayList<>();
+        for (String[] v : all) out.add(v[0]);
+        return out;
+    }
+
+    private static String get(String url) {
+        try {
+            HttpResponse<String> r = HTTP.send(HttpRequest.newBuilder(URI.create(url))
+                    .timeout(Duration.ofSeconds(5)).GET().build(), HttpResponse.BodyHandlers.ofString());
+            return r.statusCode() == 200 ? r.body() : null;
+        } catch (IOException | RuntimeException | InterruptedException e) {
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+            return null;
+        }
+    }
+
+    /** Reads a JSON array of voice objects (top-level array, or nested under {@code arrayKey}). */
+    private static void collect(List<String[]> out, String body, String arrayKey, String idKey) {
+        if (body == null || body.isBlank()) return;
+        try {
+            JsonElement root = JsonParser.parseString(body);
+            JsonElement arr = root.isJsonArray() ? root : (root.isJsonObject() ? root.getAsJsonObject().get(arrayKey) : null);
+            if (arr == null || !arr.isJsonArray()) return;
+            for (JsonElement e : arr.getAsJsonArray()) {
+                if (!e.isJsonObject()) continue;
+                JsonObject v = e.getAsJsonObject();
+                String id = str(v, idKey);
+                if (id == null || id.isBlank()) continue;
+                out.add(new String[]{id, str(v, "model")});
+            }
+        } catch (RuntimeException ignored) { }
+    }
+
+    private static String str(JsonObject o, String key) {
+        return o.has(key) && !o.get(key).isJsonNull() ? o.get(key).getAsString() : null;
+    }
+
+    @Override
+    protected void init() {
+        super.init();
+        int cx = this.width / 2;
+        int y = 74;
+        int listW = 190, colGap = 14;
+        int cols = voices.size() > 12 ? 2 : 1;
+        int rows = (voices.size() + cols - 1) / cols;
+        int leftX = cx - (cols * listW + (cols - 1) * colGap) / 2;
+        for (int i = 0; i < voices.size(); i++) {
+            int c = i % cols, r = i / cols;
+            int bx = leftX + c * (listW + colGap);
+            int by = y + r * ROW;
+            if (by + ROW > this.height - 80) break;            // keep above the footer
+            final String voice = voices.get(i);
+            this.addRenderableWidget(Button.builder(Component.literal(voice), b -> {
+                picker.accept(voice);
+                if (this.minecraft != null) this.minecraft.setScreen(parent);
+            }).pos(bx, by).size(listW, 20).build());
+        }
+        y += Math.max(1, rows) * ROW;
+
+        if (voices.isEmpty()) {
+            this.addRenderableWidget(Button.builder(Component.literal("Retry"), b -> {
+                if (this.minecraft != null) CompanionVoiceScreen.open(this.minecraft, host, model, parent, picker);
+            }).pos(cx - 40, y).size(80, 20).build());
+            y += ROW;
+        }
+
+        this.addRenderableWidget(Button.builder(Component.literal("Back"), b -> onClose())
+                .pos(cx - 50, Math.max(y + 6, this.height - 30)).size(100, 20).build());
+    }
+
+    @Override
+    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        this.extractMenuBackground(g);
+        super.extractRenderState(g, mouseX, mouseY, partialTick);
+        int cx = this.width / 2;
+        g.centeredText(this.font, this.title, cx, 30, 0xFFFFFFFF);
+        if (!status.isBlank()) g.centeredText(this.font, status, cx, 44, 0xFFFF7777);
+        g.centeredText(this.font, model.isBlank() ? "All voices on the server" : "Voices for '" + model + "'",
+                cx, 56, 0xFF9AA6B2);
+        g.centeredText(this.font, "Click a voice to use it for spoken replies.", cx, this.height - 24, 0xFF666666);
+    }
+
+    @Override
+    public void onClose() {
+        if (this.minecraft != null) this.minecraft.setScreen(parent);
+    }
+
+    @Override
+    public boolean isPauseScreen() { return false; }
 }
 ```
 
@@ -3178,7 +3561,16 @@ public enum CompanionCommand {
     GIVE, TAKE, DROP, PICKUP, OPEN, CLOSE, CRAFT, SMELT, BREW, ENCHANT,
     FISH, COOK, FIGHT, FLEE, HIDE, SEEK, FIND, SEARCH, TRACK, HUNT,
     SEEK_BLOCK, SET_NAME, REVIVE, PLAN,
-    REMEMBER, FORGET, SET_SKIN, FEMININE, MASCULINE;
+    REMEMBER, FORGET, SET_SKIN, FEMININE, MASCULINE, PLANT;
+
+    /** False for appearance/UI/memory/revive packets: they are not a new gameplay intent and must not pause or cancel a plan. */
+    public boolean interruptsPlanning() {
+        return switch (this) {
+            case NONE, PLAN, CONTINUE, INVENTORY, SET_NAME, SET_SKIN, FEMININE, MASCULINE,
+                    REMEMBER, FORGET, REVIVE -> false;
+            default -> true;
+        };
+    }
 
     /** Lenient parser: accepts the enum name plus common synonyms the model might produce. */
     public static CompanionCommand parse(String raw) {
@@ -3202,6 +3594,7 @@ public enum CompanionCommand {
             case "mine": case "dig": case "break": case "harvest": return MINE;
             case "build": case "construct": case "place": case "build_structure": return BUILD;
             case "farm": case "farming": case "harvest_crops": return FARM;
+            case "plant": case "replant": case "plant_sapling": case "plant_saplings": case "plant_trees": case "reforest": return PLANT;
             case "patrol": case "scout": case "scouting": case "lookout": return PATROL;
             case "heal": case "healing": case "rest_heal": return HEAL;
             case "equip": case "equipment": case "gear": case "armor": return EQUIP;
@@ -3259,13 +3652,21 @@ package com.example.companionmod;
 
 import net.minecraft.resources.Identifier;
 
+import java.nio.file.Path;
+
 public final class CompanionMod {
     public static final String MOD_ID = "companionmod";
+    private static volatile Path configDir = Path.of("config");
     private CompanionMod() {}
 
     public static Identifier id(String path) {
         return Identifier.fromNamespaceAndPath(MOD_ID, path); // 26.1-CHECK: was ResourceLocation before 26.1
     }
+
+    /** The loader's real config directory (set from each loader's entrypoint; never rely on the working directory). */
+    public static Path configDir() { return configDir; }
+
+    public static void setConfigDir(Path dir) { if (dir != null) configDir = dir; }
 }
 ```
 
@@ -3274,7 +3675,9 @@ public final class CompanionMod {
 ```java
 package com.example.companionmod.entity.ai;
 
+import com.example.companionmod.CompanionMod;
 import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.entity.CompanionProtection;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -3285,7 +3688,9 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.ai.goal.Goal;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
@@ -3294,29 +3699,34 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 /**
- * "Build &lt;name&gt;": places a schematic from {@code config/companionmod/schematics/<name>.json} one block
- * at a time, consuming matching items from the bag. Steps are relative to the anchor (where the order was
- * given). When a needed block is not in the bag the companion waits at that spot and tells the player what
- * it needs - refilling the bag resumes the build automatically, so a palette bigger than the bag just
- * becomes a "fetch me more cobblestone" loop instead of a failure.
+ * "Build &lt;name&gt;": places a schematic from {@code <config>/companionmod/schematics/<n>.json} one block
+ * at a time, consuming matching items from the bag, bottom layer first. Steps are relative to the anchor.
+ * When a needed block is not in the bag the companion waits and says what it needs; refilling the bag resumes the build.
  *
  * <p>File format: {@code [{"x":0,"y":0,"z":0,"block":"minecraft:cobblestone"}, ...]} (a bare array, or an
- * object with a "blocks" array). Already-correct blocks are skipped, so re-running continues where it left
- * off after a crash or relog.</p>
+ * object with a "blocks" array). The file is parsed off the server thread, limited to 2 MB / 20 000 blocks /
+ * +-96 offset, and spots the owner may not edit (spawn protection) are skipped.</p>
  */
 public class CompanionBuildGoal extends Goal {
+    private static final long MAX_FILE_BYTES = 2L * 1024 * 1024;
+    private static final int MAX_STEPS = 20_000, MAX_OFFSET = 96;
+
     private record Step(int dx, int dy, int dz, Block block) {}
+    private record Loaded(List<Step> steps, String error) {}
 
     private final CompanionEntity mob;
     private final List<Step> steps = new ArrayList<>();
     private BlockPos base;
-    private int index;
-    private int scanCooldown, speakCooldown;
+    private int index, blocked;
+    private int speakCooldown;
     private boolean loaded;
+    private CompletableFuture<Loaded> loading;
 
     public CompanionBuildGoal(CompanionEntity mob) {
         this.mob = mob;
@@ -3333,10 +3743,11 @@ public class CompanionBuildGoal extends Goal {
     public void start() {
         steps.clear();
         index = 0;
+        blocked = 0;
         base = mob.anchor().immutable();
         loaded = false;
+        loading = null;
         speakCooldown = 0;
-        scanCooldown = 0;
         mob.speak("Starting the build.");
     }
 
@@ -3349,9 +3760,9 @@ public class CompanionBuildGoal extends Goal {
     public void tick() {
         if (!(mob.level() instanceof ServerLevel level)) return;
         if (!loaded) {
-            if (!loadSchematic(level)) return;
+            if (!pollSchematic()) return;
             loaded = true;
-            if (steps.isEmpty()) { mob.clearBuild(); return; }   // loadSchematic already explained why
+            if (steps.isEmpty()) { mob.clearBuild(); return; }   // pollSchematic already explained why
         }
         while (index < steps.size()) {
             Step s = steps.get(index);
@@ -3359,6 +3770,7 @@ public class CompanionBuildGoal extends Goal {
             BlockState there = level.getBlockState(pos);
             if (there.getBlock() == s.block() || !there.isAir()) { index++; continue; }   // done, or occupied: skip
             if (pos.closerToCenterThan(mob.position(), 0.9)) { index++; continue; }  // never entomb ourselves
+            if (!CompanionProtection.canModify(level, mob, pos)) { blocked++; index++; continue; }
             if (mob.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5) > 4.5 * 4.5) {
                 mob.getNavigation().moveTo(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5, 1.1);
                 return;
@@ -3376,60 +3788,77 @@ public class CompanionBuildGoal extends Goal {
             mob.swing(InteractionHand.MAIN_HAND);
             level.setBlock(pos, s.block().defaultBlockState(), 3);
             index++;
-            if (mob.getRandom().nextInt(12) == 0) mob.speak("Building...");
         }
-        mob.speak("Build finished!");
+        mob.speak(blocked > 0 ? "Build finished, but " + blocked + " spots are protected." : "Build finished!");
         mob.clearBuild();
     }
 
-    /** Reads the schematic file. Returns false when it does not exist (retried, throttled). */
-    private boolean loadSchematic(ServerLevel level) {
-        String name = mob.buildSchematic();
-        Path file = Path.of("config", "companionmod", "schematics", name + ".json");
-        if (!Files.isRegularFile(file)) {
-            if (--speakCooldown <= 0) {
-                speakCooldown = 120;
-                mob.speak("I cannot find a schematic called " + name
-                        + ". Put a JSON file in config/companionmod/schematics.");
+    /** Starts / polls the background parse. Returns true once the result (possibly empty) is in {@link #steps}. */
+    private boolean pollSchematic() {
+        if (loading == null) {
+            String name = mob.buildSchematic();
+            Path file = CompanionMod.configDir().resolve("companionmod").resolve("schematics").resolve(name + ".json");
+            if (!Files.isRegularFile(file)) {
+                if (--speakCooldown <= 0) {
+                    speakCooldown = 120;
+                    mob.speak("I cannot find a schematic called " + name
+                            + ". Put a JSON file in config/companionmod/schematics.");
+                }
+                return false;
             }
+            loading = CompletableFuture.supplyAsync(() -> parse(file));
             return false;
         }
+        if (!loading.isDone()) return false;
+        Loaded result;
         try {
+            result = loading.join();
+        } catch (RuntimeException e) {
+            result = new Loaded(List.of(), "I could not read that schematic file.");
+        }
+        loading = null;
+        steps.addAll(result.steps());
+        if (!result.error().isBlank()) mob.speak(result.error());
+        return true;
+    }
+
+    /** Runs on a worker thread: touches no world state. */
+    private static Loaded parse(Path file) {
+        List<Step> out = new ArrayList<>();
+        try {
+            if (Files.size(file) > MAX_FILE_BYTES) return new Loaded(out, "That schematic file is too big.");
             JsonElement el = JsonParser.parseString(Files.readString(file));
             JsonArray arr = null;
             if (el.isJsonArray()) arr = el.getAsJsonArray();
             else if (el.isJsonObject() && el.getAsJsonObject().has("blocks")) arr = el.getAsJsonObject().getAsJsonArray("blocks");
-            if (arr == null) {
-                mob.speak("That schematic file has no blocks in it.");
-                return true;
-            }
+            if (arr == null) return new Loaded(out, "That schematic file has no blocks in it.");
             for (JsonElement e : arr) {
+                if (out.size() >= MAX_STEPS) break;
                 if (!e.isJsonObject()) continue;
                 JsonObject o = e.getAsJsonObject();
                 int dx = o.has("x") ? o.get("x").getAsInt() : 0;
                 int dy = o.has("y") ? o.get("y").getAsInt() : 0;
                 int dz = o.has("z") ? o.get("z").getAsInt() : 0;
+                if (Math.abs(dx) > MAX_OFFSET || Math.abs(dy) > MAX_OFFSET || Math.abs(dz) > MAX_OFFSET) continue;
                 String id = o.has("block") ? o.get("block").getAsString() : "";
-                Identifier loc = Identifier.tryParse(id.startsWith("minecraft:") ? id : "minecraft:" + id);
+                Identifier loc = Identifier.tryParse(id.contains(":") ? id : "minecraft:" + id);
                 Block b = loc == null ? null : BuiltInRegistries.BLOCK.getOptional(loc).orElse(null);
-                if (b == null || b == Blocks.AIR) continue;
-                steps.add(new Step(dx, dy, dz, b));
+                if (b == null || b == Blocks.AIR || b.asItem() == Items.AIR) continue;   // no item = nothing to take from the bag
+                out.add(new Step(dx, dy, dz, b));
             }
-            if (steps.isEmpty()) mob.speak("That schematic has no placeable blocks.");
-            return true;
+            out.sort(Comparator.comparingInt(Step::dy).thenComparingInt(Step::dx).thenComparingInt(Step::dz));   // bottom layer first
+            if (out.isEmpty()) return new Loaded(out, "That schematic has no placeable blocks.");
+            return new Loaded(out, "");
         } catch (IOException | RuntimeException ex) {
-            mob.speak("I could not read that schematic file.");
-            return true;
+            return new Loaded(new ArrayList<>(), "I could not read that schematic file.");
         }
     }
 
-    private ItemStack takeFromBag(net.minecraft.world.item.Item item) {
+    /** Removes exactly one matching item from the bag and returns it (EMPTY when there is none). */
+    private ItemStack takeFromBag(Item item) {
         for (int i = CompanionEntity.MAIN_START; i < CompanionEntity.MAIN_START + CompanionEntity.MAIN_SIZE; i++) {
             ItemStack s = mob.storage().getItem(i);
-            if (s.getItem() == item) {
-                mob.storage().removeItem(i, 1);
-                return s;
-            }
+            if (!s.isEmpty() && s.getItem() == item) return mob.storage().removeItem(i, 1);
         }
         return ItemStack.EMPTY;
     }
@@ -3442,6 +3871,7 @@ public class CompanionBuildGoal extends Goal {
 package com.example.companionmod.entity.ai;
 
 import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.entity.CompanionProtection;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.InteractionHand;
@@ -3535,6 +3965,7 @@ public class CompanionFarmGoal extends Goal {
         BlockPos pos = target;
         target = null;
         if (!(state.getBlock() instanceof CropBlock)) return;
+        if (!CompanionProtection.canModify(level, mob, pos)) return;     // spawn protection / protected area
         mob.swing(InteractionHand.MAIN_HAND);
         level.destroyBlock(pos, true, mob, 512);
         mob.collectNearbyItems();
@@ -3976,21 +4407,167 @@ public class CompanionPickupGoal extends Goal {
 }
 ```
 
+## common\src\main\java\com\example\companionmod\entity\ai\CompanionPlantGoal.java
+
+```java
+package com.example.companionmod.entity.ai;
+
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.entity.CompanionProtection;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.ai.goal.Goal;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.Vec3;
+
+import java.util.EnumSet;
+import java.util.HashSet;
+import java.util.Set;
+
+/**
+ * "Plant the saplings": walks around the anchor and plants saplings from the bag on soil, 3 blocks apart and with
+ * room to grow. Ends by itself when the bag has no (matching) sapling left or no good spot exists. Never breaks anything.
+ */
+public class CompanionPlantGoal extends Goal {
+    private static final int RADIUS = 12;
+
+    private final CompanionEntity mob;
+    private final Set<BlockPos> badSpots = new HashSet<>();
+    private BlockPos spot;
+    private int scanCooldown, walkTicks, planted;
+
+    public CompanionPlantGoal(CompanionEntity mob) {
+        this.mob = mob;
+        setFlags(EnumSet.of(Flag.MOVE, Flag.LOOK));
+    }
+
+    private boolean jobRunning() { return mob.plantUntil() > mob.level().getGameTime(); }
+
+    @Override public boolean canUse() { return jobRunning() && !mob.isSitting() && !mob.isInjured() && mob.getTarget() == null; }
+    @Override public boolean canContinueToUse() { return canUse(); }
+
+    @Override
+    public void start() {
+        spot = null;
+        scanCooldown = 0;
+        walkTicks = 0;
+        planted = 0;
+        badSpots.clear();
+    }
+
+    @Override public void stop() { mob.getNavigation().stop(); }
+
+    @Override
+    public void tick() {
+        if (!(mob.level() instanceof ServerLevel level)) return;
+        int slot = saplingSlot();
+        if (slot < 0) {
+            finish(planted > 0 ? "Planted " + planted + (planted == 1 ? " sapling." : " saplings.")
+                    : (mob.plantFilter().isBlank() ? "I don't have any saplings to plant." : "I don't have any " + mob.plantFilter().replace('_', ' ') + " to plant."));
+            return;
+        }
+        BlockState sapling = ((BlockItem) mob.storage().getItem(slot).getItem()).getBlock().defaultBlockState();
+        if (spot == null || !valid(level, spot, sapling)) {
+            if (--scanCooldown > 0) return;
+            scanCooldown = 10;
+            spot = findSpot(level, sapling);
+            walkTicks = 0;
+            if (spot == null) {
+                finish(planted > 0 ? "Planted " + planted + (planted == 1 ? " sapling." : " saplings.") : "I can't find a good spot to plant here.");
+                return;
+            }
+        }
+        Vec3 c = Vec3.atBottomCenterOf(spot);
+        if (mob.distanceToSqr(c) > 6.25) {
+            if (++walkTicks > 160) { badSpots.add(spot); spot = null; return; }
+            if (mob.getNavigation().isDone() && mob.onGround()) mob.getNavigation().moveTo(c.x, c.y, c.z, 1.0);
+            return;
+        }
+        mob.getNavigation().stop();
+        mob.getLookControl().setLookAt(c.x, c.y, c.z, 30f, mob.getMaxHeadXRot());
+        ItemStack taken = mob.storage().removeItem(slot, 1);
+        if (taken.isEmpty()) return;
+        level.setBlock(spot, ((BlockItem) taken.getItem()).getBlock().defaultBlockState(), 3);
+        mob.swing(InteractionHand.MAIN_HAND);
+        planted++;
+        spot = null;
+    }
+
+    private void finish(String msg) {
+        mob.speak(msg);
+        mob.endPlant();
+    }
+
+    private int saplingSlot() {
+        String f = mob.plantFilter();
+        for (int i = CompanionEntity.MAIN_START; i < CompanionEntity.MAIN_START + CompanionEntity.MAIN_SIZE; i++) {
+            ItemStack s = mob.storage().getItem(i);
+            if (s.isEmpty() || !(s.getItem() instanceof BlockItem bi)) continue;
+            if (!bi.getBlock().defaultBlockState().is(BlockTags.SAPLINGS)) continue;
+            if (f.isBlank() || BuiltInRegistries.ITEM.getKey(s.getItem()).getPath().contains(f)) return i;
+        }
+        return -1;
+    }
+
+    private BlockPos findSpot(ServerLevel level, BlockState sapling) {
+        BlockPos centre = mob.anchor();
+        BlockPos best = null;
+        double bestD = Double.MAX_VALUE;
+        for (BlockPos p : BlockPos.betweenClosed(centre.offset(-RADIUS, -3, -RADIUS), centre.offset(RADIUS, 3, RADIUS))) {
+            if (!level.getBlockState(p.below()).is(BlockTags.DIRT)) continue;        // cheap test first
+            double d = mob.distanceToSqr(p.getX() + 0.5, p.getY(), p.getZ() + 0.5);
+            if (d >= bestD || !valid(level, p, sapling)) continue;
+            bestD = d;
+            best = p.immutable();
+        }
+        return best;
+    }
+
+    private boolean valid(ServerLevel level, BlockPos p, BlockState sapling) {
+        if (badSpots.contains(p)) return false;
+        BlockState here = level.getBlockState(p);
+        if (!here.isAir() && !here.canBeReplaced()) return false;                   // air, grass, ferns, snow layers
+        if (!level.getBlockState(p.below()).is(BlockTags.DIRT) || !sapling.canSurvive(level, p)) return false;
+        for (int dx = -2; dx <= 2; dx++) for (int dz = -2; dz <= 2; dz++) for (int dy = 0; dy <= 1; dy++) {
+            BlockState n = level.getBlockState(p.offset(dx, dy, dz));
+            if (n.is(BlockTags.SAPLINGS) || n.is(BlockTags.LOGS)) return false;     // keep trees 3 apart
+        }
+        for (int dy = 1; dy <= 5; dy++) {                                            // room to grow
+            BlockState a = level.getBlockState(p.above(dy));
+            if (!a.isAir() && !a.is(BlockTags.LEAVES) && !a.canBeReplaced()) return false;
+        }
+        return CompanionProtection.canModify(level, mob, p);
+    }
+}
+```
+
 ## common\src\main\java\com\example\companionmod\entity\ai\CompanionSeekBlockGoal.java
 
 ```java
 package com.example.companionmod.entity.ai;
 
 import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.entity.CompanionProtection;
 import com.example.companionmod.entity.task.MineTask;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.ai.goal.Goal;
 import net.minecraft.world.entity.ai.navigation.PathNavigation;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.EntityBlock;
 import net.minecraft.world.level.block.FallingBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.Heightmap;
@@ -4001,8 +4578,10 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -4030,6 +4609,16 @@ public class CompanionSeekBlockGoal extends Goal {
     private BlockPos breaking, walkTo, oreTarget, stepStand;
     private int walkMode, breakProgress, breakNeed, walkTicks, scanCooldown, stuck, wanderTries, torchCooldown;
     private long lastProgress, lastSpeak;
+
+    // --- scaffolding: climb with blocks from the bag, take them back afterwards; plus per-target bookkeeping
+    private static final int MAX_SCAFFOLD = 24;
+    private final Deque<BlockPos> scaffold = new ArrayDeque<>();      // blocks WE placed, bottom first (kept across goal restarts)
+    private final Map<BlockPos, Integer> approachTries = new HashMap<>();
+    private BlockPos approachTarget, pillarTarget, jumpCell;
+    private int pillarAir, cleanupWait, pillarPlaced, bridgeRun;
+    private BlockPos bridgeCell;
+    private long softRecoverAt;
+    private int walkRetries;
 
     public CompanionSeekBlockGoal(CompanionEntity mob) {
         this.mob = mob;
@@ -4063,6 +4652,9 @@ public class CompanionSeekBlockGoal extends Goal {
         vein.clear();
         breaking = walkTo = oreTarget = stepStand = null;
         breakProgress = walkTicks = scanCooldown = stuck = wanderTries = 0;
+        approachTries.clear();
+        approachTarget = pillarTarget = jumpCell = bridgeCell = null;
+        pillarAir = 0;
         if (unreachable.size() > 200) unreachable.clear();
     }
 
@@ -4074,14 +4666,25 @@ public class CompanionSeekBlockGoal extends Goal {
         MineTask t = mob.mineTask();
         long now = level.getGameTime();
 
-        if (now - lastProgress > 500) {                           // 25 s without progress: re-plan, then give up politely
+        long idle = now - lastProgress;
+        if (idle > 160 && idle <= 500 && softRecoverAt != lastProgress) {   // 8 s without progress: drop what we are fixated on, re-decide
+            softRecoverAt = lastProgress;
+            cancelBreak(level);
+            if (approachTarget != null) giveUp(approachTarget);
+            pending.clear();
+            stepStand = walkTo = null;
+            endPillar();
+            bridgeCell = null;
+            return;
+        }
+        if (idle > 500) {                                         // 25 s without progress: re-plan, then give up politely
             lastProgress = now;
             cancelBreak(level);
             pending.clear();
             stepStand = walkTo = oreTarget = null;
             if (++stuck >= 4) {
                 t.pause();
-                say(level, "I'm stuck. Say 'continue' and I'll try again.", true);
+                say(level, "I'm stuck (" + stateName() + "). Say 'continue' and I'll try again.", true);
                 return;
             }
             t.dirData = Direction.from2DDataValue(t.dirData).getClockWise().get2DDataValue();
@@ -4095,7 +4698,20 @@ public class CompanionSeekBlockGoal extends Goal {
         if (breaking != null) { keepBreaking(level, t, now); return; }
         if (walkTo != null) { walk(level, now); return; }
         if (!pending.isEmpty()) { startBreak(level, pending.poll()); return; }
+        if (pillarTarget != null) { pillarStep(level, t, now); return; }
+        if (!mob.onGround() && !mob.isInWater()) return;        // wait for the landing: path requests fail in mid-air and used to mark good targets "unreachable"
         if (stepStand != null) {
+            if (bridgeCell != null) {                                   // mining: lay a floor over an air gap first (stays there)
+                BlockPos b = bridgeCell;
+                bridgeCell = null;
+                if (passable(level, b)) {
+                    ItemStack taken = CompanionProtection.canModify(level, mob, b) ? takeScaffoldBlock(t) : ItemStack.EMPTY;
+                    if (taken.isEmpty()) { stepStand = null; return; }
+                    level.setBlock(b, ((BlockItem) taken.getItem()).getBlock().defaultBlockState(), 3);
+                    mob.swing(InteractionHand.MAIN_HAND, true);
+                    lastProgress = now;
+                }
+            }
             walkTo = stepStand;
             walkMode = WALK_STAND;
             walkTicks = 0;
@@ -4107,6 +4723,14 @@ public class CompanionSeekBlockGoal extends Goal {
     }
 
     private void decide(ServerLevel level, MineTask t) {
+        if (t.mined >= t.want) {                    // done (also when a fight interrupted it): climb down first, then report
+            if (cleanupScaffold(level)) return;
+            String msg = "That's " + t.mined + " " + CompanionEntity.prettyBlockId(t.blockId) + " for you.";
+            t.finish();
+            mob.speak(msg);
+            resetTransient();                       // no warp home: the follow goal walks the companion back
+            return;
+        }
         while (!vein.isEmpty() && !matches(t, level.getBlockState(vein.peek()))) vein.poll();
         if (!vein.isEmpty()) { approach(level, t, vein.peek()); return; }
 
@@ -4117,6 +4741,8 @@ public class CompanionSeekBlockGoal extends Goal {
         }
         if (oreTarget != null && !matches(t, level.getBlockState(oreTarget))) oreTarget = null;
         if (oreTarget != null) { approach(level, t, oreTarget); return; }
+
+        if (cleanupScaffold(level)) return;         // nothing left to mine from up here: climb down, take our blocks back
 
         int y = mob.blockPosition().getY();
         switch (t.phase) {
@@ -4158,11 +4784,20 @@ public class CompanionSeekBlockGoal extends Goal {
             t.dirData = d.getClockWise().get2DDataValue();
             return;
         }
-        if (planStep(level, t, d, 0, false)) t.legLen++;
-        else t.legLen = len;                                            // lava/water/hole ahead: end this leg early
+        if (planStep(level, t, d, 0, false)) { t.legLen++; return; }
+        // Blocked ahead (lava pocket, bedrock bump): mine at a slight angle or step over it before ending the leg.
+        // Without this one blocked cell ended the leg instantly, all 8 legs burned in seconds and the task paused.
+        if (planStep(level, t, d.getClockWise(), 0, false)
+                || planStep(level, t, d.getCounterClockWise(), 0, false)
+                || planStep(level, t, d, -1, false) || planStep(level, t, d, 1, false)) {
+            t.legLen++;
+            return;
+        }
+        t.legLen = len;                                                 // truly boxed in: end this leg early
     }
 
     private void wanderSearch(ServerLevel level, MineTask t) {
+        if (wanderTries == 3) unreachable.clear();   // new vantage point: give previously unreachable blocks another chance
         if (++wanderTries > 10) {
             t.pause();
             say(level, "I can't find any " + CompanionEntity.prettyBlockId(t.blockId) + " around here.", true);
@@ -4184,10 +4819,24 @@ public class CompanionSeekBlockGoal extends Goal {
     // ------------------------------------------------------------------ approaching and tunnelling
 
     private void approach(ServerLevel level, MineTask t, BlockPos target) {
-        if (mob.distanceToSqr(Vec3.atCenterOf(target)) <= REACH_SQ && lineClear(level, target)) {
-            startBreak(level, target);
+        approachTarget = target;
+        if (inReach(Vec3.atCenterOf(target))) {
+            if (lineClear(level, target)) { startBreak(level, target); return; }
+            // Close enough but something is in the way (stone, leaves...): dig it out the way a player would.
+            BlockPos blocker = firstBlocker(level, target);
+            if (blocker == null) { startBreak(level, target); return; }
+            if (approachTries.merge(target.immutable(), 1, Integer::sum) <= 8 && safeToBreak(level, blocker)) {
+                pending.add(blocker);
+            } else {
+                giveUp(target);
+            }
             return;
         }
+        // Far away (or above us). Unless we are climbing toward this block, get off our tower first.
+        BlockPos me = mob.blockPosition();
+        boolean climbing = target.getY() - me.getY() >= 2
+                && Math.max(Math.abs(target.getX() - me.getX()), Math.abs(target.getZ() - me.getZ())) <= 3;
+        if (!climbing && cleanupScaffold(level)) return;
         if (t.phase == MineTask.Phase.SEARCH) {                          // above ground: walk if a path exists
             Path p = mob.getNavigation().createPath(target, 1);
             if (p != null && p.canReach()) {
@@ -4197,8 +4846,183 @@ public class CompanionSeekBlockGoal extends Goal {
                 mob.getNavigation().moveTo(p, 1.1);
                 return;
             }
+            if (tryScaffold(level, t, target)) return;                   // high in a tree: build up to it
         }
         tunnelToward(level, t, target);
+    }
+
+    private void giveUp(BlockPos target) {
+        unreachable.add(target.immutable());
+        vein.remove(target);
+        if (target.equals(oreTarget)) oreTarget = null;
+        if (target.equals(pillarTarget)) { pillarTarget = null; jumpCell = null; }
+        pending.clear();
+        stepStand = null;
+    }
+
+    /** First solid cell between our eyes and the target (the thing we must dig out), or null. */
+    private BlockPos firstBlocker(ServerLevel level, BlockPos target) {
+        Vec3 eye = mob.getEyePosition(), goal = Vec3.atCenterOf(target), delta = goal.subtract(eye);
+        for (int k = 1; k <= 8; k++) {
+            BlockPos bp = BlockPos.containing(eye.add(delta.scale(k / 9.0)));
+            if (bp.equals(target)) break;
+            if (!level.getBlockState(bp).getCollisionShape(level, bp).isEmpty()) return bp.immutable();
+        }
+        return null;
+    }
+
+    /** Never open a wall into liquid, and never break unbreakable blocks. */
+    private boolean safeToBreak(ServerLevel level, BlockPos c) {
+        BlockState s = level.getBlockState(c);
+        if (s.getDestroySpeed(level, c) < 0 || !s.getFluidState().isEmpty()) return false;
+        for (Direction dd : Direction.values()) {
+            if (!level.getBlockState(c.relative(dd)).getFluidState().isEmpty()) return false;
+        }
+        return true;
+    }
+
+    // ------------------------------------------------------------------ scaffolding
+
+    /** Cheap, solid, non-falling blocks only (dirt, stone family, cobble, netherrack, planks), never the block being mined. */
+    private static boolean usableScaffold(ItemStack s, MineTask t) {
+        if (s.isEmpty() || !(s.getItem() instanceof BlockItem bi)) return false;
+        Block b = bi.getBlock();
+        if (b instanceof FallingBlock || b instanceof EntityBlock) return false;
+        BlockState st = b.defaultBlockState();
+        if (matches(t, st)) return !t.deep();            // surface job: the logs we just chopped are fine (temporary) scaffolding
+        return st.is(BlockTags.DIRT) || st.is(BlockTags.BASE_STONE_OVERWORLD) || st.is(BlockTags.BASE_STONE_NETHER)
+                || st.is(BlockTags.PLANKS) || b == Blocks.COBBLESTONE || b == Blocks.COBBLED_DEEPSLATE || b == Blocks.NETHERRACK
+                || (!t.deep() && st.is(BlockTags.LOGS));
+    }
+
+    private int scaffoldSlot(MineTask t) {
+        int best = -1, bestScore = Integer.MAX_VALUE;
+        for (int i = CompanionEntity.MAIN_START; i < CompanionEntity.MAIN_START + CompanionEntity.MAIN_SIZE; i++) {
+            ItemStack s = mob.storage().getItem(i);
+            if (!usableScaffold(s, t)) continue;
+            Block b = ((BlockItem) s.getItem()).getBlock();
+            int score = (b == Blocks.DIRT || b == Blocks.COBBLESTONE || b == Blocks.COBBLED_DEEPSLATE || b == Blocks.NETHERRACK) ? 0
+                    : (matches(t, b.defaultBlockState()) ? 2 : 1);      // our own logs only as a last resort
+            if (score < bestScore) { bestScore = score; best = i; }
+        }
+        return best;
+    }
+
+    private boolean hasScaffoldBlock(MineTask t) { return scaffoldSlot(t) >= 0; }
+
+    private ItemStack takeScaffoldBlock(MineTask t) {
+        int i = scaffoldSlot(t);
+        return i < 0 ? ItemStack.EMPTY : mob.storage().removeItem(i, 1);
+    }
+
+    /** The target is above us: walk to the foot of its column if needed, then start pillaring up. */
+    private boolean tryScaffold(ServerLevel level, MineTask t, BlockPos target) {
+        BlockPos me = mob.blockPosition();
+        if (target.getY() - me.getY() < 2) return false;
+        if (!hasScaffoldBlock(t)) {
+            say(level, "I can't reach that high. Give me some dirt or cobblestone to climb with.", false);
+            return false;
+        }
+        if (approachTries.merge(target.immutable(), 1, Integer::sum) > 8) return false;
+        int h = Math.max(Math.abs(target.getX() - me.getX()), Math.abs(target.getZ() - me.getZ()));
+        if (h <= 2) {
+            if (pillarTarget == null) pillarPlaced = 0;
+            pillarTarget = target.immutable();
+            jumpCell = null;
+            pillarAir = 0;
+            return true;
+        }
+        BlockPos foot = groundBelow(level, t, target).above();
+        Path p = mob.getNavigation().createPath(foot, 2);
+        if (p == null || !p.canReach()) return false;
+        walkTo = foot;
+        walkMode = WALK_FREE;
+        walkTicks = 0;
+        mob.getNavigation().moveTo(p, 1.0);
+        return true;
+    }
+
+    /** Solid ground under the target's column (skips air, leaves and the mined material itself, e.g. the trunk). */
+    private BlockPos groundBelow(ServerLevel level, MineTask t, BlockPos target) {
+        BlockPos g = target;
+        while (g.getY() > level.getMinY()) {
+            BlockState st = level.getBlockState(g);
+            if (st.getCollisionShape(level, g).isEmpty() || matches(t, st) || st.is(BlockTags.LEAVES)) g = g.below();
+            else break;
+        }
+        return g;
+    }
+
+    /** Jump, and while the feet are above the cell we left, put a block into it; repeat until the target is in reach. */
+    private void pillarStep(ServerLevel level, MineTask t, long now) {
+        BlockPos target = pillarTarget;
+        if (!matches(t, level.getBlockState(target)) || unreachable.contains(target)) { endPillar(); return; }
+        if (inReach(Vec3.atCenterOf(target))) { endPillar(); return; }   // in reach: normal mining (clears leaves in the way)
+        if (target.getY() <= mob.blockPosition().getY() + 1) { endPillar(); return; }          // no longer above us
+        mob.getNavigation().stop();
+        if (jumpCell == null) {
+            if (!mob.onGround()) return;                                  // wait until we have landed
+            if (scaffold.size() >= MAX_SCAFFOLD || pillarPlaced >= MAX_SCAFFOLD) {
+                say(level, "That's too high to build up to.", true);
+                giveUp(target);
+                return;
+            }
+            BlockPos feet = mob.blockPosition();
+            for (int up = 2; up <= 3; up++) {                             // headroom for the jump: leaves, branches...
+                BlockPos h = feet.above(up);
+                if (passable(level, h)) continue;
+                if (safeToBreak(level, h)) pending.add(h); else giveUp(target);
+                return;
+            }
+            if (!hasScaffoldBlock(t)) {
+                say(level, "I need dirt or cobblestone to climb up there.", true);
+                giveUp(target);
+                return;
+            }
+            jumpCell = feet.immutable();
+            pillarAir = 0;
+            mob.getJumpControl().jump();
+            return;
+        }
+        pillarAir++;
+        if (mob.getY() >= jumpCell.getY() + 1.05) {                       // feet are above the cell we left
+            if (passable(level, jumpCell)) {
+                if (!CompanionProtection.canModify(level, mob, jumpCell)) { giveUp(target); return; }
+                ItemStack taken = takeScaffoldBlock(t);
+                if (taken.isEmpty()) { giveUp(target); return; }
+                level.setBlock(jumpCell, ((BlockItem) taken.getItem()).getBlock().defaultBlockState(), 3);
+                pillarPlaced++;
+                if (!t.deep()) scaffold.addLast(jumpCell);        // surface jobs (trees...): temporary, taken back afterwards. Mining: the blocks stay.
+                mob.swing(InteractionHand.MAIN_HAND, true);
+                lastProgress = now;
+                mob.noteMiningProgress();
+            }
+            jumpCell = null;
+        } else if (pillarAir > 25) {
+            jumpCell = null;                                              // the jump did not happen (head bump, water): retry
+        }
+    }
+
+    private void endPillar() {
+        pillarTarget = null;
+        jumpCell = null;
+        pillarAir = 0;
+    }
+
+    /** Climbs down by breaking the top block we placed (we stand on it) and takes the blocks back. true = still busy. */
+    private boolean cleanupScaffold(ServerLevel level) {
+        while (!scaffold.isEmpty() && level.getBlockState(scaffold.peekLast()).isAir()) scaffold.pollLast();
+        if (scaffold.isEmpty()) { cleanupWait = 0; return false; }
+        BlockPos top = scaffold.peekLast();
+        if (!inReach(Vec3.atCenterOf(top))) {
+            if (++cleanupWait > 120) { scaffold.clear(); cleanupWait = 0; return false; }   // cannot get back to the tower: leave it
+            mob.getNavigation().moveTo(top.getX() + 0.5, top.getY(), top.getZ() + 0.5, 1.0);
+            return true;
+        }
+        cleanupWait = 0;
+        startBreak(level, top);
+        if (breaking == null) scaffold.pollLast();                        // refused (protected / unbreakable): forget it
+        return true;
     }
 
     private void tunnelToward(ServerLevel level, MineTask t, BlockPos target) {
@@ -4210,9 +5034,8 @@ public class CompanionSeekBlockGoal extends Goal {
         else d = dz > 0 ? Direction.SOUTH : Direction.NORTH;
         int dyStep = dy < -1 ? -1 : dy > 1 ? 1 : 0;
         if (!planStep(level, t, d, dyStep, true)) {
-            unreachable.add(target);
-            vein.remove(target);
-            oreTarget = null;
+            if (tryScaffold(level, t, target)) return;     // open air / cave: climb with blocks from the bag
+            giveUp(target);
         }
     }
 
@@ -4228,8 +5051,12 @@ public class CompanionSeekBlockGoal extends Goal {
             cells.add(stand);
             cells.add(stand.above());
             if (dyStep < 0) cells.add(stand.above(2));                  // headroom to walk in before dropping
-            if (!safe(level, stand, cells)) continue;
+            boolean bridge = dyStep == 0 && t.deep() && bridgeRun < 12 && hasScaffoldBlock(t)
+                    && level.getBlockState(stand.below()).isAir();      // gap in the floor while mining: bridge it
+            if (!safe(level, stand, cells, bridge)) continue;
             for (BlockPos c : cells) if (!passable(level, c)) pending.add(c);
+            bridgeCell = bridge ? stand.below().immutable() : null;
+            bridgeRun = bridge ? bridgeRun + 1 : 0;
             stepStand = stand;
             t.dirData = d.get2DDataValue();
             return true;
@@ -4238,8 +5065,13 @@ public class CompanionSeekBlockGoal extends Goal {
     }
 
     private boolean safe(ServerLevel level, BlockPos stand, List<BlockPos> cells) {
+        return safe(level, stand, cells, false);
+    }
+
+    private boolean safe(ServerLevel level, BlockPos stand, List<BlockPos> cells, boolean bridge) {
         BlockState floor = level.getBlockState(stand.below());
-        if (floor.isAir() || !floor.getFluidState().isEmpty()) return false;       // would walk into a hole / liquid
+        if (!floor.getFluidState().isEmpty()) return false;                         // never into liquid
+        if (floor.isAir() && !bridge) return false;                                 // would walk into a hole (unless we bridge it)
         int topY = Integer.MIN_VALUE;
         for (BlockPos c : cells) {
             BlockState s = level.getBlockState(c);
@@ -4267,6 +5099,11 @@ public class CompanionSeekBlockGoal extends Goal {
     private void startBreak(ServerLevel level, BlockPos pos) {
         BlockState st = level.getBlockState(pos);
         if (st.isAir()) return;
+        if (!CompanionProtection.canModify(level, mob, pos)) {
+            unreachable.add(pos); oreTarget = null; pending.clear(); stepStand = null;
+            say(level, "I'm not allowed to break blocks here.", false);
+            return;
+        }
         mob.equipBestToolFor(st);                                 // hold the right tool: visible swings + correct speed
         float h = st.getDestroySpeed(level, pos);
         if (h < 0) { unreachable.add(pos); oreTarget = null; pending.clear(); stepStand = null; return; }
@@ -4282,7 +5119,7 @@ public class CompanionSeekBlockGoal extends Goal {
         BlockState st = level.getBlockState(breaking);
         if (st.isAir()) { cancelBreak(level); lastProgress = now; return; }
         Vec3 c = Vec3.atCenterOf(breaking);
-        if (mob.distanceToSqr(c) > REACH_SQ + 1) {
+        if (mob.getEyePosition().distanceToSqr(c) > REACH_SQ + 2) {
             mob.getNavigation().moveTo(c.x, breaking.getY(), c.z, 1.0);
             return;
         }
@@ -4294,7 +5131,7 @@ public class CompanionSeekBlockGoal extends Goal {
         level.destroyBlockProgress(mob.getId(), breaking, Math.min(9, breakProgress * 10 / breakNeed));
         if (breakProgress < breakNeed) return;
 
-        boolean hit = matches(t, st);
+        boolean hit = matches(t, st) && !scaffold.contains(breaking);   // taking our own scaffold back is not a harvest
         BlockPos pos = breaking;
         level.destroyBlockProgress(mob.getId(), pos, -1);
         level.destroyBlock(pos, true, mob, 512);
@@ -4302,6 +5139,7 @@ public class CompanionSeekBlockGoal extends Goal {
         lastProgress = now;
         stuck = 0;
         mob.collectNearbyItems();
+        if (hit && !t.deep()) replantAfterChop(level, pos, st);
         if (hit) onMined(level, t, pos);
     }
 
@@ -4311,40 +5149,80 @@ public class CompanionSeekBlockGoal extends Goal {
             BlockPos n = pos.offset(dx, dy, dz);
             if (vein.size() < 24 && !vein.contains(n) && matches(t, level.getBlockState(n))) vein.add(n);
         }
-        say(level, "Got " + CompanionEntity.prettyBlockId(t.blockId) + "! (" + t.mined + "/" + t.want + ")", true);
-        if (t.mined >= t.want) {
-            String msg = "That's " + t.mined + " " + CompanionEntity.prettyBlockId(t.blockId) + " for you.";
-            t.finish();
-            mob.speak(msg);
-            resetTransient();      // no warp home: the follow goal walks the companion back
-        }
+        mob.noteMiningProgress();                 // keeps an AI plan step alive; progress is shown in the radial menu, not spoken
+        // finishing (and climbing back down) is handled in decide()
     }
 
     private void walk(ServerLevel level, long now) {
         walkTicks++;
+        if (walkTicks == 1) walkRetries = 0;
         BlockPos w = walkTo;
         boolean arrived = switch (walkMode) {
-            case WALK_REACH -> mob.distanceToSqr(Vec3.atCenterOf(w)) <= REACH_SQ && lineClear(level, w);
+            case WALK_REACH -> inReach(Vec3.atCenterOf(w));     // line of sight is handled by approach(): it digs the blocker out
             case WALK_FREE -> mob.distanceToSqr(Vec3.atCenterOf(w)) < 4.0;
             default -> Math.abs(mob.getX() - (w.getX() + 0.5)) < 0.7 && Math.abs(mob.getZ() - (w.getZ() + 0.5)) < 0.7
                     && Math.abs(mob.getY() - w.getY()) < 1.2;
         };
         if (arrived) { walkTo = null; lastProgress = now; mob.getNavigation().stop(); return; }
         PathNavigation nav = mob.getNavigation();
-        if (walkTicks > 80 || (walkTicks > 5 && nav.isDone())) {
-            if (walkMode == WALK_STAND) {                                // last resort so a tunnel step never deadlocks
+        if (walkMode == WALK_STAND) {
+            // A tunnel / stair step is one block: drive the move control directly.
+            // No path request that can fail mid-air, so no more block-by-block teleporting.
+            nav.stop();
+            mob.getMoveControl().setWantedPosition(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
+            mob.getLookControl().setLookAt(w.getX() + 0.5, w.getY() + 1.0, w.getZ() + 0.5);
+            if (w.getY() > mob.blockPosition().getY() && mob.onGround() && walkTicks % 4 == 0) {
+                mob.getJumpControl().jump();   // the move control cannot climb a 1-block step on its own: hop onto it
+            }
+            if (walkTicks > 60) {                                   // really jammed (corner, entity in the way): last resort
                 mob.setPos(w.getX() + 0.5, w.getY(), w.getZ() + 0.5);
                 mob.resetFallDistance();
-                nav.stop();
                 lastProgress = now;
-            } else if (walkMode == WALK_REACH && oreTarget != null) {
-                unreachable.add(oreTarget);
-                oreTarget = null;
+                walkTo = null;
             }
-            walkTo = null;
             return;
         }
-        if (walkMode == WALK_STAND && walkTicks % 20 == 0) nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
+        // Long walks use the pathfinder: re-request the path when it finished early or could not be made (airborne).
+        if (walkTicks % 10 == 1 && nav.isDone() && mob.onGround()) {
+            if (++walkRetries > 4) { failWalk(); return; }
+            nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, walkMode == WALK_FREE ? 1.0 : 1.1);
+        }
+        if (walkTicks > 160) failWalk();
+    }
+
+    private void failWalk() {
+        if (walkMode == WALK_REACH && approachTarget != null) giveUp(approachTarget);
+        walkTo = null;
+    }
+
+    /** Block reach is measured from the eyes (like a player), not from the feet: 1.6 blocks more upward reach. */
+    private boolean inReach(Vec3 c) { return mob.getEyePosition().distanceToSqr(c) <= REACH_SQ; }
+
+    private String stateName() {
+        return breaking != null ? "digging" : walkTo != null ? "walking" : pillarTarget != null ? "climbing"
+                : !pending.isEmpty() ? "clearing" : "planning";
+    }
+
+    /** After felling a trunk base on soil: put a matching sapling from the bag back (silently). */
+    private void replantAfterChop(ServerLevel level, BlockPos pos, BlockState chopped) {
+        if (!chopped.is(BlockTags.LOGS) || !level.getBlockState(pos.below()).is(BlockTags.DIRT)) return;
+        if (!level.getBlockState(pos).isAir()) return;
+        String path = BuiltInRegistries.BLOCK.getKey(chopped.getBlock()).getPath();
+        int cut = path.indexOf("_log");
+        if (cut <= 0) cut = path.indexOf("_wood");
+        if (cut <= 0) return;
+        String wood = path.substring(0, cut);
+        String saplingId = wood.equals("mangrove") ? "mangrove_propagule" : wood + "_sapling";
+        for (int i = CompanionEntity.MAIN_START; i < CompanionEntity.MAIN_START + CompanionEntity.MAIN_SIZE; i++) {
+            ItemStack s = mob.storage().getItem(i);
+            if (s.isEmpty() || !(s.getItem() instanceof BlockItem bi)) continue;
+            if (!BuiltInRegistries.ITEM.getKey(s.getItem()).getPath().equals(saplingId)) continue;
+            BlockState sap = bi.getBlock().defaultBlockState();
+            if (!sap.canSurvive(level, pos) || !CompanionProtection.canModify(level, mob, pos)) return;
+            mob.storage().removeItem(i, 1);
+            level.setBlock(pos, sap, 3);
+            return;
+        }
     }
 
     private void cancelBreak(ServerLevel level) {
@@ -4354,7 +5232,11 @@ public class CompanionSeekBlockGoal extends Goal {
 
     // ------------------------------------------------------------------ sensing
 
-    /** Nearest match that a player could actually see (touching air) or that is within 2 blocks of the companion. */
+    /**
+     * Nearest match a player could actually see. Exposed blocks (air on at least one face) win over buried ones
+     * at almost any range: a seeable ore 15 blocks away beats a buried ore 3 blocks away. Buried blocks only
+     * count when close, and the crown height penalty keeps high-up blocks from stealing the target.
+     */
     private BlockPos scan(ServerLevel level, MineTask t) {
         int r = t.phase == MineTask.Phase.SEARCH ? 22 : 10;
         BlockPos o = mob.blockPosition();
@@ -4363,8 +5245,11 @@ public class CompanionSeekBlockGoal extends Goal {
         for (BlockPos p : BlockPos.betweenClosed(o.offset(-r, -Math.min(r, 12), -r), o.offset(r, Math.min(r, 8), r))) {
             if (!matches(t, level.getBlockState(p)) || unreachable.contains(p)) continue;
             double d = mob.distanceToSqr(Vec3.atCenterOf(p));
-            if (d >= bestD || (d > 9.0 && !exposed(level, p))) continue;
-            bestD = d;
+            boolean exp = exposed(level, p);
+            if (d > 9.0 && !exp) continue;                              // buried blocks only count when close
+            double score = d + Math.max(0, p.getY() - (o.getY() + 2)) * 6.0 - (exp ? 50.0 : 0);
+            if (score >= bestD) continue;
+            bestD = score;
             best = p.immutable();
         }
         return best;
@@ -4571,6 +5456,7 @@ import com.example.companionmod.entity.ai.CompanionFollowGoal;
 import com.example.companionmod.entity.ai.CompanionFishGoal;
 import com.example.companionmod.entity.ai.CompanionPatrolGoal;
 import com.example.companionmod.entity.ai.CompanionPickupGoal;
+import com.example.companionmod.entity.ai.CompanionPlantGoal;
 import com.example.companionmod.entity.ai.CompanionSeekBlockGoal;
 import com.example.companionmod.entity.ai.CompanionSitGoal;
 import com.example.companionmod.entity.ai.CompanionTargetGoal;
@@ -4587,6 +5473,10 @@ import net.minecraft.network.syncher.EntityDataAccessor;
 import net.minecraft.network.syncher.EntityDataSerializers;
 import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.resources.Identifier;
+import net.minecraft.tags.DamageTypeTags;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.entity.ai.memory.MemoryModuleType;
+import com.example.companionmod.world.CompanionRegistry;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
@@ -4610,7 +5500,6 @@ import net.minecraft.world.entity.ai.goal.OpenDoorGoal;
 import net.minecraft.world.entity.ai.goal.RandomLookAroundGoal;
 import net.minecraft.world.entity.ai.navigation.GroundPathNavigation;
 import net.minecraft.world.entity.item.ItemEntity;
-import net.minecraft.world.entity.monster.Creeper;
 import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.player.Player;
@@ -4651,6 +5540,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     private static final EntityDataAccessor<String> DATA_SKIN = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.STRING);
     private static final EntityDataAccessor<Integer> DATA_FEMININE = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
     private static final EntityDataAccessor<Integer> DATA_PICKUP = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
+    /** Short progress text for the radial menu ("Wood 6/16"); empty when idle. Updated by the server every half second. */
+    private static final EntityDataAccessor<String> DATA_TASK = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.STRING);
     private static final EntityDataAccessor<String> DATA_SPEECH = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.STRING);
     private static final EntityDataAccessor<Integer> DATA_SPEECH_ID = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
     private static final EntityDataAccessor<Integer> DATA_INJURED = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
@@ -4710,9 +5601,11 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     // AI plan executor (the model never runs anything itself; it only returns validated plan data).
     private final CompanionPlanner planner = new CompanionPlanner();
     private boolean applyingPlanStep;
+    private boolean registryChecked;
 
     // job state (time-boxed / schematic-driven behaviours)
-    private long farmUntil, fishUntil;
+    private long farmUntil, fishUntil, plantUntil;
+    private String plantFilter = "";
     private String buildSchematic = "";
     private int selectedToolSlot = 0;          // which tool slot is held in the main hand
     private int targetSinceTick;               // when the current automatic target was acquired
@@ -4747,7 +5640,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         goalSelector.addGoal(2, new MeleeAttackGoal(this, 1.25, true));
         goalSelector.addGoal(2, new CompanionSeekBlockGoal(this));   // explicit "find diamonds" pre-empts walking
         goalSelector.addGoal(3, new CompanionPickupGoal(this));      // explicit "pick this up" pre-empts walking
-        goalSelector.addGoal(4, new CompanionFarmGoal(this));        // time-boxed jobs (farm / fish / build)
+        goalSelector.addGoal(4, new CompanionFarmGoal(this));
+        goalSelector.addGoal(4, new CompanionPlantGoal(this));        // time-boxed jobs (farm / fish / build)
         goalSelector.addGoal(4, new CompanionFishGoal(this));
         goalSelector.addGoal(4, new CompanionBuildGoal(this));
         goalSelector.addGoal(4, new CompanionPatrolGoal(this));
@@ -4769,6 +5663,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         builder.define(DATA_SKIN, "");
         builder.define(DATA_FEMININE, 0);
         builder.define(DATA_PICKUP, 0);
+        builder.define(DATA_TASK, "");
         builder.define(DATA_SPEECH, "");
         builder.define(DATA_SPEECH_ID, 0);
         builder.define(DATA_INJURED, 0);
@@ -4834,7 +5729,12 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     public boolean isSitting() { return moveMode() == MoveMode.SIT; }
 
     public String skin() { return entityData.get(DATA_SKIN); }
-    public void setSkin(String skin) { entityData.set(DATA_SKIN, skin == null ? "" : skin); }
+    /** Accepts "", "owner", "default" or a plain Minecraft name; anything else is ignored (every nearby client would look it up). */
+    public void setSkin(String skin) {
+        String s = skin == null ? "" : skin.trim();
+        boolean ok = s.isEmpty() || s.equalsIgnoreCase("owner") || s.equalsIgnoreCase("default") || s.matches("[A-Za-z0-9_]{1,16}");
+        if (ok) entityData.set(DATA_SKIN, s);
+    }
     public boolean isFeminine() { return entityData.get(DATA_FEMININE) != 0; }
     public void setFeminine(boolean value) { entityData.set(DATA_FEMININE, value ? 1 : 0); }
     public boolean isPickupEnabled() { return entityData.get(DATA_PICKUP) != 0; }
@@ -4850,6 +5750,12 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     public MineTask mineTask() { return mineTask; }
 
     public long farmUntil() { return farmUntil; }
+    public long plantUntil() { return plantUntil; }
+    public String plantFilter() { return plantFilter; }
+    public void endPlant() { plantUntil = 0; plantFilter = ""; }
+    public String taskText() { return entityData.get(DATA_TASK); }
+    /** Called by work goals whenever they make real progress, so a timed AI plan step is not cut off mid-job. */
+    public void noteMiningProgress() { planner.extendDeadline(tickCount, 600); }
     public long fishUntil() { return fishUntil; }
     public String buildSchematic() { return buildSchematic; }
     /** Clears the current build job (called by the build goal when it finishes). */
@@ -4890,7 +5796,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     }
 
     public void applyCommand(CompanionCommand cmd, ServerPlayer from, String target) {
-        if (!applyingPlanStep && cmd != CompanionCommand.PLAN && cmd != CompanionCommand.CONTINUE) {
+        if (!applyingPlanStep && cmd.interruptsPlanning()) {
             // One explicit intent at a time: a manual order pauses the AI plan (STOP forgets it entirely).
             planner.notePlayerOrder(tickCount);
         }
@@ -4921,7 +5827,15 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             case GUARD, DEFEND -> { if (isSitting()) setMoveMode(MoveMode.FOLLOW); setStance(Stance.GUARD); }
             case DEFENSIVE -> { setStance(Stance.DEFENSIVE); forcedTarget = null; setTarget(null); }
             case PASSIVE -> { setStance(Stance.PASSIVE); forcedTarget = null; setTarget(null); getNavigation().stop(); }
-            case COME -> { clearSeekBlock(); if (isSitting()) setMoveMode(MoveMode.FOLLOW); if (from != null) teleportNear(from); }
+            case COME -> {
+                clearSeekBlock();
+                if (isSitting()) setMoveMode(MoveMode.FOLLOW);
+                if (from != null) {
+                    // A "come" that is part of a plan (bringing the loot back) walks like a person; only a spoken "come" warps.
+                    if (applyingPlanStep && from.level() == level() && distanceToSqr(from) < 48 * 48) setMoveMode(MoveMode.FOLLOW);
+                    else teleportNear(from);
+                }
+            }
             case RETREAT, FLEE -> {
                 clearSeekBlock();
                 setStance(Stance.PASSIVE);
@@ -4942,7 +5856,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             case PICKUP, LOOT, TAKE -> {
                 String filter = target == null ? "" : target.trim();
                 String id = normalizeBlockId(filter);
-                if (!id.isBlank() && !anyMatchingDrops(filter)) {
+                if (!id.isBlank() && !isPlantId(id) && !anyMatchingDrops(filter)) {   // saplings/flowers are items to pick up, never blocks to break
                     clearSeekBlock();
                     setSeekBlock(id);
                     setAnchor(blockPosition());
@@ -4970,7 +5884,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
                 }
             }
             case SET_NAME -> {
-                String n = target == null ? "" : target.trim();
+                String n = sanitizeName(target);
                 if (!n.isBlank()) {
                     setCustomName(Component.literal(n));
                     setCustomNameVisible(false);
@@ -4979,7 +5893,10 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             case SET_SKIN -> setSkin(target == null ? "" : target.trim());
             case FEMININE -> setFeminine(true);
             case MASCULINE -> setFeminine(false);
-            case REVIVE -> revivePulse();
+            case REVIVE -> {
+                // Must be the owner and actually next to the body (the client sends pulses while holding left click).
+                if (from != null && isOwner(from) && from.distanceToSqr(this) <= 49.0) revivePulse();
+            }
             case PLAN -> { lastPlanJson = target == null ? "" : target; planner.accept(target, this, tickCount); }
             case CONTINUE -> {
                 // Resume whatever was interrupted: a paused AI plan first, then a stuck/paused mining job,
@@ -4988,6 +5905,14 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
                 else if (mineTask().running() || mineTask().resume()) speak("Back to work.");
                 else if (!lastPlanJson.isBlank() && planner.accept(lastPlanJson, this, tickCount)) speak("Restarting the plan.");
                 else speak("There is nothing to continue.");
+            }
+            case PLANT -> {
+                clearSeekBlock();
+                plantFilter = target == null ? "" : target.toLowerCase(Locale.ROOT).trim().replace("minecraft:", "")
+                        .replace(' ', '_').replace("saplings", "sapling");
+                plantUntil = level().getGameTime() + 1200;
+                setAnchor(blockPosition());
+                getNavigation().stop();
             }
             case FARM -> { farmUntil = level().getGameTime() + 600; setAnchor(blockPosition()); speak("Farming."); }
             case FISH -> { fishUntil = level().getGameTime() + 600; setAnchor(blockPosition()); speak("Going fishing."); }
@@ -5018,6 +5943,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         clearSeekBlock();
         finishPickup(false);
         farmUntil = 0;
+        plantUntil = 0;
         fishUntil = 0;
         clearBuild();
         forcedTarget = null;
@@ -5299,6 +6225,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         if (isSitting()) setMoveMode(MoveMode.STAY);
         getNavigation().stop();
         speak("I'm down! Hold left click on me to revive me!");
+        makeMobsForgetMe();
     }
 
     /** Called from the REVIVE order while the player holds left mouse button on the companion. */
@@ -5321,10 +6248,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     /** The 60 s revive window ran out: drop the gear and really die. */
     private void bleedOut() {
         speak("I'm fading...");
-        Containers.dropContents(level(), this, storage);
-        setItemSlot(EquipmentSlot.MAINHAND, ItemStack.EMPTY);
-        setItemSlot(EquipmentSlot.OFFHAND, ItemStack.EMPTY);
-        for (EquipmentSlot slot : ARMOR_SLOTS) setItemSlot(slot, ItemStack.EMPTY);
+        dropStorageAndClear();
         forceDeath = true;
         die(injurySource != null ? injurySource : level().damageSources().generic());
     }
@@ -5355,6 +6279,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     @Override public void planSay(String text) { speak(text); }
     @Override public boolean planSeekActive() { return !seekBlock().isBlank(); }
+    @Override public boolean planPlantActive() { return plantUntil > level().getGameTime(); }
     @Override public boolean planPickupActive() { return isPickupRequested() || isPickupEnabled(); }
     @Override public boolean planFighting() { LivingEntity t = getTarget(); return t != null && t.isAlive(); }
     @Override public boolean planPaused() { return isInjured(); }
@@ -5400,9 +6325,9 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         if (forcedTarget != null) return forcedTarget;
         if (owner != null) {
             LivingEntity a = owner.getLastHurtByMob();
-            if (a != null && owner.tickCount - owner.getLastHurtByMobTimestamp() < 200 && isValidTarget(a, owner) && !(a instanceof Creeper) && visibleOrAggro(a, owner)) return a;
+            if (a != null && owner.tickCount - owner.getLastHurtByMobTimestamp() < 200 && isValidTarget(a, owner) && visibleOrAggro(a, owner)) return a;
             LivingEntity b = owner.getLastHurtMob();
-            if (b != null && owner.tickCount - owner.getLastHurtMobTimestamp() < 200 && isValidTarget(b, owner) && !(b instanceof Creeper) && visibleOrAggro(b, owner)) return b;
+            if (b != null && owner.tickCount - owner.getLastHurtMobTimestamp() < 200 && isValidTarget(b, owner) && visibleOrAggro(b, owner)) return b;
         }
         LivingEntity c = getLastHurtByMob();
         if (c != null && c.isAlive() && c != owner && !(c instanceof CompanionEntity) && !(c instanceof Player) && visibleOrAggro(c, owner)) return c;
@@ -5412,7 +6337,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         double r = mining ? 4 : (stance() == Stance.GUARD ? 16 : 6);
         var centre = (owner != null && moveMode() == MoveMode.FOLLOW) ? owner : this;
         List<LivingEntity> near = level().getEntitiesOfClass(LivingEntity.class, centre.getBoundingBox().inflate(r),
-                e -> isValidTarget(e, owner) && !(e instanceof Creeper) && distanceToSqr(e) < (mining ? 8 * 8 : 28 * 28));
+                e -> isValidTarget(e, owner) && distanceToSqr(e) < (mining ? 8 * 8 : 28 * 28));
         LivingEntity best = null;
         double bestD = Double.MAX_VALUE;
         for (LivingEntity e : near) {
@@ -5494,11 +6419,13 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
      * retargeting still wins whenever a player (or a fight) is available, and a downed/resting companion is left alone.
      */
     private void aggroMonsters() {
-        if (isInjured() || isSitting()) return;
+        if (isInjured() || isSitting() || stance() == Stance.PASSIVE) return;
         if (!(level() instanceof ServerLevel level)) return;
-        for (Monster m : level.getEntitiesOfClass(Monster.class, getBoundingBox().inflate(24), e -> e.isAlive())) {
+        int claimed = 0;
+        for (Monster m : level.getEntitiesOfClass(Monster.class, getBoundingBox().inflate(16), e -> e.isAlive())) {
             if (m.getTarget() != null || !m.getSensing().hasLineOfSight(this)) continue;
             m.setTarget(this);
+            if (++claimed >= 6) break;            // never pull a whole cave onto the companion in one pass
         }
     }
 
@@ -5696,6 +6623,11 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     public void tick() {
         super.tick();
         if (level().isClientSide()) return;
+        if (!registryChecked) {
+            registryChecked = true;
+            if (!claimRegistry()) return;       // stale duplicate: it dropped its bag and removed itself
+        }
+        if (tickCount % 10 == 0) refreshTaskText();
         if (isSitting()) {
             getNavigation().stop();
             if (tickCount % 40 == 0) heal(1.0f);               // resting heals
@@ -5706,10 +6638,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         if (!speech().isBlank() && tickCount - lastSpokenTick > 600) {
             entityData.set(DATA_SPEECH, "");
         }
-        if (tickCount % 20 == 0) {
-            refreshEquipment();
-            aggroMonsters();                     // hostile mobs should see the companion as a target
-        }
+        if (tickCount % 20 == 0) refreshEquipment();
+        if (tickCount % 40 == 0) aggroMonsters();   // hostile mobs should see the companion as a target
         // Drop an automatic target we cannot reach (so mining etc. resumes); player-forced targets persist.
         LivingEntity tgt = getTarget();
         if (tgt != null && tgt != forcedTarget && tgt.isAlive() && tickCount - targetSinceTick > 200
@@ -5720,6 +6650,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             getNavigation().stop();
             setTarget(null);
             setPose(Pose.SWIMMING);                            // Mojang's crawl animation (swimming pose on land)
+            if (tickCount % 10 == 0) makeMobsForgetMe();       // a downed body is not a target
             boolean reviving = isReviving();
             if (reviving) {
                 reviveProgress = Math.min(1f, reviveProgress + 1f / REVIVE_TICKS);
@@ -5738,7 +6669,11 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     @Override
     public boolean hurtServer(ServerLevel level, DamageSource source, float amount) { // 26.1-CHECK: hurt -> hurtServer since 1.21.2
-        if (isInjured()) return false;                              // already down: no further damage
+        if (isInjured()) {
+            // Downed bodies take no normal damage, but /kill and the void must still be able to finish them.
+            if (!source.is(DamageTypeTags.BYPASSES_INVULNERABILITY)) return false;
+            return super.hurtServer(level, source, amount);
+        }
         // Friendly fire enabled: the owner can hurt the companion just like another player can.
         // Lethal damage still uses the normal downed/revive flow (and a downed companion is invulnerable).
         boolean hurt = super.hurtServer(level, source, amount);
@@ -5757,6 +6692,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     @Override
     public void die(DamageSource source) {
         if (!forceDeath && !isInjured()) { injure(source); return; }
+        if (!forceDeath) { dropStorageAndClear(); forceDeath = true; }   // killed while downed (/kill, void): the bag must not vanish
+        if (level() instanceof ServerLevel sl && ownerUuid != null) CompanionRegistry.clear(sl.getServer(), ownerUuid, getUUID());
         super.die(source);
     }
 
@@ -5764,6 +6701,129 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     @Override
     public boolean removeWhenFarAway(double distSq) { return false; }
+
+    // ------------------------------------------------------------------ task text, plants
+
+    private void refreshTaskText() {
+        long now = level().getGameTime();
+        String s = "";
+        if (mineTask.exists()) {
+            String p = prettyBlockId(mineTask.blockId).replace(" ore", "");
+            s = Character.toUpperCase(p.charAt(0)) + p.substring(1) + " " + mineTask.mined + "/" + mineTask.want + (mineTask.paused ? " ||" : "");
+        } else if (plantUntil > now) s = "Planting";
+        else if (farmUntil > now) s = "Farming";
+        else if (fishUntil > now) s = "Fishing";
+        else if (!buildSchematic.isBlank()) s = "Building";
+        if (!s.equals(entityData.get(DATA_TASK))) entityData.set(DATA_TASK, s);
+    }
+
+    private static boolean isPlantId(String id) {
+        if (id.endsWith("_sapling") || id.endsWith("_propagule")) return true;
+        Identifier loc = Identifier.tryParse(id);
+        if (loc == null) return false;
+        return BuiltInRegistries.BLOCK.getOptional(loc).map(b -> {
+            BlockState st = b.defaultBlockState();
+            return st.is(net.minecraft.tags.BlockTags.SAPLINGS) || st.is(net.minecraft.tags.BlockTags.FLOWERS)
+                    || st.is(net.minecraft.tags.BlockTags.CROPS);
+        }).orElse(false);
+    }
+
+    // ------------------------------------------------------------------ identity, registry, downed handling
+
+    /** Owner UUID from the synced data: valid on BOTH sides (the {@code ownerUuid} field is server-only). */
+    public UUID syncedOwner() {
+        String s = entityData.get(DATA_OWNER);
+        if (s.isEmpty()) return null;
+        try { return UUID.fromString(s); } catch (IllegalArgumentException e) { return null; }
+    }
+
+    private static String sanitizeName(String raw) {
+        if (raw == null) return "";
+        String s = raw.replaceAll("\\p{Cntrl}", "").trim();
+        return s.length() > 32 ? s.substring(0, 32).trim() : s;
+    }
+
+    /**
+     * One companion per owner: the world's registry says which UUID is the real one. A copy that was left in an
+     * unloaded chunk when the shrine made a new companion drops its bag and removes itself the moment it loads.
+     * @return false when this entity just removed itself
+     */
+    private boolean claimRegistry() {
+        if (ownerUuid == null || !(level() instanceof ServerLevel sl)) return true;
+        UUID registered = CompanionRegistry.get(sl.getServer(), ownerUuid);
+        if (registered == null) { CompanionRegistry.set(sl.getServer(), ownerUuid, getUUID()); return true; }
+        if (registered.equals(getUUID())) return true;
+        dropStorageAndClear();
+        discard();
+        return false;
+    }
+
+    /** Mobs that were already chasing the body (or remember it as their attacker) let go of it. */
+    private void makeMobsForgetMe() {
+        if (!(level() instanceof ServerLevel sl)) return;
+        for (Mob m : sl.getEntitiesOfClass(Mob.class, getBoundingBox().inflate(32), e -> e != this)) {
+            if (m.getTarget() == this) m.setTarget(null);
+            if (m.getLastHurtByMob() == this) m.setLastHurtByMob(null);
+            // hasMemoryValue is null-safe; getMemory() itself throws for brains without ATTACK_TARGET
+            // (cows, chickens, most passive mobs), which crashed the server when the companion went down.
+            if (m.getBrain().hasMemoryValue(MemoryModuleType.ATTACK_TARGET)) {
+                m.getBrain().getMemory(MemoryModuleType.ATTACK_TARGET).ifPresent(t -> {
+                    if (t == this) m.getBrain().eraseMemory(MemoryModuleType.ATTACK_TARGET);
+                });
+            }
+        }
+    }
+
+    /** Drops the whole bag and the mirrored gear on the ground, and empties them so nothing can be dropped twice. */
+    private void dropStorageAndClear() {
+        Containers.dropContents(level(), this, storage);
+        storage.clearContent();
+        setItemSlot(EquipmentSlot.MAINHAND, ItemStack.EMPTY);
+        setItemSlot(EquipmentSlot.OFFHAND, ItemStack.EMPTY);
+        for (EquipmentSlot slot : ARMOR_SLOTS) setItemSlot(slot, ItemStack.EMPTY);
+    }
+
+    /** Used when the shrine has to recreate the companion (other dimension): nothing the player gave it is lost. */
+    public void copyStateFrom(CompanionEntity other) {
+        for (int i = 0; i < SIZE; i++) storage.setItem(i, other.storage.getItem(i).copy());
+        if (other.hasCustomName()) setCustomName(other.getCustomName());
+        setSkin(other.skin());
+        setFeminine(other.isFeminine());
+        setStance(other.stance());
+        refreshEquipment();
+    }
+
+    /** A downed companion is not a valid target for any mob. */
+    @Override
+    public boolean canBeSeenAsEnemy() { return !isInjured() && super.canBeSeenAsEnemy(); }
+
+    @Override
+    public boolean canBeSeenByAnyone() { return !isInjured() && super.canBeSeenByAnyone(); }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\CompanionProtection.java
+
+```java
+package com.example.companionmod.entity;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.player.Player;
+
+/**
+ * One place that decides whether the companion may break or place a block. It acts on behalf of its owner, so it
+ * respects vanilla spawn protection and the world border. Mods that protect land through player events
+ * (claim mods) can only be honoured fully with a fake player; this is the loader-neutral baseline.
+ */
+public final class CompanionProtection {
+    private CompanionProtection() {}
+
+    public static boolean canModify(ServerLevel level, CompanionEntity mob, BlockPos pos) {
+        Player owner = mob.getOwner();
+        if (owner == null) return false;
+        return level.mayInteract(owner, pos);   // 26.1-CHECK: parameter type is Player or Entity; a Player fits both
+    }
 }
 ```
 
@@ -5883,7 +6943,7 @@ import java.util.Set;
  * while it was interrupted.</p>
  */
 public final class CompanionPlanner {
-    private static final Set<String> RETURN_AFTER = Set.of("wander", "patrol", "seek_block", "pickup", "attack", "guard");
+    private static final Set<String> RETURN_AFTER = Set.of("wander", "patrol", "seek_block", "pickup", "attack", "guard", "plant");
 
     private final ArrayDeque<PlanStep> queue = new ArrayDeque<>();
     private PlanStep current;
@@ -5896,6 +6956,13 @@ public final class CompanionPlanner {
     public boolean active() { return current != null || !queue.isEmpty(); }
     public boolean paused() { return paused; }
     public String goal() { return goal; }
+
+    /** A work goal made real progress: a timed seek_block / plant step gets at least {@code ticks} more, so it is never cut off mid-job. */
+    public void extendDeadline(long fromTick, long ticks) {
+        if (current != null && ("seek_block".equals(current.op()) || "plant".equals(current.op()))) {
+            endTick = Math.max(endTick, fromTick + ticks);
+        }
+    }
 
     public void cancel() { queue.clear(); current = null; goal = ""; paused = false; }
 
@@ -5965,6 +7032,7 @@ public final class CompanionPlanner {
             case "say" -> dt >= 30;                                   // small pause so lines never flood chat
             case "seek_block" -> tick >= endTick || (dt > 40 && !host.planSeekActive());
             case "pickup" -> tick >= endTick || (dt > 20 && !host.planPickupActive());
+            case "plant" -> tick >= endTick || (dt > 40 && !host.planPlantActive());
             case "attack" -> tick >= endTick || (dt > 60 && !host.planFighting());
             default -> tick >= endTick;
         };
@@ -5988,6 +7056,7 @@ public interface PlanActions {
     void planSay(String text);
     boolean planSeekActive();
     boolean planPickupActive();
+    default boolean planPlantActive() { return false; }
     boolean planFighting();
     /** Freeze the plan while true (e.g. injured and recovering). */
     default boolean planPaused() { return false; }
@@ -6260,6 +7329,7 @@ import com.example.companionmod.command.CompanionCommand;
 import com.example.companionmod.entity.CompanionEntity;
 import com.example.companionmod.registry.ModContent;
 import com.example.companionmod.voice.ReplyParser;
+import com.example.companionmod.world.CompanionRegistry;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -6305,7 +7375,10 @@ public final class CommandHandler {
 
         CompanionEntity companion = ModContent.findCompanion(player.level().getServer(), player.getUUID());
         if (companion == null) {
-            player.sendSystemMessage(Component.literal("You have no companion. Activate a Companion Shrine to summon one."));
+            boolean exists = CompanionRegistry.get(player.level().getServer(), player.getUUID()) != null;
+            player.sendSystemMessage(Component.literal(exists
+                    ? "Your companion is too far away (its chunk is not loaded). Activate a Companion Shrine to call it."
+                    : "You have no companion. Activate a Companion Shrine to summon one."));
             return;
         }
         companion.applyCommand(cmd, player, target);
@@ -6313,6 +7386,8 @@ public final class CommandHandler {
     }
 
     public static void forget(UUID player) { BUCKETS.remove(player); }
+
+    public static void forgetAll() { BUCKETS.clear(); }
 }
 ```
 
@@ -6357,6 +7432,7 @@ import com.example.companionmod.CompanionMod;
 import com.example.companionmod.block.CompanionShrineBlock;
 import com.example.companionmod.entity.CompanionEntity;
 import com.example.companionmod.inventory.CompanionInventoryMenu;
+import com.example.companionmod.world.CompanionRegistry;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
@@ -6376,7 +7452,7 @@ import net.minecraft.world.level.material.MapColor;
 import java.util.UUID;
 
 /**
- * All game objects, created once. The loaders only register them (Fabric: Registry.register in order block -> item -> entity;
+ * All game objects, created once. The loaders only register them (Fabric: Registry.register in order block -> item -> entity -> menu;
  * NeoForge: inside RegisterEvent per registry). Nothing in here touches a loader API.
  */
 public final class ModContent {
@@ -6384,9 +7460,10 @@ public final class ModContent {
     private static final ResourceKey<Item> ITEM_KEY = ResourceKey.create(Registries.ITEM, CompanionMod.id("shrine_core"));
     private static final ResourceKey<EntityType<?>> ENTITY_KEY = ResourceKey.create(Registries.ENTITY_TYPE, CompanionMod.id("companion"));
 
+    /** One block, 3D model (assets/.../models/block/shrine_core.json). Unbreakable in survival: the shrine is the mod's anchor. */
     public static final Block SHRINE_CORE = new CompanionShrineBlock(
             BlockBehaviour.Properties.of().setId(BLOCK_KEY).mapColor(MapColor.COLOR_CYAN)
-                    .strength(3.0f, 1200.0f).sound(SoundType.AMETHYST).lightLevel(s -> 12)); // 26.1-CHECK: setId is mandatory since 1.21.2
+                    .strength(-1.0f, 3600000.0f).noOcclusion().sound(SoundType.AMETHYST).lightLevel(s -> 12)); // 26.1-CHECK: setId is mandatory since 1.21.2
 
     public static final Item SHRINE_CORE_ITEM = new BlockItem(SHRINE_CORE,
             new Item.Properties().setId(ITEM_KEY).useBlockDescriptionPrefix());
@@ -6408,14 +7485,76 @@ public final class ModContent {
     public static net.minecraft.resources.Identifier entityId() { return ENTITY_KEY.identifier(); }
     public static net.minecraft.resources.Identifier menuId() { return MENU_KEY.identifier(); }
 
-    /** Finds the loaded companion owned by {@code owner} in any dimension, or null. */
+    /**
+     * Finds the player's loaded companion. The world registry gives its UUID, so this is an O(1) lookup per level
+     * instead of scanning every entity. Worlds without a registry entry yet fall back to one scan and adopt the result.
+     * Returns null when there is none, or when the registered one sits in an unloaded chunk.
+     */
     public static CompanionEntity findCompanion(MinecraftServer server, UUID owner) {
-        if (server == null) return null;
+        if (server == null || owner == null) return null;
+        UUID known = CompanionRegistry.get(server, owner);
+        if (known != null) {
+            for (ServerLevel level : server.getAllLevels()) {
+                if (level.getEntity(known) instanceof CompanionEntity c && c.isAlive()) return c;
+            }
+            return null;
+        }
         for (ServerLevel level : server.getAllLevels()) {
             for (Entity e : level.getAllEntities()) { // 26.1-CHECK: ServerLevel.getAllEntities()
-                if (e instanceof CompanionEntity c && c.isAlive() && owner.equals(c.getOwnerUuid())) return c;
+                if (e instanceof CompanionEntity c && c.isAlive() && owner.equals(c.getOwnerUuid())) {
+                    CompanionRegistry.set(server, owner, c.getUUID());
+                    return c;
+                }
             }
         }
+        return null;
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\AudioDevices.java
+
+```java
+package com.example.companionmod.voice;
+
+import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.Line;
+import javax.sound.sampled.Mixer;
+import javax.sound.sampled.SourceDataLine;
+import javax.sound.sampled.TargetDataLine;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Enumerates the Java Sound input/output devices (mixers) by name and resolves a stored name back to a
+ * {@code Mixer.Info}. Names are the stable-ish human identifier ("Microphone Array (Realtek...)", ...);
+ * an empty name means the system default, which is always available.
+ */
+public final class AudioDevices {
+    private AudioDevices() {}
+
+    /** Names of every mixer that can record (has a TargetDataLine). */
+    public static List<String> inputs() {
+        List<String> out = new ArrayList<>();
+        for (Mixer.Info info : AudioSystem.getMixerInfo()) {
+            if (AudioSystem.getMixer(info).isLineSupported(new Line.Info(TargetDataLine.class))) out.add(info.getName());
+        }
+        return out;
+    }
+
+    /** Names of every mixer that can play (has a SourceDataLine). */
+    public static List<String> outputs() {
+        List<String> out = new ArrayList<>();
+        for (Mixer.Info info : AudioSystem.getMixerInfo()) {
+            if (AudioSystem.getMixer(info).isLineSupported(new Line.Info(SourceDataLine.class))) out.add(info.getName());
+        }
+        return out;
+    }
+
+    /** The mixer with exactly this name, or null when it was unplugged / renamed / never existed. */
+    public static Mixer.Info find(String name) {
+        if (name == null || name.isBlank()) return null;
+        for (Mixer.Info info : AudioSystem.getMixerInfo()) if (name.equals(info.getName())) return info;
         return null;
     }
 }
@@ -6707,41 +7846,61 @@ package com.example.companionmod.voice;
 
 import javax.sound.sampled.*;
 import java.io.ByteArrayOutputStream;
+import java.util.function.IntSupplier;
+import java.util.function.Supplier;
 
-/** Records 16 kHz mono 16-bit PCM from the default microphone on a daemon thread and feeds a {@link LevelMeter}. */
+/** Records 16 kHz mono 16-bit PCM from the configured microphone (or the system default) on a daemon thread and feeds a {@link LevelMeter}. */
 public final class MicCapture {
     public static final int SAMPLE_RATE = 16000;
     private static final AudioFormat FORMAT = new AudioFormat(SAMPLE_RATE, 16, 1, true, false);
 
     private final LevelMeter meter;
-    private final int maxBytes;
+    private final IntSupplier maxSeconds;
+    private final Supplier<String> deviceName;   // read on every start: settings changes apply live
+    private volatile int maxBytes;
     private volatile boolean running;
     private volatile String lastError = "";
     private TargetDataLine line;
     private Thread thread;
     private ByteArrayOutputStream buffer;
-    private long startedAt;
+    private volatile long startedAt;
 
-    public MicCapture(LevelMeter meter, int maxSeconds) {
+    public MicCapture(LevelMeter meter, int maxSeconds) { this(meter, () -> maxSeconds); }
+
+    /** The cap is read on every start, so changing it in the settings screen takes effect immediately. */
+    public MicCapture(LevelMeter meter, IntSupplier maxSeconds) { this(meter, maxSeconds, () -> ""); }
+
+    /** {@code deviceName} is a Java Sound mixer name; blank/null = system default. */
+    public MicCapture(LevelMeter meter, IntSupplier maxSeconds, Supplier<String> deviceName) {
         this.meter = meter;
-        this.maxBytes = maxSeconds * SAMPLE_RATE * 2;
+        this.maxSeconds = maxSeconds;
+        this.deviceName = deviceName;
     }
 
     public String lastError() { return lastError; }
     public boolean isRunning() { return running; }
 
+    /** Opens the line: can block for a moment, so call it from a worker thread, never the render thread. */
     public synchronized boolean start() {
         if (running) return true;
         try {
             DataLine.Info info = new DataLine.Info(TargetDataLine.class, FORMAT);
-            if (!AudioSystem.isLineSupported(info)) { lastError = "No microphone supporting 16 kHz mono found"; return false; }
-            line = (TargetDataLine) AudioSystem.getLine(info);
+            line = null;
+            Mixer.Info wanted = AudioDevices.find(deviceName.get());
+            if (wanted != null && AudioSystem.getMixer(wanted).isLineSupported(info)) {
+                line = (TargetDataLine) AudioSystem.getMixer(wanted).getLine(info);
+            }
+            if (line == null) {                                   // unset, unknown (unplugged?) or unsupported: default
+                if (!AudioSystem.isLineSupported(info)) { lastError = "No microphone supporting 16 kHz mono found"; return false; }
+                line = (TargetDataLine) AudioSystem.getLine(info);
+            }
             line.open(FORMAT, SAMPLE_RATE / 5 * 2);
             line.start();
         } catch (Exception e) {
             lastError = "Microphone unavailable: " + e.getMessage();
             return false;
         }
+        maxBytes = Math.max(1, maxSeconds.getAsInt()) * SAMPLE_RATE * 2;
         buffer = new ByteArrayOutputStream();
         meter.reset();
         running = true;
@@ -6766,7 +7925,7 @@ public final class MicCapture {
     public synchronized byte[] stop() {
         if (!running) return new byte[0];
         running = false;
-        try { thread.join(200); } catch (InterruptedException ignored) { }
+        try { thread.join(200); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
         line.stop();
         line.close();
         byte[] out = buffer.toByteArray();
@@ -6942,7 +8101,7 @@ public final class OllamaVoiceBackend {
              + "Greetings, small talk, questions, or comments about the world are action none - just reply in character. "
              + "Never start mining, gathering, building, fighting or exploring unless the player explicitly asked for it in this message. "
              + "A bare order (stay, come, sit, follow, stop, wait, defend) is that action with an empty target. "
-             + "Reply with ONE JSON object and nothing else:\n"
+             + "Reply with ONE JSON object and nothing else. The say field is REQUIRED: always answer with a short in-character line, even for bare orders (a word is enough):\n"
              + "{\"heard\":\"<what the player said>\",\"say\":\"<your short in-character reply>\","
              + "\"action\":\"<action>\",\"target\":\"<target or empty>\",\"memory\":\"<one fact to remember or empty>\"}\n"
              + "action must be exactly one of: follow, stay, sit, stand, attack, guard, defensive, passive, come, stop, continue (resume interrupted work), "
@@ -6950,7 +8109,7 @@ public final class OllamaVoiceBackend {
              + "pickup (walk to a dropped item ON THE GROUND and store it; put the item name in target, e.g. bone, diamond, rotten_flesh - only for items already lying around), "
              + "seek_block (walk to the named block and mine it; target = a vanilla block id: oak_log or log for wood/trees, stone, cobblestone, dirt, coal_ore, iron_ore, gold_ore, redstone_ore, lapis_ore, emerald_ore, diamond_ore, copper_ore, ancient_debris; 'wood', 'logs' and 'planks' mean the whole family), "
              + "drop, heal, patrol, wander, explore, build (target = schematic name, e.g. house; places it block by block from the bag), "
-             + "farm (harvest ripe crops nearby and replant), equip (target = tool name, e.g. pickaxe), trade, craft, smelt, brew, enchant, "
+             + "farm (harvest ripe crops nearby and replant), plant (target = sapling name e.g. birch_sapling; plants saplings from your bag on nearby soil), equip (target = tool name, e.g. pickaxe), trade, craft, smelt, brew, enchant, "
              + "fish (fish at nearby water), cook, open, close, dance, jump, sneak, sleep, wake, remember, forget, set_name (rename; new name in target), "
              + "set_skin (target = Minecraft player name), feminine, masculine, "
              + "track, hunt (attack the named or nearest hostile), fight, flee, hide, retreat, defend, none (just chatting).\n"
@@ -7040,7 +8199,7 @@ public final class OllamaVoiceBackend {
         return reply;
     }
 
-    public void clearHistory() { history.clear(); }
+    public synchronized void clearHistory() { history.clear(); }
 
     private static JsonObject msg(String role, String content) {
         JsonObject o = new JsonObject();
@@ -7197,7 +8356,7 @@ public final class PlanningBackend {
           .append("attack or hunt (fights nearby enemies); ")
           .append("seek_block (arg = a VANILLA BLOCK ID such as oak_log, log, stone, cobblestone, coal_ore, iron_ore, diamond_ore - use it whenever the task is 'get wood/stone/coal/diamonds'; never a colloquial word); ")
           .append("pickup (arg = optional item name; ONLY for items already dropped on the ground); ")
-          .append("farm (harvests ripe crops nearby); fish (fishes at nearby water); ")
+          .append("farm (harvests ripe crops nearby); fish (fishes at nearby water); plant (arg = sapling name such as birch_sapling; plants saplings from the bag on nearby soil; use pickup first only if saplings lie on the ground); ")
           .append("build (arg = schematic name, places it from the schematics folder); say (arg = one short in-character sentence); wait (seconds).\n")
           .append("Ground choices in observations: use pickup only for listed drops, attack/hunt only for listed hostiles, seek_block only for a requested resource (an exact observed block ID is best), and avoid repeating an already active task. The executor will navigate, switch tools, swing, collect drops, fight and speak; do not output code or pretend unsupported actions exist.\n")
           .append("Reply with ONE JSON object and nothing else: {\"goal\":\"get wood\",\"steps\":[{\"op\":\"seek_block\",\"arg\":\"log\",\"seconds\":90},{\"op\":\"come\",\"arg\":\"\",\"seconds\":10}]}\n");
@@ -7281,7 +8440,7 @@ public final class PlanParser {
     public record Plan(String goal, List<PlanStep> steps) { public boolean isEmpty() { return steps.isEmpty(); } }
 
     public static final Set<String> OPS = Set.of("follow", "stay", "sit", "stand", "come", "stop", "wander", "patrol", "guard",
-            "defensive", "passive", "attack", "seek_block", "pickup", "say", "wait", "hunt", "farm", "fish", "build", "continue");
+            "defensive", "passive", "attack", "seek_block", "pickup", "say", "wait", "hunt", "farm", "fish", "build", "plant", "continue");
     /** What the companion may do on its own initiative: no mining, no starting fights, no builds. */
     public static final Set<String> AUTO_OPS = Set.of("follow", "come", "wander", "patrol", "guard", "defensive", "pickup", "say", "wait", "farm", "fish");
 
@@ -7293,7 +8452,7 @@ public final class PlanParser {
             Map.entry("come_back", "come"), Map.entry("go_home", "come"), Map.entry("rest", "sit"),
             Map.entry("talk", "say"), Map.entry("speak", "say"), Map.entry("protect", "guard"),
             Map.entry("harvest", "farm"), Map.entry("bring", "come"), Map.entry("deliver", "come"),
-            Map.entry("resume", "continue"), Map.entry("keep_going", "continue"));
+            Map.entry("replant", "plant"), Map.entry("reforest", "plant"), Map.entry("resume", "continue"), Map.entry("keep_going", "continue"));
     /** Ops whose meaning depends on the argument: a material word means "go mine it", otherwise "loot the ground". */
     private static final Set<String> AMBIGUOUS = Set.of("get", "collect", "gather", "fetch", "pickup", "take", "grab");
     /** Words that usually name a mineable material rather than a dropped item. */
@@ -7335,6 +8494,12 @@ public final class PlanParser {
                     case "seek_block" -> { arg = blockId(arg); if (arg.isEmpty()) continue; }
                     case "say" -> { arg = clean(arg, 120); if (arg.isEmpty()) continue; }
                     case "pickup" -> arg = clean(arg, 32).toLowerCase();
+                    case "build" -> {
+                        arg = clean(arg, 40).toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9_\\-]", "_");
+                        if (arg.isEmpty()) continue;
+                    }
+                    case "attack", "hunt" -> arg = clean(arg, 32).toLowerCase(Locale.ROOT);
+                    case "plant" -> arg = clean(arg, 32).toLowerCase(Locale.ROOT);
                     default -> arg = "";
                 }
                 if (sec < 0) sec = defaultSeconds(op);
@@ -7396,6 +8561,7 @@ public final class PlanParser {
         return switch (op) {
             case "wander", "patrol", "guard", "attack", "hunt", "pickup", "farm", "fish" -> 30;
             case "build" -> 90;
+            case "plant" -> 60;
             case "seek_block" -> 120;
             case "wait" -> 3;
             case "say", "stop", "continue" -> 0;
@@ -7463,7 +8629,14 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
-/** Hold-to-talk state machine and the single companion speech playback queue. */
+/**
+ * Hold-to-talk state machine and the single companion speech playback queue.
+ *
+ * <p>Thread rules: the game thread only flips the state and queues work. Opening / closing the microphone happens on
+ * its own IO thread (it can block), HTTP and playback on the worker. The state lives in one {@link AtomicReference}
+ * and every transition is a compare-and-set, so the speech thread can never overwrite LISTENING / THINKING
+ * (which used to leave the microphone open).</p>
+ */
 public final class PushToTalkController {
     private final OllamaVoiceBackend backend;
     private final VoiceConfig cfg;
@@ -7476,17 +8649,16 @@ public final class PushToTalkController {
     private final LevelMeter speakMeter = new LevelMeter();
     private final MicCapture mic;
     private final SpeechPlayer player;
-    private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "companionmod-voice");
-        t.setDaemon(true);
-        return t;
-    });
-    private volatile VoiceState state = VoiceState.IDLE;
+    private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> daemon(r, "companionmod-voice"));
+    private final ExecutorService micIo = Executors.newSingleThreadExecutor(r -> daemon(r, "companionmod-mic-io"));
+    private final AtomicReference<VoiceState> state = new AtomicReference<>(VoiceState.IDLE);
     private volatile boolean probeStarted;
+    private volatile boolean micFailed;
 
     /** Latest line waiting to be spoken; rapid chatter is intentionally coalesced. */
     private final AtomicReference<String> pendingSpeech = new AtomicReference<>();
     private volatile boolean speechDraining;
+    private volatile long lastSpeechProbe;      // speech-model recovery: re-probe at most once a minute
 
     public PushToTalkController(OllamaVoiceBackend backend, VoiceConfig cfg, Supplier<String> context,
                                 Consumer<VoiceReply> onReply, Consumer<String> onStatus) {
@@ -7502,54 +8674,73 @@ public final class PushToTalkController {
         this.onReply = onReply;
         this.onStatus = onStatus;
         this.speechListener = speechListener == null ? SpeechPlayer.Listener.NONE : speechListener;
-        this.player = new SpeechPlayer(speakMeter, this.speechListener);
-        this.mic = new MicCapture(micMeter, cfg.maxRecordSeconds);
+        this.player = new SpeechPlayer(speakMeter, this.speechListener, () -> cfg.outputDevice);
+        this.mic = new MicCapture(micMeter, () -> cfg.maxRecordSeconds, () -> cfg.micDevice);
     }
 
-    public VoiceState state() { return state; }
+    private static Thread daemon(Runnable r, String name) {
+        Thread t = new Thread(r, name);
+        t.setDaemon(true);
+        return t;
+    }
+
+    public VoiceState state() { return state.get(); }
     public float level() {
-        return switch (state) { case LISTENING -> micMeter.level(); case SPEAKING -> speakMeter.level(); default -> 0f; };
+        return switch (state.get()) { case LISTENING -> micMeter.level(); case SPEAKING -> speakMeter.level(); default -> 0f; };
     }
     public float peak() {
-        return switch (state) { case LISTENING -> micMeter.peak(); case SPEAKING -> speakMeter.peak(); default -> 0f; };
+        return switch (state.get()) { case LISTENING -> micMeter.peak(); case SPEAKING -> speakMeter.peak(); default -> 0f; };
     }
     public long listeningMillis() { return mic.elapsedMillis(); }
 
+    /** Game thread. */
     public void onPress() {
-        if (state == VoiceState.SPEAKING) player.stop();
-        else if (state != VoiceState.IDLE) return;
+        VoiceState s = state.get();
+        if (s == VoiceState.SPEAKING) player.stop();
+        else if (s != VoiceState.IDLE) return;
+        if (!state.compareAndSet(s, VoiceState.LISTENING)) return;     // lost a race with the speech thread: ignore this press
+        micFailed = false;
         if (!probeStarted) {
             probeStarted = true;
             worker.execute(() -> onStatus.accept(backend.probe().message()));
         }
-        if (mic.start()) state = VoiceState.LISTENING;
-        else onStatus.accept(mic.lastError());
+        micIo.execute(() -> {
+            if (!mic.start()) {
+                micFailed = true;
+                state.compareAndSet(VoiceState.LISTENING, VoiceState.IDLE);
+                onStatus.accept(mic.lastError());
+            }
+        });
     }
 
+    /** Game thread. */
     public void onRelease() {
-        if (state != VoiceState.LISTENING) return;
-        long ms = mic.elapsedMillis();
-        byte[] pcm = mic.stop();
-        if (ms < cfg.minRecordMillis || micMeter.maxSeen() < cfg.silenceGate) {
-            state = VoiceState.IDLE;
-            onStatus.accept("I didn't hear anything.");
-            return;
-        }
-        state = VoiceState.THINKING;
-        final String ctx = context.get();
-        final byte[] wav = WavUtil.pcm16ToWav(pcm, MicCapture.SAMPLE_RATE, 1);
-        worker.execute(() -> {
-            VoiceReply reply;
-            try {
-                if (!backend.isProbed()) backend.probe();
-                reply = backend.converse(wav, ctx);
-            } catch (Exception e) {
-                state = VoiceState.IDLE;
-                onStatus.accept(e.getMessage() == null ? e.toString() : e.getMessage());
+        if (state.get() != VoiceState.LISTENING) return;
+        final String ctx = context.get();                               // world snapshot must be taken on the game thread
+        micIo.execute(() -> {
+            if (micFailed) return;
+            long ms = mic.elapsedMillis();
+            byte[] pcm = mic.stop();
+            if (ms < cfg.minRecordMillis || micMeter.maxSeen() < cfg.silenceGate) {
+                state.compareAndSet(VoiceState.LISTENING, VoiceState.IDLE);
+                onStatus.accept("I didn't hear anything.");
                 return;
             }
-            onReply.accept(reply);
-            state = VoiceState.IDLE;
+            if (!state.compareAndSet(VoiceState.LISTENING, VoiceState.THINKING)) return;
+            final byte[] wav = WavUtil.pcm16ToWav(pcm, MicCapture.SAMPLE_RATE, 1);
+            worker.execute(() -> {
+                VoiceReply reply;
+                try {
+                    if (!backend.isProbed()) backend.probe();
+                    reply = backend.converse(wav, ctx);
+                } catch (Exception e) {
+                    state.compareAndSet(VoiceState.THINKING, VoiceState.IDLE);
+                    onStatus.accept(e.getMessage() == null ? e.toString() : e.getMessage());
+                    return;
+                }
+                onReply.accept(reply);
+                state.compareAndSet(VoiceState.THINKING, VoiceState.IDLE);
+            });
         });
     }
 
@@ -7570,11 +8761,28 @@ public final class PushToTalkController {
                 if (current == null) break;
                 if (!backend.isProbed()) backend.probe();
                 if (backend.speechModel() == null) {
+                    // The startup probe may have run before the speech model was pulled (or it 404'd later).
+                    // Re-probe at most once a minute so speech recovers without a relog.
+                    long nowMs = System.currentTimeMillis();
+                    if (nowMs - lastSpeechProbe > 60_000) {
+                        lastSpeechProbe = nowMs;
+                        try { backend.probe(); } catch (RuntimeException ignored) { }
+                    }
+                    if (backend.speechModel() == null) {
+                        speechListener.onUnavailable(current);
+                        continue;
+                    }
+                }
+                // Only speak while idle: never talk over the player (LISTENING / THINKING keep their state).
+                if (!state.compareAndSet(VoiceState.IDLE, VoiceState.SPEAKING) && state.get() != VoiceState.SPEAKING) {
                     speechListener.onUnavailable(current);
                     continue;
                 }
-                state = VoiceState.SPEAKING;
                 byte[] audio = backend.synthesize(current);
+                if (state.get() != VoiceState.SPEAKING) {          // the player pressed the key while we were synthesizing
+                    speechListener.onUnavailable(current);
+                    continue;
+                }
                 if (audio == null) speechListener.onUnavailable(current);
                 else player.playBlocking(audio, cfg.speechVolume, current);
             }
@@ -7583,14 +8791,16 @@ public final class PushToTalkController {
             onStatus.accept("Speech failed, continuing in text: " + e.getMessage());
         } finally {
             speechDraining = false;
-            if (state == VoiceState.SPEAKING) state = VoiceState.IDLE;
+            state.compareAndSet(VoiceState.SPEAKING, VoiceState.IDLE);
         }
     }
 
     public void shutdown() {
         player.stop();
-        if (mic.isRunning()) mic.stop();
+        micIo.execute(() -> { if (mic.isRunning()) mic.stop(); });
+        micIo.shutdown();
         worker.shutdownNow();
+        state.set(VoiceState.IDLE);
     }
 }
 ```
@@ -7620,15 +8830,40 @@ public final class ReplyParser {
                 if (el.isJsonObject()) {
                     JsonObject o = el.getAsJsonObject();
                     String heard = str(o, "heard");
-                    String say = str(o, "say");
-                    String target = truncate(clean(str(o, "target")), 60);   // must fit the 64-char packet field
+                    String say = clean(str(o, "say"));
+                    String target = truncate(clean(str(o, "target")), 60);   // the packet field allows 1024; keep model targets short
                     String memory = clean(str(o, "memory"));
                     CompanionCommand cmd = CompanionCommand.parse(str(o, "action"));
-                    return new VoiceReply(heard, clean(say), cmd, target, memory);
+                    if (say.isBlank() && cmd != CompanionCommand.NONE) say = ack(cmd);   // json_mode models often drop the line; never go silent
+                    return new VoiceReply(heard, say, cmd, target, memory);
                 }
             } catch (RuntimeException ignored) { /* fall through to plain text */ }
         }
         return VoiceReply.text(clean(text));
+    }
+
+    /** Short in-character fallback line when the model chose an action but left "say" empty. */
+    private static String ack(CompanionCommand c) {
+        return switch (c) {
+            case FOLLOW -> "Following.";
+            case STAY -> "Staying put.";
+            case SIT -> "Sitting down.";
+            case STAND -> "Standing up.";
+            case COME -> "Coming.";
+            case ATTACK, FIGHT, HUNT -> "On it.";
+            case GUARD -> "Guarding.";
+            case PATROL -> "Patrolling.";
+            case PICKUP -> "Picking up.";
+            case DROP -> "Dropped.";
+            case SEEK_BLOCK, MINE -> "Digging.";
+            case BUILD -> "Building.";
+            case FARM -> "Farming.";
+            case PLANT -> "Planting.";
+            case HEAL -> "Healing up.";
+            case INVENTORY -> "Here, look.";
+            case STOP -> "Stopped.";
+            default -> "On it.";
+        };
     }
 
     private static String str(JsonObject o, String key) {
@@ -7659,13 +8894,19 @@ import com.example.companionmod.client.PcmStreamSound;
 
 import javax.sound.sampled.AudioFormat;
 import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.LineUnavailableException;
+import javax.sound.sampled.Mixer;
 import javax.sound.sampled.SourceDataLine;
+import java.util.function.Supplier;
 
 /**
  * Plays WAV replies and reports actual PCM playback progress to the subtitle clock. Prefers Minecraft's
  * own sound engine (OpenAL) so the voice pauses with the game, obeys the audio sliders, and gets any
  * in-world effects installed (e.g. Sound Physics Remastered's echo); a plain {@code SourceDataLine}
  * stays as a fallback for runtimes where the engine can't stream memory PCM.
+ *
+ * <p>When the player picks a specific output device in the settings, the engine path is skipped: OpenAL
+ * cannot target a chosen Java Sound device, so playback goes straight to that device's SourceDataLine.</p>
  */
 public final class SpeechPlayer {
     public interface Listener {
@@ -7678,13 +8919,16 @@ public final class SpeechPlayer {
 
     private final LevelMeter meter;
     private final Listener listener;
+    private final Supplier<String> outputDevice;   // read on every playback: settings changes apply live
     private volatile boolean playing;
     private volatile boolean stopRequested;
 
     public SpeechPlayer(LevelMeter meter) { this(meter, Listener.NONE); }
-    public SpeechPlayer(LevelMeter meter, Listener listener) {
+    public SpeechPlayer(LevelMeter meter, Listener listener) { this(meter, listener, () -> ""); }
+    public SpeechPlayer(LevelMeter meter, Listener listener, Supplier<String> outputDevice) {
         this.meter = meter;
         this.listener = listener == null ? Listener.NONE : listener;
+        this.outputDevice = outputDevice;
     }
 
     public boolean isPlaying() { return playing; }
@@ -7714,7 +8958,10 @@ public final class SpeechPlayer {
         listener.onStart(text, duration);
 
         // ---- engine path: OpenAL channel -> pause-aware, slider-obeying, SPR-echoed --------------------
-        if (PcmStreamSound.engineStreamingSupported()) {
+        // Skipped when a specific output device was chosen: OpenAL cannot target a chosen Java Sound device.
+        String dev = outputDevice == null ? "" : outputDevice.get();
+        boolean explicitDevice = dev != null && !dev.isBlank();
+        if (!explicitDevice && PcmStreamSound.engineStreamingSupported()) {
             try {
                 boolean handled = PcmStreamSound.play(data, pcm.sampleRate(), pcm.channels(), 1.0f, duration,
                         () -> stopRequested, new PcmStreamSound.Listener() {
@@ -7730,9 +8977,9 @@ public final class SpeechPlayer {
             } catch (Throwable ignored) { }   // any engine surprise falls through to the line below
         }
 
-        // ---- fallback: direct SourceDataLine (engine missing / rejected the stream) ----------------
+        // ---- fallback: direct SourceDataLine (engine missing / rejected the stream / explicit device) -
         boolean started = false;
-        try (SourceDataLine out = AudioSystem.getSourceDataLine(fmt)) {
+        try (SourceDataLine out = openOutput(fmt, explicitDevice ? dev : "")) {
             out.open(fmt);
             out.start();
             started = true;
@@ -7753,6 +9000,19 @@ public final class SpeechPlayer {
             playing = false;
             meter.reset();
         }
+    }
+
+    /** The chosen device's line, or the system default when {@code dev} is blank/unknown. */
+    private static SourceDataLine openOutput(AudioFormat fmt, String dev) throws LineUnavailableException {
+        Mixer.Info wanted = AudioDevices.find(dev);
+        if (wanted != null) {
+            try {
+                return AudioSystem.getSourceDataLine(fmt, wanted);
+            } catch (IllegalArgumentException | LineUnavailableException e) {
+                // chosen mixer vanished or cannot play at this format: fall through to the default line
+            }
+        }
+        return AudioSystem.getSourceDataLine(fmt);
     }
 
     private static byte[] applyGain(byte[] raw, float gain) {
@@ -7815,6 +9075,10 @@ public final class VoiceConfig {
     public String speechModel = "";
     public String fallbackSpeechModel = "phonon";
     public String speechVoice = "";
+    /** Java Sound input device name for push-to-talk. Empty = system default microphone. */
+    public String micDevice = "";
+    /** Java Sound output device for spoken replies (bypasses Minecraft's engine so a specific device can be used). Empty = default. */
+    public String outputDevice = "";
     /** Optional speech-to-text model (Whisper etc.) so a normal text LLM can be used instead of an audio model. */
     public String sttModel = "";
     /** OpenAI-compatible base URL for the STT model. Empty = use {@link #host}. */
@@ -7975,6 +9239,93 @@ public final class WavUtil {
 }
 ```
 
+## common\src\main\java\com\example\companionmod\world\CompanionRegistry.java
+
+```java
+package com.example.companionmod.world;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.level.storage.LevelResource;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+
+/**
+ * Which companion entity belongs to which player, stored in the world folder (companionmod_companions.json).
+ * This is what lets the shrine find a companion that sits in an unloaded chunk, and lets a stale copy remove itself.
+ * Plain JSON on purpose: no SavedData API, so it is identical on Fabric and NeoForge.
+ */
+public final class CompanionRegistry {
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final Map<UUID, UUID> OWNERS = new HashMap<>();
+    private static Path loadedFrom;
+
+    private CompanionRegistry() {}
+
+    private static Path file(MinecraftServer server) {
+        return server.getWorldPath(LevelResource.ROOT).resolve("companionmod_companions.json");
+    }
+
+    private static void ensure(MinecraftServer server) {
+        Path f = file(server);
+        if (f.equals(loadedFrom)) return;
+        loadedFrom = f;
+        OWNERS.clear();
+        try {
+            if (!Files.isRegularFile(f)) return;
+            JsonObject o = JsonParser.parseString(Files.readString(f)).getAsJsonObject();
+            for (Map.Entry<String, JsonElement> e : o.entrySet()) {
+                try { OWNERS.put(UUID.fromString(e.getKey()), UUID.fromString(e.getValue().getAsString())); }
+                catch (RuntimeException ignored) { }
+            }
+        } catch (IOException | RuntimeException ignored) { /* corrupt file: start empty */ }
+    }
+
+    public static synchronized UUID get(MinecraftServer server, UUID owner) {
+        ensure(server);
+        return OWNERS.get(owner);
+    }
+
+    public static synchronized void set(MinecraftServer server, UUID owner, UUID companion) {
+        ensure(server);
+        if (!companion.equals(OWNERS.put(owner, companion))) save(server);
+    }
+
+    /** Removes the entry only if it still points at {@code companion} (a newer companion keeps its entry). */
+    public static synchronized void clear(MinecraftServer server, UUID owner, UUID companion) {
+        ensure(server);
+        if (OWNERS.remove(owner, companion)) save(server);
+    }
+
+    /** Forget the in-memory copy (server stopped); the file stays. */
+    public static synchronized void reset() {
+        loadedFrom = null;
+        OWNERS.clear();
+    }
+
+    private static void save(MinecraftServer server) {
+        JsonObject o = new JsonObject();
+        OWNERS.forEach((k, v) -> o.addProperty(k.toString(), v.toString()));
+        Path f = file(server);
+        try {
+            Path tmp = f.resolveSibling(f.getFileName() + ".tmp");
+            Files.writeString(tmp, GSON.toJson(o));
+            Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException ignored) { }
+    }
+}
+```
+
 ## common\src\main\java\com\example\companionmod\world\ModCommands.java
 
 ```java
@@ -8100,13 +9451,26 @@ public final class ModCommands {
 }
 ```
 
-## common\src\main\java\com\example\companionmod\world\ShrineHandler.java
+## common\src\main\java\com\example\companionmod\world\ServerHooks.java
 
 ```java
 package com.example.companionmod.world;
 
-public class ShrineHandler {
-    // Placeholder - shrine interaction will be implemented later
+import com.example.companionmod.net.CommandHandler;
+import net.minecraft.server.level.ServerPlayer;
+
+/** Everything both loaders must call from their join / leave / stop events, so Fabric and NeoForge behave identically. */
+public final class ServerHooks {
+    private ServerHooks() {}
+
+    public static void onPlayerJoin(ServerPlayer player) { ShrinePlacer.onPlayerJoin(player); }
+
+    public static void onPlayerLeave(ServerPlayer player) { CommandHandler.forget(player.getUUID()); }
+
+    public static void onServerStopped() {
+        CompanionRegistry.reset();
+        CommandHandler.forgetAll();
+    }
 }
 ```
 
@@ -8117,14 +9481,13 @@ package com.example.companionmod.world;
 
 import com.example.companionmod.registry.ModContent;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.util.RandomSource;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.storage.LevelResource;
 
@@ -8133,7 +9496,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 /**
- * Builds the shrine procedurally (no datapack structure needed) and remembers it with a tiny marker file in the world folder,
+ * Places the shrine (a single block with a 3D model) and remembers it with a tiny marker file in the world folder,
  * so it is placed exactly once: next to the first player that ever joins a world, which on a fresh world is the spawn point.
  */
 public final class ShrinePlacer {
@@ -8148,107 +9511,24 @@ public final class ShrinePlacer {
         MinecraftServer server = level.getServer();
         Path file = marker(server);
         if (Files.exists(file)) return;
-        BlockPos core = place(level, player.blockPosition().offset(6, 0, 6));
+        BlockPos core = place(level, player.blockPosition().offset(3, 0, 2));
         try {
             Files.writeString(file, "{\"x\":" + core.getX() + ",\"y\":" + core.getY() + ",\"z\":" + core.getZ() + "}");
         } catch (IOException ignored) { }
         player.sendSystemMessage(Component.literal("A strange shrine hums near spawn at " + core.getX() + " " + core.getY() + " " + core.getZ() + "."));
     }
 
-    /** Places the shrine so its core stands on the surface at (origin.x, origin.z). Returns the core block position. */
+    /** Puts the shrine block on the surface at (origin.x, origin.z). Returns its position. */
     public static BlockPos place(ServerLevel level, BlockPos origin) {
-        int cx = origin.getX(), cz = origin.getZ();
-        int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, cx, cz);   // first free block above the ground
-        RandomSource rnd = level.getRandom();
-        BlockState bricks = Blocks.STONE_BRICKS.defaultBlockState();
-        BlockState mossy = Blocks.MOSSY_STONE_BRICKS.defaultBlockState();
-        BlockState cracked = Blocks.CRACKED_STONE_BRICKS.defaultBlockState();
-        BlockState rim = Blocks.DEEPSLATE_BRICKS.defaultBlockState();
-
-        for (int dx = -3; dx <= 3; dx++) {
-            for (int dz = -3; dz <= 3; dz++) {
-                BlockPos floor = new BlockPos(cx + dx, y - 1, cz + dz);
-                boolean edge = Math.abs(dx) == 3 || Math.abs(dz) == 3;
-                float r = rnd.nextFloat();
-                level.setBlock(floor, edge ? rim : (r < 0.2f ? mossy : r < 0.35f ? cracked : bricks), 3);
-                for (int h = 0; h < 5; h++) level.setBlock(floor.above(1 + h), Blocks.AIR.defaultBlockState(), 2);
-                for (int d = 1; d <= 2; d++) {                                  // fill small holes under the platform
-                    BlockPos under = floor.below(d);
-                    if (level.getBlockState(under).canBeReplaced()) level.setBlock(under, bricks, 2);
-                }
-            }
+        int x = origin.getX(), z = origin.getZ();
+        int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);   // first free block above the ground
+        BlockPos core = new BlockPos(x, y, z);
+        BlockPos below = core.below();
+        if (!level.getBlockState(below).isFaceSturdy(level, below, Direction.UP)) {   // water, leaves, a hole: give it footing
+            level.setBlock(below, Blocks.DEEPSLATE_BRICKS.defaultBlockState(), 3);
         }
-        for (int sx : new int[]{-3, 3}) for (int sz : new int[]{-3, 3}) {        // corner pillars with soul lanterns
-            for (int h = 0; h < 3; h++) level.setBlock(new BlockPos(cx + sx, y + h, cz + sz), Blocks.STONE_BRICK_WALL.defaultBlockState(), 3);
-            level.setBlock(new BlockPos(cx + sx, y + 3, cz + sz), Blocks.SOUL_LANTERN.defaultBlockState(), 3);
-        }
-        BlockPos[] lamps = {new BlockPos(cx + 2, y, cz), new BlockPos(cx - 2, y, cz), new BlockPos(cx, y, cz + 2), new BlockPos(cx, y, cz - 2)};
-        for (BlockPos p : lamps) level.setBlock(p, Blocks.SOUL_LANTERN.defaultBlockState(), 3);
-
-        BlockPos core = new BlockPos(cx, y, cz);
         level.setBlock(core, ModContent.SHRINE_CORE.defaultBlockState(), 3);
         return core;
-    }
-}
-```
-
-## common\src\main\java\com\example\companionmod\world\ShrineSpawner.java
-
-```java
-package com.example.companionmod.world;
-
-import net.minecraft.core.BlockPos;
-import net.minecraft.world.level.Level;
-import net.minecraft.world.level.block.Block;
-import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.state.BlockState;
-
-public class ShrineSpawner {
-    public static final Block SHRINE_BLOCK = Blocks.NETHER_BRICKS;
-
-    public static BlockPos findShrinePosition(Level level, BlockPos spawnPos) {
-        // Search for existing shrine in 32-block radius
-        for (int x = -32; x <= 32; x++) {
-            for (int y = 0; y < 256; y++) {
-                for (int z = -32; z <= 32; z++) {
-                    BlockPos pos = new BlockPos(spawnPos.getX() + x, y, spawnPos.getZ() + z);
-                    if (level.getBlockState(pos).getBlock() == SHRINE_BLOCK) {
-                        return pos;
-                    }
-                }
-            }
-        }
-
-        // No shrine found, create one near spawn at Y=64 (above ground)
-        BlockPos shrinePos = new BlockPos(spawnPos.getX(), 64, spawnPos.getZ());
-
-        // Check if area is clear
-        if (level.isEmptyBlock(shrinePos) && level.isEmptyBlock(shrinePos.north()) &&
-            level.isEmptyBlock(shrinePos.south()) && level.isEmptyBlock(shrinePos.east()) &&
-            level.isEmptyBlock(shrinePos.west())) {
-            return shrinePos;
-        }
-
-        // Try a few more positions
-        for (int offset = 1; offset <= 10; offset++) {
-            shrinePos = new BlockPos(spawnPos.getX() + offset, 64, spawnPos.getZ() + offset);
-            if (level.isEmptyBlock(shrinePos) && level.isEmptyBlock(shrinePos.north()) &&
-                level.isEmptyBlock(shrinePos.south()) && level.isEmptyBlock(shrinePos.east()) &&
-                level.isEmptyBlock(shrinePos.west())) {
-                return shrinePos;
-            }
-        }
-
-        return null;
-    }
-
-    public static void placeShrine(Level level, BlockPos pos) {
-        level.setBlock(pos, SHRINE_BLOCK.defaultBlockState(), 3);
-        level.setBlock(pos.above(), Blocks.SMOOTH_STONE.defaultBlockState(), 3);
-    }
-
-    public static boolean isShrineBlock(BlockState state) {
-        return state.getBlock() == SHRINE_BLOCK;
     }
 }
 ```
@@ -8264,12 +9544,12 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.entity.EntitySpawnReason;
-import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.phys.Vec3;
@@ -8277,19 +9557,24 @@ import net.minecraft.world.phys.Vec3;
 public final class ShrineSummoner {
     private ShrineSummoner() {}
 
-    /** One companion per player: reuse the living one (calling it to the shrine) or create a new one. */
+    /**
+     * One companion per player: reuse the living one (calling it to the shrine) or create a new one.
+     * A companion from another dimension is recreated here WITH its bag, name and look; one stranded in an
+     * unloaded chunk is replaced, and when that chunk loads the stale copy drops its bag and removes itself.
+     */
     public static void summon(ServerLevel level, BlockPos shrine, ServerPlayer player) {
+        MinecraftServer server = level.getServer();
         Vec3 spot = findSpot(level, shrine);
-        CompanionEntity existing = ModContent.findCompanion(level.getServer(), player.getUUID());
+        CompanionEntity existing = ModContent.findCompanion(server, player.getUUID());
 
         if (existing != null && existing.level() == level) {
             existing.setPos(spot.x, spot.y, spot.z);
+            existing.resetFallDistance();
             existing.getNavigation().stop();
             player.sendSystemMessage(Component.literal(existing.getName().getString() + " answers the shrine's call."));
             effects(level, spot);
             return;
         }
-        if (existing != null) existing.discard();   // it was in another dimension: replace it (inventory/progress persistence is phase 2)
 
         CompanionEntity c = ModContent.COMPANION.create(level, EntitySpawnReason.MOB_SUMMONED);
         if (c == null) return;
@@ -8298,9 +9583,14 @@ public final class ShrineSummoner {
         c.setOwner(player.getUUID());
         c.setCustomName(Component.literal("Companion"));
         c.setCustomNameVisible(true);
-        c.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(Items.IRON_SWORD));
+        if (existing != null) c.copyStateFrom(existing);
+        else c.store(new ItemStack(Items.IRON_SWORD));     // goes into the sword slot, so it stays in hand
+        CompanionRegistry.set(server, player.getUUID(), c.getUUID());
+        if (existing != null) existing.discard();          // its bag now lives in the new body
         level.addFreshEntity(c);
-        player.sendSystemMessage(Component.literal("A companion steps out of the light. Hold V to talk to it."));
+        player.sendSystemMessage(Component.literal(existing != null
+                ? "Your companion steps out of the light, carrying everything it had."
+                : "A companion steps out of the light. Hold V to talk to it."));
         effects(level, spot);
     }
 
@@ -8325,13 +9615,117 @@ public final class ShrineSummoner {
 }
 ```
 
-## common\src\main\java\com\example\companionmod\world\WorldGenerationHandler.java
+## common\src\test\java\com\example\companionmod\voice\VoiceSmokeTest.java
 
 ```java
-package com.example.companionmod.world;
+package com.example.companionmod.voice;
 
-public class WorldGenerationHandler {
-    // Placeholder - world generation will be implemented later
+import com.example.companionmod.command.CompanionCommand;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import com.sun.net.httpserver.HttpServer;
+
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+
+/** Plain-main smoke test (no JUnit needed): java -cp out:gson.jar ...VoiceSmokeTest */
+public class VoiceSmokeTest {
+    static int fails = 0;
+    static void check(boolean ok, String what) { System.out.println((ok ? "PASS " : "FAIL ") + what); if (!ok) fails++; }
+
+    public static void main(String[] a) throws Exception {
+        // --- WAV roundtrip + streamed-header WAV (size fields 0xFFFFFFFF like Ollama's speech endpoint)
+        byte[] pcm = new byte[4800];
+        for (int i = 0; i < 2400; i++) { short s = (short) (Math.sin(i / 10.0) * 12000); pcm[2*i] = (byte) s; pcm[2*i+1] = (byte) (s >> 8); }
+        WavUtil.Pcm back = WavUtil.decode(WavUtil.pcm16ToWav(pcm, 16000, 1));
+        check(back.data().length == 4800 && back.sampleRate() == 16000 && back.channels() == 1, "wav roundtrip");
+        byte[] streamed = WavUtil.pcm16ToWav(pcm, 24000, 1);
+        ByteBuffer sb = ByteBuffer.wrap(streamed).order(ByteOrder.LITTLE_ENDIAN);
+        sb.putInt(4, -1); sb.putInt(40, -1);
+        WavUtil.Pcm sp = WavUtil.decode(streamed);
+        check(sp.data().length == 4800 && sp.sampleRate() == 24000, "streamed-header wav (0xFFFFFFFF sizes)");
+
+        // --- level meter: silence ~0, loud tone high, release is slower than attack
+        LevelMeter m = new LevelMeter();
+        m.feed(new byte[640], 640);
+        check(m.level() < 0.01f, "meter silence ~0");
+        byte[] loud = new byte[640];
+        for (int i = 0; i < 320; i++) { short s = (short) (Math.sin(i / 3.0) * 20000); loud[2*i] = (byte) s; loud[2*i+1] = (byte) (s >> 8); }
+        for (int i = 0; i < 6; i++) m.feed(loud, 640);
+        check(m.level() > 0.7f && m.maxSeen() > 0.8f, "meter loud tone high (level=" + m.level() + ")");
+        float hi = m.level(); m.feed(new byte[640], 640);
+        check(m.level() > hi * 0.6f, "meter slow release");
+
+        // --- parser
+        VoiceReply r = ReplyParser.parse("```json\n{\"heard\":\"follow me\",\"say\":\"On my way!\",\"action\":\"Follow\"}\n```");
+        check(r.command() == CompanionCommand.FOLLOW && r.say().equals("On my way!") && r.heard().equals("follow me"), "parser fenced json");
+        check(ReplyParser.parse("Sure thing, boss").command() == CompanionCommand.NONE, "parser plain text -> NONE");
+        check(CompanionCommand.parse("stand down") == CompanionCommand.PASSIVE && CompanionCommand.parse("come here") == CompanionCommand.COME, "command synonyms");
+
+        // --- fake Ollama
+        final String[] lastChatBody = {null};
+        final int[] chatCalls = {0};
+        HttpServer s = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        s.createContext("/api/version", x -> send(x, 200, "{\"version\":\"0.41.0\"}"));
+        s.createContext("/api/show", x -> {
+            JsonObject req = JsonParser.parseString(new String(x.getRequestBody().readAllBytes())).getAsJsonObject();
+            String model = req.get("model").getAsString();
+            if (model.startsWith("lfm3-audio")) send(x, 200, "{\"capabilities\":[\"tools\",\"audio\"]}");
+            else if (model.equals("phonon")) send(x, 200, "{\"capabilities\":[\"speech\"]}");
+            else send(x, 404, "{\"error\":\"not found\"}");
+        });
+        s.createContext("/v1/chat/completions", x -> {
+            lastChatBody[0] = new String(x.getRequestBody().readAllBytes());
+            chatCalls[0]++;
+            if (chatCalls[0] == 1) { send(x, 400, "{\"error\":\"response_format unsupported with audio\"}"); return; } // exercise retry
+            send(x, 200, "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"{\\\"heard\\\":\\\"sit down\\\",\\\"say\\\":\\\"Resting.\\\",\\\"action\\\":\\\"sit\\\"}\"}}]}");
+        });
+        s.createContext("/v1/audio/speech", x -> {
+            x.getRequestBody().readAllBytes();
+            byte[] w = WavUtil.pcm16ToWav(new byte[2400], 24000, 1);
+            x.sendResponseHeaders(200, w.length); x.getResponseBody().write(w); x.close();
+        });
+        s.start();
+        String host = "http://127.0.0.1:" + s.getAddress().getPort();
+
+        VoiceConfig cfg = new VoiceConfig();
+        cfg.host = host;
+        OllamaVoiceBackend be = new OllamaVoiceBackend(cfg);
+        OllamaVoiceBackend.Probe p = be.probe();
+        check(p.reachable() && p.chatModelPresent() && p.chatHasAudio(), "probe: lfm3-audio found with audio capability");
+        check("phonon".equals(p.speechModel()), "probe: falls back to phonon because lfm3-audio has no 'speech' cap (" + p.message() + ")");
+
+        VoiceReply vr = be.converse(WavUtil.pcm16ToWav(pcm, 16000, 1), "mode=FOLLOW");
+        check(vr.command() == CompanionCommand.SIT && vr.heard().equals("sit down"), "converse parsed JSON reply after 400->retry");
+        JsonObject sent = JsonParser.parseString(lastChatBody[0]).getAsJsonObject();
+        check(!sent.has("response_format"), "retry dropped response_format");
+        String part = sent.getAsJsonArray("messages").get(1).getAsJsonObject().getAsJsonArray("content").get(1).getAsJsonObject().get("type").getAsString();
+        check(part.equals("input_audio"), "request carries input_audio part");
+        check(sent.getAsJsonArray("messages").get(0).getAsJsonObject().get("content").getAsString().contains("mode=FOLLOW"), "context injected in system prompt");
+
+        byte[] wav = be.synthesize("Resting.");
+        check(wav != null && WavUtil.decode(wav).sampleRate() == 24000, "synthesize returns decodable wav");
+
+        // missing model path
+        cfg.chatModel = "nope";
+        check(!new OllamaVoiceBackend(cfg).probe().chatModelPresent(), "probe: missing model reported");
+        s.stop(0);
+        cfg.host = "http://127.0.0.1:1";
+        check(!new OllamaVoiceBackend(cfg).probe().reachable(), "probe: unreachable host reported");
+
+        System.out.println(fails == 0 ? "ALL PASSED" : fails + " FAILED");
+        System.exit(fails == 0 ? 0 : 1);
+    }
+
+    static void send(com.sun.net.httpserver.HttpExchange x, int code, String body) throws java.io.IOException {
+        byte[] b = body.getBytes(StandardCharsets.UTF_8);
+        x.getResponseHeaders().add("Content-Type", "application/json");
+        x.sendResponseHeaders(code, b.length);
+        x.getResponseBody().write(b);
+        x.close();
+    }
 }
 ```
 
@@ -8379,34 +9773,44 @@ import com.example.companionmod.net.CommandHandler;
 import com.example.companionmod.net.CommandPayload;
 import com.example.companionmod.registry.ModContent;
 import com.example.companionmod.world.ModCommands;
-import com.example.companionmod.world.ShrinePlacer;
+import com.example.companionmod.world.ServerHooks;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
-// import net.fabricmc.fabric.api.event.lifecycle.v1.ServerPlayConnectionEvents; // not available in this Fabric API version
-
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.fabric.api.creativetab.v1.CreativeModeTabEvents;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.fabricmc.fabric.api.object.builder.v1.entity.FabricDefaultAttributeRegistry;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.core.Registry;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.item.CreativeModeTabs;
 
-/** Fabric entrypoint. NOTE: every Fabric API package/method name below is a 26.1-CHECK: compare with the Fabric API 26.1 porting guide. */
+/** Fabric entrypoint. Mirrors CompanionModNeoForge one-to-one; the real logic lives in common/. */
 public class CompanionModFabric implements ModInitializer {
     @Override
     public void onInitialize() {
+        CompanionMod.setConfigDir(FabricLoader.getInstance().getConfigDir());
+
         Registry.register(BuiltInRegistries.BLOCK, ModContent.blockId(), ModContent.SHRINE_CORE);
         Registry.register(BuiltInRegistries.ITEM, ModContent.itemId(), ModContent.SHRINE_CORE_ITEM);
         Registry.register(BuiltInRegistries.ENTITY_TYPE, ModContent.entityId(), ModContent.COMPANION);
-        Registry.register(BuiltInRegistries.MENU, ModContent.menuId(), ModContent.COMPANION_INV_MENU);
+        Registry.register(BuiltInRegistries.MENU, ModContent.menuId(), ModContent.COMPANION_INV_MENU);   // was registered twice -> duplicate-key crash
         FabricDefaultAttributeRegistry.register(ModContent.COMPANION, CompanionEntity.createAttributes());
 
-        PayloadTypeRegistry.serverboundPlay().register(CommandPayload.TYPE, CommandPayload.CODEC);   // 26.1-CHECK: may be serverboundPlay()
+        PayloadTypeRegistry.serverboundPlay().register(CommandPayload.TYPE, CommandPayload.CODEC);
         ServerPlayNetworking.registerGlobalReceiver(CommandPayload.TYPE, (payload, ctx) -> CommandHandler.handle(ctx.player(), payload));
 
-        Registry.register(BuiltInRegistries.MENU, ModContent.menuId(), ModContent.COMPANION_INV_MENU);
-
         CommandRegistrationCallback.EVENT.register((dispatcher, buildContext, environment) -> ModCommands.register(dispatcher));
+
+        // 26.1-CHECK: ServerPlayConnectionEvents lives in networking.v1 (NOT event.lifecycle.v1); getPlayer() on the handler.
+        ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> ServerHooks.onPlayerJoin(handler.getPlayer()));
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> ServerHooks.onPlayerLeave(handler.getPlayer()));
+        ServerLifecycleEvents.SERVER_STOPPED.register(server -> ServerHooks.onServerStopped());
+        // 26.1-CHECK: itemgroup.v1.ItemGroupEvents was replaced by creativetab.v1.CreativeModeTabEvents in this Fabric API
+        CreativeModeTabEvents.modifyOutputEvent(CreativeModeTabs.FUNCTIONAL_BLOCKS)
+                .register(output -> output.accept(ModContent.SHRINE_CORE_ITEM));
     }
 }
 ```
@@ -8422,23 +9826,28 @@ import com.example.companionmod.net.CommandHandler;
 import com.example.companionmod.net.CommandPayload;
 import com.example.companionmod.registry.ModContent;
 import com.example.companionmod.world.ModCommands;
-import com.example.companionmod.world.ShrinePlacer;
+import com.example.companionmod.world.ServerHooks;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.item.CreativeModeTabs;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.common.Mod;
+import net.neoforged.fml.loading.FMLPaths;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.BuildCreativeModeTabContentsEvent;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
 import net.neoforged.neoforge.event.entity.EntityAttributeCreationEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+import net.neoforged.neoforge.event.server.ServerStoppedEvent;
 import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 import net.neoforged.neoforge.registries.RegisterEvent;
 
+/** NeoForge entrypoint. Mirrors CompanionModFabric one-to-one; the real logic lives in common/. */
 @Mod(CompanionMod.MOD_ID)
 public class CompanionModNeoForge {
     public CompanionModNeoForge(IEventBus modBus) {
+        CompanionMod.setConfigDir(FMLPaths.CONFIGDIR.get());
+
         modBus.addListener(RegisterEvent.class, e -> {
             e.register(Registries.BLOCK, h -> h.register(ModContent.blockId(), ModContent.SHRINE_CORE));
             e.register(Registries.ITEM, h -> h.register(ModContent.itemId(), ModContent.SHRINE_CORE_ITEM));
@@ -8455,9 +9864,12 @@ public class CompanionModNeoForge {
 
         NeoForge.EVENT_BUS.addListener(RegisterCommandsEvent.class, e -> ModCommands.register(e.getDispatcher()));
         NeoForge.EVENT_BUS.addListener(PlayerEvent.PlayerLoggedInEvent.class, e -> {
-            if (e.getEntity() instanceof ServerPlayer sp) ShrinePlacer.onPlayerJoin(sp);
+            if (e.getEntity() instanceof ServerPlayer sp) ServerHooks.onPlayerJoin(sp);
         });
-        NeoForge.EVENT_BUS.addListener(PlayerEvent.PlayerLoggedOutEvent.class, e -> CommandHandler.forget(e.getEntity().getUUID()));
+        NeoForge.EVENT_BUS.addListener(PlayerEvent.PlayerLoggedOutEvent.class, e -> {
+            if (e.getEntity() instanceof ServerPlayer sp) ServerHooks.onPlayerLeave(sp);
+        });
+        NeoForge.EVENT_BUS.addListener(ServerStoppedEvent.class, e -> ServerHooks.onServerStopped());
     }
 }
 ```
