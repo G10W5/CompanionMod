@@ -205,7 +205,7 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         if (words.isEmpty()) return;
 
         poseStack.pushPose();
-        poseStack.translate(0.0, state.boundingBoxHeight + 0.45f, 0.0);   // just above the head, not floating mid-air
+        poseStack.translate(0.0, state.boundingBoxHeight + 0.2f, 0.0);    // starts right above the head (was +0.45)
         poseStack.mulPose(camera.orientation);
         poseStack.scale(SUBTITLE_SCALE, -SUBTITLE_SCALE, SUBTITLE_SCALE);
 

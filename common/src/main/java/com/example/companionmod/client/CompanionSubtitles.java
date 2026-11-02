@@ -19,7 +19,7 @@ final class CompanionSubtitles {
 
     private static final long LIFE_MS = 1500;
     private static final long POP_MS = 260;
-    private static final float RISE_PX = 64f;
+    private static final float RISE_PX = 20f;     // was 64: bubbles climbed ~1.6 blocks above an already high anchor
     private static final long FADE_MS = 450;
     /** Extra smoothing factor: how much of the audio-clock's coarse jump we accept per rendered frame. */
     private static final float CLOCK_EASE = 0.45f;
@@ -117,9 +117,8 @@ final class CompanionSubtitles {
             if (age < 0) break;
             if (age >= LIFE_MS) continue;
             float life = age / (float) LIFE_MS;
-            float travel = (age / (float) POP_MS) * 1.6f;
-            travel = Math.min(1, travel);
-            float walk = (1 - (1 - travel) * (1 - travel));                 // eased rise/drift fraction
+            float travel = Math.min(1, age / (float) LIFE_MS);              // float up slowly for the word's whole life
+            float walk = (1 - (1 - travel) * (1 - travel));                 // ease-out rise/drift fraction
             float lift = RISE_PX * a.liftMul[i] * walk;
             float pop = Math.min(1, age / (float) POP_MS);
             float scale = (0.2f + 0.8f * popIn(pop)) * a.sizeMul[i];        // small -> big with a bounce
@@ -128,6 +127,7 @@ final class CompanionSubtitles {
             float fade = age > LIFE_MS - FADE_MS
                     ? 1 - (age - (LIFE_MS - FADE_MS)) / (float) FADE_MS : 1;
             float alpha = Math.min(1, age / 70f) * fade;
+            if (alpha < 0.03f) continue;     // vanilla text treats alpha < 4/255 as fully OPAQUE: skip instead of flashing at the end of the fade
             float flash = Math.max(0, 1 - age / 150f);                      // bright right at the pop
             int argb = blend(((int) (alpha * 255) << 24) | (PALETTE[i % PALETTE.length] & 0xFFFFFF), flash);
             float rot = a.rotDeg[i] + wobble;
@@ -161,11 +161,20 @@ final class CompanionSubtitles {
     }
 
     private static synchronized long elapsed(String text) {
-        if (text == null || !text.equals(clockText) || clockText.isBlank()) return -1;
+        if (text == null || !sameLine(text, clockText) || clockText.isBlank()) return -1;
         long now = System.currentTimeMillis();
         if (finishedAt != 0) return durationMs + now - finishedAt;
-        if (fallback) return Math.min(durationMs, now - startedAt);
-        return (long) (progress * durationMs);
+        long wall = now - startedAt;
+        // The timed estimate used to be clamped at durationMs, which froze the last words at a young age forever
+        // (no fade, stuck above the head). Time now keeps running so every word ages out and fades.
+        if (fallback) return wall;
+        // Audio mode: if the "stopped" callback never arrives, fall back to wall time after a grace period.
+        return wall > durationMs + 2000 ? wall : (long) (progress * durationMs);
+    }
+
+    /** The voice queue clips lines to 200 chars, so the audio clock may carry a prefix of the synced line. */
+    private static boolean sameLine(String text, String clock) {
+        return text.equals(clock) || (clock.length() >= 200 && text.startsWith(clock));
     }
 
     /** Exponential approach to the raw audio clock; snaps on any backward jump (new line / rewind). */

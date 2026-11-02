@@ -1258,9 +1258,13 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         for (Mob m : sl.getEntitiesOfClass(Mob.class, getBoundingBox().inflate(32), e -> e != this)) {
             if (m.getTarget() == this) m.setTarget(null);
             if (m.getLastHurtByMob() == this) m.setLastHurtByMob(null);
-            m.getBrain().getMemory(MemoryModuleType.ATTACK_TARGET).ifPresent(t -> {
-                if (t == this) m.getBrain().eraseMemory(MemoryModuleType.ATTACK_TARGET);
-            });
+            // hasMemoryValue is null-safe; getMemory() itself throws for brains without ATTACK_TARGET
+            // (cows, chickens, most passive mobs), which crashed the server when the companion went down.
+            if (m.getBrain().hasMemoryValue(MemoryModuleType.ATTACK_TARGET)) {
+                m.getBrain().getMemory(MemoryModuleType.ATTACK_TARGET).ifPresent(t -> {
+                    if (t == this) m.getBrain().eraseMemory(MemoryModuleType.ATTACK_TARGET);
+                });
+            }
         }
     }
 

@@ -7,10 +7,16 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.ai.goal.Goal;
 import net.minecraft.world.entity.ai.navigation.PathNavigation;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.EntityBlock;
 import net.minecraft.world.level.block.FallingBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.Heightmap;
@@ -21,8 +27,10 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -50,6 +58,14 @@ public class CompanionSeekBlockGoal extends Goal {
     private BlockPos breaking, walkTo, oreTarget, stepStand;
     private int walkMode, breakProgress, breakNeed, walkTicks, scanCooldown, stuck, wanderTries, torchCooldown;
     private long lastProgress, lastSpeak;
+
+    // --- scaffolding: climb with blocks from the bag, take them back afterwards; plus per-target bookkeeping
+    private static final int MAX_SCAFFOLD = 24;
+    private final Deque<BlockPos> scaffold = new ArrayDeque<>();      // blocks WE placed, bottom first (kept across goal restarts)
+    private final Map<BlockPos, Integer> approachTries = new HashMap<>();
+    private BlockPos approachTarget, pillarTarget, jumpCell;
+    private int pillarAir, cleanupWait, pillarPlaced, bridgeRun;
+    private BlockPos bridgeCell;
 
     public CompanionSeekBlockGoal(CompanionEntity mob) {
         this.mob = mob;
@@ -83,6 +99,9 @@ public class CompanionSeekBlockGoal extends Goal {
         vein.clear();
         breaking = walkTo = oreTarget = stepStand = null;
         breakProgress = walkTicks = scanCooldown = stuck = wanderTries = 0;
+        approachTries.clear();
+        approachTarget = pillarTarget = jumpCell = bridgeCell = null;
+        pillarAir = 0;
         if (unreachable.size() > 200) unreachable.clear();
     }
 
@@ -115,7 +134,19 @@ public class CompanionSeekBlockGoal extends Goal {
         if (breaking != null) { keepBreaking(level, t, now); return; }
         if (walkTo != null) { walk(level, now); return; }
         if (!pending.isEmpty()) { startBreak(level, pending.poll()); return; }
+        if (pillarTarget != null) { pillarStep(level, t, now); return; }
         if (stepStand != null) {
+            if (bridgeCell != null) {                                   // mining: lay a floor over an air gap first (stays there)
+                BlockPos b = bridgeCell;
+                bridgeCell = null;
+                if (passable(level, b)) {
+                    ItemStack taken = CompanionProtection.canModify(level, mob, b) ? takeScaffoldBlock(t) : ItemStack.EMPTY;
+                    if (taken.isEmpty()) { stepStand = null; return; }
+                    level.setBlock(b, ((BlockItem) taken.getItem()).getBlock().defaultBlockState(), 3);
+                    mob.swing(InteractionHand.MAIN_HAND, true);
+                    lastProgress = now;
+                }
+            }
             walkTo = stepStand;
             walkMode = WALK_STAND;
             walkTicks = 0;
@@ -127,6 +158,14 @@ public class CompanionSeekBlockGoal extends Goal {
     }
 
     private void decide(ServerLevel level, MineTask t) {
+        if (t.mined >= t.want) {                    // done (also when a fight interrupted it): climb down first, then report
+            if (cleanupScaffold(level)) return;
+            String msg = "That's " + t.mined + " " + CompanionEntity.prettyBlockId(t.blockId) + " for you.";
+            t.finish();
+            mob.speak(msg);
+            resetTransient();                       // no warp home: the follow goal walks the companion back
+            return;
+        }
         while (!vein.isEmpty() && !matches(t, level.getBlockState(vein.peek()))) vein.poll();
         if (!vein.isEmpty()) { approach(level, t, vein.peek()); return; }
 
@@ -137,6 +176,8 @@ public class CompanionSeekBlockGoal extends Goal {
         }
         if (oreTarget != null && !matches(t, level.getBlockState(oreTarget))) oreTarget = null;
         if (oreTarget != null) { approach(level, t, oreTarget); return; }
+
+        if (cleanupScaffold(level)) return;         // nothing left to mine from up here: climb down, take our blocks back
 
         int y = mob.blockPosition().getY();
         switch (t.phase) {
@@ -183,6 +224,7 @@ public class CompanionSeekBlockGoal extends Goal {
     }
 
     private void wanderSearch(ServerLevel level, MineTask t) {
+        if (wanderTries == 3) unreachable.clear();   // new vantage point: give previously unreachable blocks another chance
         if (++wanderTries > 10) {
             t.pause();
             say(level, "I can't find any " + CompanionEntity.prettyBlockId(t.blockId) + " around here.", true);
@@ -204,10 +246,24 @@ public class CompanionSeekBlockGoal extends Goal {
     // ------------------------------------------------------------------ approaching and tunnelling
 
     private void approach(ServerLevel level, MineTask t, BlockPos target) {
-        if (mob.distanceToSqr(Vec3.atCenterOf(target)) <= REACH_SQ && lineClear(level, target)) {
-            startBreak(level, target);
+        approachTarget = target;
+        if (mob.distanceToSqr(Vec3.atCenterOf(target)) <= REACH_SQ) {
+            if (lineClear(level, target)) { startBreak(level, target); return; }
+            // Close enough but something is in the way (stone, leaves...): dig it out the way a player would.
+            BlockPos blocker = firstBlocker(level, target);
+            if (blocker == null) { startBreak(level, target); return; }
+            if (approachTries.merge(target.immutable(), 1, Integer::sum) <= 8 && safeToBreak(level, blocker)) {
+                pending.add(blocker);
+            } else {
+                giveUp(target);
+            }
             return;
         }
+        // Far away (or above us). Unless we are climbing toward this block, get off our tower first.
+        BlockPos me = mob.blockPosition();
+        boolean climbing = target.getY() - me.getY() >= 2
+                && Math.max(Math.abs(target.getX() - me.getX()), Math.abs(target.getZ() - me.getZ())) <= 3;
+        if (!climbing && cleanupScaffold(level)) return;
         if (t.phase == MineTask.Phase.SEARCH) {                          // above ground: walk if a path exists
             Path p = mob.getNavigation().createPath(target, 1);
             if (p != null && p.canReach()) {
@@ -217,8 +273,176 @@ public class CompanionSeekBlockGoal extends Goal {
                 mob.getNavigation().moveTo(p, 1.1);
                 return;
             }
+            if (tryScaffold(level, t, target)) return;                   // high in a tree: build up to it
         }
         tunnelToward(level, t, target);
+    }
+
+    private void giveUp(BlockPos target) {
+        unreachable.add(target.immutable());
+        vein.remove(target);
+        if (target.equals(oreTarget)) oreTarget = null;
+        if (target.equals(pillarTarget)) { pillarTarget = null; jumpCell = null; }
+        pending.clear();
+        stepStand = null;
+    }
+
+    /** First solid cell between our eyes and the target (the thing we must dig out), or null. */
+    private BlockPos firstBlocker(ServerLevel level, BlockPos target) {
+        Vec3 eye = mob.getEyePosition(), goal = Vec3.atCenterOf(target), delta = goal.subtract(eye);
+        for (int k = 1; k <= 8; k++) {
+            BlockPos bp = BlockPos.containing(eye.add(delta.scale(k / 9.0)));
+            if (bp.equals(target)) break;
+            if (!level.getBlockState(bp).getCollisionShape(level, bp).isEmpty()) return bp.immutable();
+        }
+        return null;
+    }
+
+    /** Never open a wall into liquid, and never break unbreakable blocks. */
+    private boolean safeToBreak(ServerLevel level, BlockPos c) {
+        BlockState s = level.getBlockState(c);
+        if (s.getDestroySpeed(level, c) < 0 || !s.getFluidState().isEmpty()) return false;
+        for (Direction dd : Direction.values()) {
+            if (!level.getBlockState(c.relative(dd)).getFluidState().isEmpty()) return false;
+        }
+        return true;
+    }
+
+    // ------------------------------------------------------------------ scaffolding
+
+    /** Cheap, solid, non-falling blocks only (dirt, stone family, cobble, netherrack, planks), never the block being mined. */
+    private static boolean usableScaffold(ItemStack s, MineTask t) {
+        if (s.isEmpty() || !(s.getItem() instanceof BlockItem bi)) return false;
+        Block b = bi.getBlock();
+        if (b instanceof FallingBlock || b instanceof EntityBlock) return false;
+        BlockState st = b.defaultBlockState();
+        if (matches(t, st)) return false;
+        return st.is(BlockTags.DIRT) || st.is(BlockTags.BASE_STONE_OVERWORLD) || st.is(BlockTags.BASE_STONE_NETHER)
+                || st.is(BlockTags.PLANKS) || b == Blocks.COBBLESTONE || b == Blocks.COBBLED_DEEPSLATE || b == Blocks.NETHERRACK;
+    }
+
+    private int scaffoldSlot(MineTask t) {
+        int best = -1, bestScore = Integer.MAX_VALUE;
+        for (int i = CompanionEntity.MAIN_START; i < CompanionEntity.MAIN_START + CompanionEntity.MAIN_SIZE; i++) {
+            ItemStack s = mob.storage().getItem(i);
+            if (!usableScaffold(s, t)) continue;
+            Block b = ((BlockItem) s.getItem()).getBlock();
+            int score = (b == Blocks.DIRT || b == Blocks.COBBLESTONE || b == Blocks.COBBLED_DEEPSLATE || b == Blocks.NETHERRACK) ? 0 : 1;
+            if (score < bestScore) { bestScore = score; best = i; }
+        }
+        return best;
+    }
+
+    private boolean hasScaffoldBlock(MineTask t) { return scaffoldSlot(t) >= 0; }
+
+    private ItemStack takeScaffoldBlock(MineTask t) {
+        int i = scaffoldSlot(t);
+        return i < 0 ? ItemStack.EMPTY : mob.storage().removeItem(i, 1);
+    }
+
+    /** The target is above us: walk to the foot of its column if needed, then start pillaring up. */
+    private boolean tryScaffold(ServerLevel level, MineTask t, BlockPos target) {
+        BlockPos me = mob.blockPosition();
+        if (target.getY() - me.getY() < 2 || !hasScaffoldBlock(t)) return false;
+        if (approachTries.merge(target.immutable(), 1, Integer::sum) > 8) return false;
+        int h = Math.max(Math.abs(target.getX() - me.getX()), Math.abs(target.getZ() - me.getZ()));
+        if (h <= 2) {
+            if (pillarTarget == null) pillarPlaced = 0;
+            pillarTarget = target.immutable();
+            jumpCell = null;
+            pillarAir = 0;
+            return true;
+        }
+        BlockPos foot = groundBelow(level, t, target).above();
+        Path p = mob.getNavigation().createPath(foot, 2);
+        if (p == null || !p.canReach()) return false;
+        walkTo = foot;
+        walkMode = WALK_FREE;
+        walkTicks = 0;
+        mob.getNavigation().moveTo(p, 1.0);
+        return true;
+    }
+
+    /** Solid ground under the target's column (skips air, leaves and the mined material itself, e.g. the trunk). */
+    private BlockPos groundBelow(ServerLevel level, MineTask t, BlockPos target) {
+        BlockPos g = target;
+        while (g.getY() > level.getMinY()) {
+            BlockState st = level.getBlockState(g);
+            if (st.getCollisionShape(level, g).isEmpty() || matches(t, st) || st.is(BlockTags.LEAVES)) g = g.below();
+            else break;
+        }
+        return g;
+    }
+
+    /** Jump, and while the feet are above the cell we left, put a block into it; repeat until the target is in reach. */
+    private void pillarStep(ServerLevel level, MineTask t, long now) {
+        BlockPos target = pillarTarget;
+        if (!matches(t, level.getBlockState(target)) || unreachable.contains(target)) { endPillar(); return; }
+        if (mob.distanceToSqr(Vec3.atCenterOf(target)) <= REACH_SQ) { endPillar(); return; }   // in reach: normal mining (clears leaves in the way)
+        if (target.getY() <= mob.blockPosition().getY() + 1) { endPillar(); return; }          // no longer above us
+        mob.getNavigation().stop();
+        if (jumpCell == null) {
+            if (!mob.onGround()) return;                                  // wait until we have landed
+            if (scaffold.size() >= MAX_SCAFFOLD || pillarPlaced >= MAX_SCAFFOLD) {
+                say(level, "That's too high to build up to.", true);
+                giveUp(target);
+                return;
+            }
+            BlockPos feet = mob.blockPosition();
+            for (int up = 2; up <= 3; up++) {                             // headroom for the jump: leaves, branches...
+                BlockPos h = feet.above(up);
+                if (passable(level, h)) continue;
+                if (safeToBreak(level, h)) pending.add(h); else giveUp(target);
+                return;
+            }
+            if (!hasScaffoldBlock(t)) {
+                say(level, "I need dirt or cobblestone to climb up there.", true);
+                giveUp(target);
+                return;
+            }
+            jumpCell = feet.immutable();
+            pillarAir = 0;
+            mob.getJumpControl().jump();
+            return;
+        }
+        pillarAir++;
+        if (mob.getY() >= jumpCell.getY() + 1.05) {                       // feet are above the cell we left
+            if (passable(level, jumpCell)) {
+                if (!CompanionProtection.canModify(level, mob, jumpCell)) { giveUp(target); return; }
+                ItemStack taken = takeScaffoldBlock(t);
+                if (taken.isEmpty()) { giveUp(target); return; }
+                level.setBlock(jumpCell, ((BlockItem) taken.getItem()).getBlock().defaultBlockState(), 3);
+                pillarPlaced++;
+                if (!t.deep()) scaffold.addLast(jumpCell);        // surface jobs (trees...): temporary, taken back afterwards. Mining: the blocks stay.
+                mob.swing(InteractionHand.MAIN_HAND, true);
+                lastProgress = now;
+            }
+            jumpCell = null;
+        } else if (pillarAir > 25) {
+            jumpCell = null;                                              // the jump did not happen (head bump, water): retry
+        }
+    }
+
+    private void endPillar() {
+        pillarTarget = null;
+        jumpCell = null;
+        pillarAir = 0;
+    }
+
+    /** Climbs down by breaking the top block we placed (we stand on it) and takes the blocks back. true = still busy. */
+    private boolean cleanupScaffold(ServerLevel level) {
+        while (!scaffold.isEmpty() && level.getBlockState(scaffold.peekLast()).isAir()) scaffold.pollLast();
+        if (scaffold.isEmpty()) { cleanupWait = 0; return false; }
+        BlockPos top = scaffold.peekLast();
+        if (mob.distanceToSqr(Vec3.atCenterOf(top)) > REACH_SQ) {
+            if (++cleanupWait > 120) { scaffold.clear(); cleanupWait = 0; return false; }   // cannot get back to the tower: leave it
+            mob.getNavigation().moveTo(top.getX() + 0.5, top.getY(), top.getZ() + 0.5, 1.0);
+            return true;
+        }
+        cleanupWait = 0;
+        startBreak(level, top);
+        if (breaking == null) scaffold.pollLast();                        // refused (protected / unbreakable): forget it
+        return true;
     }
 
     private void tunnelToward(ServerLevel level, MineTask t, BlockPos target) {
@@ -230,9 +454,8 @@ public class CompanionSeekBlockGoal extends Goal {
         else d = dz > 0 ? Direction.SOUTH : Direction.NORTH;
         int dyStep = dy < -1 ? -1 : dy > 1 ? 1 : 0;
         if (!planStep(level, t, d, dyStep, true)) {
-            unreachable.add(target);
-            vein.remove(target);
-            oreTarget = null;
+            if (tryScaffold(level, t, target)) return;     // open air / cave: climb with blocks from the bag
+            giveUp(target);
         }
     }
 
@@ -248,8 +471,12 @@ public class CompanionSeekBlockGoal extends Goal {
             cells.add(stand);
             cells.add(stand.above());
             if (dyStep < 0) cells.add(stand.above(2));                  // headroom to walk in before dropping
-            if (!safe(level, stand, cells)) continue;
+            boolean bridge = dyStep == 0 && t.deep() && bridgeRun < 12 && hasScaffoldBlock(t)
+                    && level.getBlockState(stand.below()).isAir();      // gap in the floor while mining: bridge it
+            if (!safe(level, stand, cells, bridge)) continue;
             for (BlockPos c : cells) if (!passable(level, c)) pending.add(c);
+            bridgeCell = bridge ? stand.below().immutable() : null;
+            bridgeRun = bridge ? bridgeRun + 1 : 0;
             stepStand = stand;
             t.dirData = d.get2DDataValue();
             return true;
@@ -258,8 +485,13 @@ public class CompanionSeekBlockGoal extends Goal {
     }
 
     private boolean safe(ServerLevel level, BlockPos stand, List<BlockPos> cells) {
+        return safe(level, stand, cells, false);
+    }
+
+    private boolean safe(ServerLevel level, BlockPos stand, List<BlockPos> cells, boolean bridge) {
         BlockState floor = level.getBlockState(stand.below());
-        if (floor.isAir() || !floor.getFluidState().isEmpty()) return false;       // would walk into a hole / liquid
+        if (!floor.getFluidState().isEmpty()) return false;                         // never into liquid
+        if (floor.isAir() && !bridge) return false;                                 // would walk into a hole (unless we bridge it)
         int topY = Integer.MIN_VALUE;
         for (BlockPos c : cells) {
             BlockState s = level.getBlockState(c);
@@ -337,19 +569,14 @@ public class CompanionSeekBlockGoal extends Goal {
             if (vein.size() < 24 && !vein.contains(n) && matches(t, level.getBlockState(n))) vein.add(n);
         }
         say(level, "Got " + CompanionEntity.prettyBlockId(t.blockId) + "! (" + t.mined + "/" + t.want + ")", true);
-        if (t.mined >= t.want) {
-            String msg = "That's " + t.mined + " " + CompanionEntity.prettyBlockId(t.blockId) + " for you.";
-            t.finish();
-            mob.speak(msg);
-            resetTransient();      // no warp home: the follow goal walks the companion back
-        }
+        // finishing (and climbing back down) is handled in decide()
     }
 
     private void walk(ServerLevel level, long now) {
         walkTicks++;
         BlockPos w = walkTo;
         boolean arrived = switch (walkMode) {
-            case WALK_REACH -> mob.distanceToSqr(Vec3.atCenterOf(w)) <= REACH_SQ && lineClear(level, w);
+            case WALK_REACH -> mob.distanceToSqr(Vec3.atCenterOf(w)) <= REACH_SQ;     // line of sight is handled by approach(): it digs the blocker out
             case WALK_FREE -> mob.distanceToSqr(Vec3.atCenterOf(w)) < 4.0;
             default -> Math.abs(mob.getX() - (w.getX() + 0.5)) < 0.7 && Math.abs(mob.getZ() - (w.getZ() + 0.5)) < 0.7
                     && Math.abs(mob.getY() - w.getY()) < 1.2;
@@ -362,9 +589,8 @@ public class CompanionSeekBlockGoal extends Goal {
                 mob.resetFallDistance();
                 nav.stop();
                 lastProgress = now;
-            } else if (walkMode == WALK_REACH && oreTarget != null) {
-                unreachable.add(oreTarget);
-                oreTarget = null;
+            } else if (walkMode == WALK_REACH && approachTarget != null) {
+                giveUp(approachTarget);      // used to cover only oreTarget: a stuck vein block was retried forever ("staring")
             }
             walkTo = null;
             return;
@@ -388,8 +614,9 @@ public class CompanionSeekBlockGoal extends Goal {
         for (BlockPos p : BlockPos.betweenClosed(o.offset(-r, -Math.min(r, 12), -r), o.offset(r, Math.min(r, 8), r))) {
             if (!matches(t, level.getBlockState(p)) || unreachable.contains(p)) continue;
             double d = mob.distanceToSqr(Vec3.atCenterOf(p));
-            if (d >= bestD || (d > 9.0 && !exposed(level, p))) continue;
-            bestD = d;
+            double score = d + Math.max(0, p.getY() - (o.getY() + 2)) * 6.0;   // prefer reachable blocks over ones high in a crown
+            if (score >= bestD || (d > 9.0 && !exposed(level, p))) continue;
+            bestD = score;
             best = p.immutable();
         }
         return best;
