@@ -159,9 +159,9 @@ public final class CompanionRadialScreen extends Screen {
                 custom("Cancel Plan", "Stop the current goal", Items.BARRIER, CompanionAutonomy::cancelPlan))));
         e.add(sub("More", "Skin, persona, settings", Items.NAME_TAG, List.of(
                 custom("Skin Library", "Wear a player skin", Items.LEATHER_HELMET,
-                        () -> open(new CompanionSkinScreen(cfg, ClientVoice.configFile()))),
+                        () -> open(new CompanionSkinScreen(cfg, ClientVoice.configFile(), this))),
                 custom("Personalize", "Who your companion is", Items.NAME_TAG,
-                        () -> open(new CompanionProfileScreen(cfg, ClientVoice.configFile(), null))),
+                        () -> open(new CompanionProfileScreen(cfg, ClientVoice.configFile(), this))),
                 custom("Settings", "Voice, memory, AI", Items.REDSTONE,
                         () -> open(new CompanionSettingsScreen(cfg, ClientVoice.configFile()))),
                 order("Inventory", "Open its bag", "inventory", Items.CHEST))));

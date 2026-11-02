@@ -715,6 +715,7 @@ package com.example.companionmod.client;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.network.chat.Component;
 
 import java.util.ArrayList;
@@ -746,6 +747,10 @@ final class CompanionDropdowns {
         String emptyText = "Nothing found";
         boolean loading;
         int scroll;
+        // optional free-text mode (pencil button): type any value the server list does not contain
+        EditBox editor;
+        Button editButton;
+        boolean editing;
 
         Dropdown(String title, Supplier<String> getter, Consumer<String> setter) {
             this.title = title;
@@ -1221,11 +1226,12 @@ import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.inventory.Slot;
 
 /**
- * The companion's bag: top row = 4 armor slots + 4 tool slots, below that 18 storage slots,
- * then the player's own inventory. Slot rendering, tooltips and click handling come from
- * {@link AbstractContainerScreen}; we only paint the panel and the section labels.
+ * The companion's bag in the grey panel style of the settings screens: armor row, tool row, 2x9 storage, then the
+ * player's own inventory. Slot rendering, tooltips and click handling come from {@link AbstractContainerScreen};
+ * this class paints the panel, a sunken well behind every slot, and the section labels.
  */
 public class CompanionInventoryScreen extends AbstractContainerScreen<CompanionInventoryMenu> {
     public CompanionInventoryScreen(CompanionInventoryMenu menu, Inventory playerInventory, Component title) {
@@ -1233,34 +1239,30 @@ public class CompanionInventoryScreen extends AbstractContainerScreen<CompanionI
         this.titleLabelX = 8;
         this.titleLabelY = 6;
         this.inventoryLabelX = 8;
-        this.inventoryLabelY = 104;
+        this.inventoryLabelY = 102;
     }
 
     @Override
     public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
-        int x = leftPos, y = topPos;
-        g.fill(x - 4, y - 4, x + imageWidth + 4, y + imageHeight + 4, 0xB4101010);
-        g.fill(x, y, x + imageWidth, y + imageHeight, 0xE6181818);
-        g.fill(x, y, x + imageWidth, y + 1, 0xFFFFFFFF);
-        g.fill(x + 4, y + 23, x + imageWidth - 4, y + 47, 0x33383838);
-        g.fill(x + 4, y + 51, x + imageWidth - 4, y + 93, 0x22383838);
-        g.fill(x + 4, y + 108, x + imageWidth - 4, y + 192, 0x22383838);
+        super.extractBackground(g, mouseX, mouseY, partialTick);   // 26.1-CHECK: vanilla blur/dim; remove if it draws twice
+        CompanionUi.panel(g, leftPos, topPos, leftPos + imageWidth, topPos + imageHeight);
+        for (Slot s : this.menu.slots) slotWell(g, leftPos + s.x - 1, topPos + s.y - 1);
+    }
+
+    /** Vanilla-style sunken 18x18 slot: dark top/left edge, light bottom/right edge, mid-grey fill. */
+    private static void slotWell(GuiGraphicsExtractor g, int x, int y) {
+        g.fill(x, y, x + 18, y + 18, 0xFF373737);
+        g.fill(x + 1, y + 1, x + 18, y + 18, 0xFFFFFFFF);
+        g.fill(x + 1, y + 1, x + 17, y + 17, 0xFF8B8B8B);
     }
 
     @Override
     protected void extractLabels(GuiGraphicsExtractor g, int mouseX, int mouseY) {
-        g.text(this.font, this.title, this.titleLabelX, this.titleLabelY, 0xFFE8EEF4, true);
-        g.text(this.font, Component.literal("Armor"), 8, 16, 0xFF9AA6B2, true);
-        String[] tools = {"Pick", "Axe", "Shov", "Swrd"};
-        for (int i = 0; i < tools.length; i++) {
-            g.pose().pushMatrix();
-            g.pose().translate(107 + i * 18, 17);
-            g.pose().scale(0.68f, 0.68f);
-            g.centeredText(this.font, tools[i], 0, 0, 0xFFC8C8C8);
-            g.pose().popMatrix();
-        }
-        g.text(this.font, Component.literal("Storage"), 8, 47, 0xFF9AA6B2, true);
-        g.text(this.font, this.playerInventoryTitle, this.inventoryLabelX, this.inventoryLabelY, 0xFF9AA6B2, true);
+        g.text(this.font, this.title, this.titleLabelX, this.titleLabelY, CompanionUi.TEXT_DARK, false);
+        g.text(this.font, Component.literal("Armor"), 8, 17, CompanionUi.TEXT_MUTED, false);
+        g.text(this.font, Component.literal("Tools"), 98, 17, CompanionUi.TEXT_MUTED, false);
+        g.text(this.font, Component.literal("Storage"), 8, 44, CompanionUi.TEXT_MUTED, false);
+        g.text(this.font, this.playerInventoryTitle, this.inventoryLabelX, this.inventoryLabelY, CompanionUi.TEXT_DARK, false);
     }
 }
 ```
@@ -1482,18 +1484,19 @@ import net.minecraft.network.chat.Component;
 import java.nio.file.Path;
 
 /**
- * "Who is my companion?" editor: name, backstory, personality and traits.
- * Everything is saved to the client config and immediately sent to the server (name).
+ * "Who is my companion?" editor (name, backstory, personality, traits) in the same grey panel style as the
+ * settings screen. Save writes the config and sends the name to the server; Cancel discards. Both return to
+ * {@code parent} (or close the screen when it was opened without one, e.g. from the radial wheel).
  */
 public class CompanionProfileScreen extends Screen {
+    private static final int PANEL_W = 300, PAD = 12, HEAD_H = 44, PITCH = 32;
+
     private final VoiceConfig config;
     private final Path configFile;
     private final Screen parent;
 
-    private EditBox nameField;
-    private EditBox descriptionField;
-    private EditBox personalityField;
-    private EditBox traitsField;
+    private EditBox nameField, descriptionField, personalityField, traitsField;
+    private int px, py, panelW, panelH, ix, iw;
 
     public CompanionProfileScreen(VoiceConfig config, Path configFile, Screen parent) {
         super(Component.literal("Personalize Companion"));
@@ -1504,42 +1507,42 @@ public class CompanionProfileScreen extends Screen {
 
     @Override
     protected void init() {
-        super.init();
-        int cx = this.width / 2;
-        int w = 300;
-        int y = 64;
+        panelW = Math.min(PANEL_W, this.width - 8);
+        panelH = HEAD_H + 4 * PITCH + 4 + 24 + 20 + 12;
+        px = (this.width - panelW) / 2;
+        py = Math.max(4, (this.height - panelH) / 2);
+        ix = px + PAD;
+        iw = panelW - 2 * PAD;
 
-        this.nameField = field(cx, y, w, config.companionName, "Name (e.g. Aria)");
-        y += 34;
-        this.descriptionField = field(cx, y, w, config.companionDescription,
-                "Who are they? Backstory, role, quirks...");
-        y += 34;
-        this.personalityField = field(cx, y, w, config.companionPersonality,
-                "Personality (friendly, sarcastic, brave...)");
-        y += 34;
-        this.traitsField = field(cx, y, w, config.companionTraits,
-                "Traits, comma separated (loyal, curious, protective)");
-        y += 40;
+        int y = py + HEAD_H;
+        nameField = field(y, config.companionName, "Name (e.g. Aria)");
+        y += PITCH;
+        descriptionField = field(y, config.companionDescription, "Who are they? Backstory, role, quirks...");
+        y += PITCH;
+        personalityField = field(y, config.companionPersonality, "Friendly, sarcastic, brave...");
+        y += PITCH;
+        traitsField = field(y, config.companionTraits, "Comma separated: loyal, curious");
+        y += PITCH + 4;
 
+        int colW = (iw - 4) / 2;
         this.addRenderableWidget(Button.builder(Component.literal("Save"), b -> save())
-                .pos(cx - w / 2, y).size(w, 20).build());
-        y += 24;
-        this.addRenderableWidget(Button.builder(Component.literal("Reset to defaults"), b -> {
+                .pos(ix, y).size(colW, 20).build());
+        this.addRenderableWidget(Button.builder(Component.literal("Reset to Defaults"), b -> {
             nameField.setValue("Companion");
             descriptionField.setValue("A loyal companion fighting beside you.");
             personalityField.setValue("Friendly and helpful");
             traitsField.setValue("loyal, curious, protective");
-        }).pos(cx - w / 2, y).size(w, 20).build());
+        }).pos(ix + colW + 4, y).size(colW, 20).build());
         y += 24;
-        this.addRenderableWidget(Button.builder(Component.literal("Back"), b -> back())
-                .pos(cx - w / 2, y).size(w, 20).build());
+        this.addRenderableWidget(Button.builder(Component.literal("Cancel"), b -> back())
+                .pos(ix, y).size(iw, 20).build());
     }
 
-    private EditBox field(int cx, int y, int w, String value, String hint) {
-        EditBox box = new EditBox(this.font, cx - w / 2, y, w, 20, Component.literal(hint));
+    private EditBox field(int y, String value, String hint) {
+        EditBox box = new EditBox(this.font, ix, y, iw, 20, Component.literal(hint));
+        box.setMaxLength(240);
         box.setValue(value == null ? "" : value);
         box.setHint(Component.literal(hint));
-        box.setMaxLength(240);
         this.addRenderableWidget(box);
         return box;
     }
@@ -1555,34 +1558,44 @@ public class CompanionProfileScreen extends Screen {
     }
 
     private void back() {
-        if (this.minecraft != null) this.minecraft.setScreen(parent);
+        if (this.minecraft != null) this.minecraft.setScreen(parent);   // null parent = close
     }
+
+    @Override
+    public void onClose() { back(); }
 
     private static String blankTo(String value, String fallback) {
         return value == null || value.isBlank() ? fallback : value.trim();
     }
 
     @Override
-    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
-        this.extractMenuBackground(g);
-        int cx = this.width / 2;
-        int w = 300;
-        g.fill(cx - w / 2 - 12, 34, cx + w / 2 + 12, this.height - 28, 0xCC101216);
-        g.fill(cx - w / 2 - 12, 34, cx + w / 2 + 12, 35, 0xFF3D7BB8);
-        super.extractRenderState(g, mouseX, mouseY, partialTick);
+    public boolean isPauseScreen() { return false; }
 
-        g.centeredText(this.font, "Personalize Companion", cx, 42, 0xFFFFFFFF);
-        g.centeredText(this.font, "This is who your companion is. It shapes every reply.", cx, 54, 0xFF9AA6B2);
-
-        int y = 64;
-        label(g, "Name", cx - w / 2, y - 11);
-        label(g, "Who they are", cx - w / 2, y + 23);
-        label(g, "Personality", cx - w / 2, y + 57);
-        label(g, "Traits", cx - w / 2, y + 91);
+    @Override
+    public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        super.extractBackground(g, mouseX, mouseY, partialTick);
+        CompanionUi.panel(g, px, py, px + panelW, py + panelH);
     }
 
-    private void label(GuiGraphicsExtractor g, String text, int x, int y) {
-        g.text(this.font, text, x, y, 0xFFB8C2CC, true);
+    @Override
+    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        super.extractRenderState(g, mouseX, mouseY, partialTick);
+        int cx = this.width / 2;
+        centered(g, "Personalize Companion", cx, py + 8, CompanionUi.TEXT_DARK);
+        centered(g, "Who your companion is. It shapes every reply.", cx, py + 20, CompanionUi.TEXT_MUTED);
+        int y = py + HEAD_H - 11;
+        label(g, "Name", y);
+        label(g, "Who they are", y + PITCH);
+        label(g, "Personality", y + 2 * PITCH);
+        label(g, "Traits", y + 3 * PITCH);
+    }
+
+    private void label(GuiGraphicsExtractor g, String s, int y) {
+        g.text(this.font, s, ix, y, CompanionUi.TEXT_DARK, false);
+    }
+
+    private void centered(GuiGraphicsExtractor g, String s, int cx, int y, int color) {
+        g.text(this.font, s, cx - this.font.width(s) / 2, y, color, false);
     }
 }
 ```
@@ -1751,9 +1764,9 @@ public final class CompanionRadialScreen extends Screen {
                 custom("Cancel Plan", "Stop the current goal", Items.BARRIER, CompanionAutonomy::cancelPlan))));
         e.add(sub("More", "Skin, persona, settings", Items.NAME_TAG, List.of(
                 custom("Skin Library", "Wear a player skin", Items.LEATHER_HELMET,
-                        () -> open(new CompanionSkinScreen(cfg, ClientVoice.configFile()))),
+                        () -> open(new CompanionSkinScreen(cfg, ClientVoice.configFile(), this))),
                 custom("Personalize", "Who your companion is", Items.NAME_TAG,
-                        () -> open(new CompanionProfileScreen(cfg, ClientVoice.configFile(), null))),
+                        () -> open(new CompanionProfileScreen(cfg, ClientVoice.configFile(), this))),
                 custom("Settings", "Voice, memory, AI", Items.REDSTONE,
                         () -> open(new CompanionSettingsScreen(cfg, ClientVoice.configFile()))),
                 order("Inventory", "Open its bag", "inventory", Items.CHEST))));
@@ -2295,6 +2308,7 @@ public class CompanionSettingsScreen extends Screen {
     private CompanionDropdowns dropdowns;
     private Dropdown chatDd, sttDd, ttsDd, voiceDd, micDd, spkDd;
     private EditBox hostBox;
+    private final List<Dropdown> editables = new ArrayList<>();
 
     // server catalog (survives tab switches and resizes)
     private boolean catalogRequested;
@@ -2330,6 +2344,7 @@ public class CompanionSettingsScreen extends Screen {
         dropdowns = new CompanionDropdowns(this.font, () -> this.height);
         chatDd = sttDd = ttsDd = voiceDd = micDd = spkDd = null;
         hostBox = null;
+        editables.clear();
 
         panelW = Math.min(PANEL_W, this.width - 8);
         panelH = HEAD_H + CONTENT_H + FOOT_H;
@@ -2375,7 +2390,7 @@ public class CompanionSettingsScreen extends Screen {
         int colW = (iw - 4) / 2, lx = ix, rx = ix + colW + 4, y = cy;
 
         nav(lx, y, colW, "Personalize...", () -> new CompanionProfileScreen(config, configFile, this));
-        nav(rx, y, colW, "Appearance...", () -> new CompanionSkinScreen(config, configFile));
+        nav(rx, y, colW, "Appearance...", () -> new CompanionSkinScreen(config, configFile, this));
         y += ROW;
 
         toggle(lx, y, colW, "Dynamic Goals", config.dynamicGoals, v -> config.dynamicGoals = v);
@@ -2406,9 +2421,9 @@ public class CompanionSettingsScreen extends Screen {
                 .pos(ix + iw - 20, y).size(20, 20).build());
         y += ROW;
 
-        chatDd = dd(ix, y, iw, "Chat Model", () -> config.chatModel, v -> config.chatModel = v);
+        chatDd = dd(ix, y, iw, "Chat Model", () -> config.chatModel, v -> config.chatModel = v, true);
         y += ROW;
-        sttDd = dd(ix, y, iw, "STT Model", () -> config.sttModel, v -> config.sttModel = v);
+        sttDd = dd(ix, y, iw, "STT Model", () -> config.sttModel, v -> config.sttModel = v, true);
         y += ROW;
         this.addRenderableWidget(new Slider(ix, y, iw, "Temperature", 0f, 1.5f, config.temperature, 2, "",
                 v -> config.temperature = Math.round(v * 100f) / 100f));
@@ -2443,9 +2458,9 @@ public class CompanionSettingsScreen extends Screen {
         spkDd.options = opts;
         y += ROW;
 
-        ttsDd = dd(ix, y, iw, "Speech Model", () -> config.speechModel, v -> { config.speechModel = v; loadVoices(); });
+        ttsDd = dd(ix, y, iw, "Speech Model", () -> config.speechModel, v -> { config.speechModel = v; loadVoices(); }, true);
         y += ROW;
-        voiceDd = dd(ix, y, iw, "Voice", () -> config.speechVoice, v -> config.speechVoice = v);
+        voiceDd = dd(ix, y, iw, "Voice", () -> config.speechVoice, v -> config.speechVoice = v, true);
         y += ROW;
 
         this.addRenderableWidget(new Slider(ix, y, iw, "Reply Volume", 0, 100, config.speechVolume * 100f, 0, "%",
@@ -2455,11 +2470,58 @@ public class CompanionSettingsScreen extends Screen {
     // ---- widget helpers -----------------------------------------------------------------------------------------
 
     private Dropdown dd(int x, int y, int w, String title, Supplier<String> get, Consumer<String> set) {
+        return dd(x, y, w, title, get, set, false);
+    }
+
+    /** {@code editable}: adds a pencil button that swaps the dropdown for a text box, so any value can be typed. */
+    private Dropdown dd(int x, int y, int w, String title, Supplier<String> get, Consumer<String> set, boolean editable) {
         Dropdown d = new Dropdown(title, get, set);
+        int hw = editable ? w - 22 : w;
         d.button = this.addRenderableWidget(Button.builder(Component.literal(title), b -> dropdowns.toggle(d))
-                .pos(x, y).size(w, 20).build());
+                .pos(x, y).size(hw, 20).build());
+        if (editable) {
+            EditBox box = new EditBox(this.font, x, y, hw, 20, Component.literal(title));
+            box.setMaxLength(120);
+            box.setHint(Component.literal("Type a name, Enter to confirm"));
+            box.visible = false;
+            d.editor = this.addRenderableWidget(box);
+            d.editButton = this.addRenderableWidget(Button.builder(Component.literal("\u270E"), b -> toggleEdit(d))
+                    .pos(x + w - 20, y).size(20, 20).build());
+            editables.add(d);
+        }
         dropdowns.register(d);
         return d;
+    }
+
+    private void toggleEdit(Dropdown d) {
+        if (d.editing) { commitEdit(d); return; }
+        dropdowns.close();
+        d.editing = true;
+        d.button.visible = false;
+        String cur = d.getter.get();
+        d.editor.setValue(cur == null ? "" : cur);
+        d.editor.visible = true;
+        this.setFocused(d.editor);
+        d.editButton.setMessage(Component.literal("\u2714"));
+    }
+
+    private void commitEdit(Dropdown d) {
+        String v = d.editor.getValue() == null ? "" : d.editor.getValue().trim();
+        endEdit(d);
+        d.setter.accept(v);
+        dropdowns.refresh(d);
+    }
+
+    private void cancelEdit(Dropdown d) {
+        endEdit(d);
+        dropdowns.refresh(d);
+    }
+
+    private void endEdit(Dropdown d) {
+        d.editing = false;
+        d.editor.visible = false;
+        d.button.visible = true;
+        d.editButton.setMessage(Component.literal("\u270E"));
     }
 
     private void nav(int x, int y, int w, String label, Supplier<Screen> target) {
@@ -2558,7 +2620,7 @@ public class CompanionSettingsScreen extends Screen {
     /** Pushes the freshest lists into whichever dropdowns the current tab has. */
     private void applyOptions() {
         if (dropdowns == null) return;
-        String modelEmpty = modelsFailed ? "Server unreachable" : "No models installed";
+        String modelEmpty = modelsFailed ? "Server unreachable - use the pencil" : "None found - use the pencil";
         if (chatDd != null) { chatDd.options = modelOptions(null); chatDd.loading = modelsLoading; chatDd.emptyText = modelEmpty; }
         if (sttDd != null) { sttDd.options = modelOptions("None (audio model)"); sttDd.loading = modelsLoading; sttDd.emptyText = modelEmpty; }
         if (ttsDd != null) { ttsDd.options = modelOptions("Auto"); ttsDd.loading = modelsLoading; ttsDd.emptyText = modelEmpty; }
@@ -2568,8 +2630,9 @@ public class CompanionSettingsScreen extends Screen {
             for (String n : voiceNames) v.add(new Option(n, n));
             voiceDd.options = v;
             voiceDd.loading = voicesLoading;
-            if (!voicesLoading) voiceDd.emptyText = "No voices answered - is the speech model installed? (ollama pull "
-                    + ((config.speechModel == null || config.speechModel.isBlank()) ? "phonon" : config.speechModel) + ")";
+            voiceDd.emptyText = "No voices - ollama pull "
+                    + ((config.speechModel == null || config.speechModel.isBlank()) ? "phonon" : config.speechModel)
+                    + " (or use the pencil)";
         }
         dropdowns.refreshAll();
     }
@@ -2627,6 +2690,11 @@ public class CompanionSettingsScreen extends Screen {
     @Override
     public boolean keyPressed(KeyEvent event) {
         int k = event.key();
+        for (Dropdown d : editables) {
+            if (!d.editing) continue;
+            if (k == GLFW.GLFW_KEY_ESCAPE) { cancelEdit(d); return true; }
+            if (k == GLFW.GLFW_KEY_ENTER || k == GLFW.GLFW_KEY_KP_ENTER) { commitEdit(d); return true; }
+        }
         if (k == GLFW.GLFW_KEY_ESCAPE && dropdowns.escape()) return true;
         if ((k == GLFW.GLFW_KEY_ENTER || k == GLFW.GLFW_KEY_KP_ENTER) && hostBox != null && hostBox.isFocused()) {
             reloadCatalog();
@@ -2728,48 +2796,58 @@ import net.minecraft.network.chat.Component;
 import java.nio.file.Path;
 
 /**
- * Skin library: type any Minecraft player name and the companion wears that skin.
- * The renderer downloads/caches it through the vanilla SkinManager, so it also works with
- * skins from NameMC-style player names.
+ * Skin library in the grey panel style: type any Minecraft player name and the companion wears that skin
+ * (downloaded and cached through the vanilla SkinManager). "owner" copies your own skin.
  *
- * <p>Body type and the feminine model live only in {@link CompanionSettingsScreen}; this screen used to
- * duplicate them, which produced two places to edit the same value.</p>
+ * <p>Body type and the feminine model live only in {@link CompanionSettingsScreen}.</p>
+ * <p>Back / Apply return to {@code parent}; with no parent (opened from the radial wheel) they close the screen.</p>
  */
 public final class CompanionSkinScreen extends Screen {
+    private static final int PANEL_W = 300, PAD = 12, HEAD_H = 44;
+
     private final VoiceConfig config;
     private final Path configFile;
+    private final Screen parent;
     private EditBox nameField;
+    private int px, py, panelW, panelH, ix, iw;
 
-    public CompanionSkinScreen(VoiceConfig config, Path configFile) {
-        super(Component.literal("Companion Skin Library"));
+    public CompanionSkinScreen(VoiceConfig config, Path configFile) { this(config, configFile, null); }
+
+    public CompanionSkinScreen(VoiceConfig config, Path configFile, Screen parent) {
+        super(Component.literal("Appearance & Skins"));
         this.config = config;
         this.configFile = configFile;
+        this.parent = parent;
     }
 
     @Override
     protected void init() {
-        int cx = this.width / 2;
-        int y = this.height / 2 - 60;
+        panelW = Math.min(PANEL_W, this.width - 8);
+        panelH = HEAD_H + 26 + 24 + 30 + 20 + 12;
+        px = (this.width - panelW) / 2;
+        py = Math.max(4, (this.height - panelH) / 2);
+        ix = px + PAD;
+        iw = panelW - 2 * PAD;
 
-        this.nameField = new EditBox(this.font, cx - 110, y, 220, 20, Component.literal("Player name"));
-        this.nameField.setValue(config.companionSkin == null ? "" : config.companionSkin);
-        this.nameField.setHint(Component.literal("Minecraft player name (e.g. Notch)"));
-        this.addRenderableWidget(this.nameField);
-        y += 30;
-
-        this.addRenderableWidget(Button.builder(Component.literal("Use my skin"), b -> {
-            // "owner" resolves synchronously from the local player (and picks up Quick Skin local skins
-            // plus the real slim/classic model); a raw name resolves asynchronously via Mojang and
-            // falls back to Steve meanwhile, which is exactly what made slim detection unreliable.
-            nameField.setValue("owner");
-        }).pos(cx - 110, y).size(105, 20).build());
-
-        this.addRenderableWidget(Button.builder(Component.literal("Apply"), b -> apply()).pos(cx + 5, y).size(105, 20).build());
+        int y = py + HEAD_H;
+        nameField = new EditBox(this.font, ix, y, iw, 20, Component.literal("Player name"));
+        nameField.setMaxLength(64);
+        nameField.setValue(config.companionSkin == null ? "" : config.companionSkin);
+        nameField.setHint(Component.literal("Minecraft player name (e.g. Notch)"));
+        this.addRenderableWidget(nameField);
         y += 26;
 
-        this.addRenderableWidget(Button.builder(Component.literal("Back"), b -> {
-            if (this.minecraft != null) this.minecraft.setScreen(new CompanionRadialScreen());
-        }).pos(cx - 110, y).size(220, 20).build());
+        int colW = (iw - 4) / 2;
+        // "owner" resolves synchronously from the local player (and picks up Quick Skin local skins plus the real
+        // slim/classic model); a raw name resolves asynchronously via Mojang and shows Steve until it arrives.
+        this.addRenderableWidget(Button.builder(Component.literal("Use My Skin"), b -> nameField.setValue("owner"))
+                .pos(ix, y).size(colW, 20).build());
+        this.addRenderableWidget(Button.builder(Component.literal("Apply"), b -> apply())
+                .pos(ix + colW + 4, y).size(colW, 20).build());
+        y += 24 + 30;                                     // room for the two tip lines
+
+        this.addRenderableWidget(Button.builder(Component.literal("Back"), b -> back())
+                .pos(ix, y).size(iw, 20).build());
     }
 
     private void apply() {
@@ -2777,17 +2855,40 @@ public final class CompanionSkinScreen extends Screen {
         config.companionSkin = name;
         config.save(configFile);
         if (!name.isBlank()) ClientVoice.send("set_skin", "", name);
-        if (this.minecraft != null) this.minecraft.setScreen(null);
+        back();
+    }
+
+    private void back() {
+        if (this.minecraft != null) this.minecraft.setScreen(parent);   // null parent = close
+    }
+
+    @Override
+    public void onClose() { back(); }
+
+    @Override
+    public boolean isPauseScreen() { return false; }
+
+    @Override
+    public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        super.extractBackground(g, mouseX, mouseY, partialTick);
+        CompanionUi.panel(g, px, py, px + panelW, py + panelH);
     }
 
     @Override
     public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
-        this.extractMenuBackground(g);
         super.extractRenderState(g, mouseX, mouseY, partialTick);
         int cx = this.width / 2;
-        g.centeredText(this.font, "Companion Skin Library", cx, 30, 0xFFFFFFFF);
-        g.centeredText(this.font, "The companion downloads the skin once and caches it.", cx, 44, 0xFF9AA6B2);
-        g.centeredText(this.font, "Tip: type \"owner\" to copy your own skin automatically.", cx, 56, 0xFF9AA6B2);
+        String cur = config.companionSkin == null || config.companionSkin.isBlank() ? "default" : config.companionSkin;
+        centered(g, "Appearance & Skins", cx, py + 8, CompanionUi.TEXT_DARK);
+        centered(g, "Current skin: " + this.font.plainSubstrByWidth(cur, iw - 90), cx, py + 20, CompanionUi.TEXT_MUTED);
+        g.text(this.font, "Skin (Minecraft player name)", ix, py + HEAD_H - 11, CompanionUi.TEXT_DARK, false);
+        int ty = py + HEAD_H + 26 + 24 + 4;
+        g.text(this.font, "Downloaded once, then cached.", ix, ty, CompanionUi.TEXT_MUTED, false);
+        g.text(this.font, "Type \"owner\" to copy your own skin.", ix, ty + 12, CompanionUi.TEXT_MUTED, false);
+    }
+
+    private void centered(GuiGraphicsExtractor g, String s, int cx, int y, int color) {
+        g.text(this.font, s, cx - this.font.width(s) / 2, y, color, false);
     }
 }
 ```

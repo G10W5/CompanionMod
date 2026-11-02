@@ -3,6 +3,7 @@ package com.example.companionmod.client;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.network.chat.Component;
 
 import java.util.ArrayList;
@@ -34,6 +35,10 @@ final class CompanionDropdowns {
         String emptyText = "Nothing found";
         boolean loading;
         int scroll;
+        // optional free-text mode (pencil button): type any value the server list does not contain
+        EditBox editor;
+        Button editButton;
+        boolean editing;
 
         Dropdown(String title, Supplier<String> getter, Consumer<String> setter) {
             this.title = title;

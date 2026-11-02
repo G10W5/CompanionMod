@@ -58,6 +58,7 @@ public class CompanionSettingsScreen extends Screen {
     private CompanionDropdowns dropdowns;
     private Dropdown chatDd, sttDd, ttsDd, voiceDd, micDd, spkDd;
     private EditBox hostBox;
+    private final List<Dropdown> editables = new ArrayList<>();
 
     // server catalog (survives tab switches and resizes)
     private boolean catalogRequested;
@@ -93,6 +94,7 @@ public class CompanionSettingsScreen extends Screen {
         dropdowns = new CompanionDropdowns(this.font, () -> this.height);
         chatDd = sttDd = ttsDd = voiceDd = micDd = spkDd = null;
         hostBox = null;
+        editables.clear();
 
         panelW = Math.min(PANEL_W, this.width - 8);
         panelH = HEAD_H + CONTENT_H + FOOT_H;
@@ -138,7 +140,7 @@ public class CompanionSettingsScreen extends Screen {
         int colW = (iw - 4) / 2, lx = ix, rx = ix + colW + 4, y = cy;
 
         nav(lx, y, colW, "Personalize...", () -> new CompanionProfileScreen(config, configFile, this));
-        nav(rx, y, colW, "Appearance...", () -> new CompanionSkinScreen(config, configFile));
+        nav(rx, y, colW, "Appearance...", () -> new CompanionSkinScreen(config, configFile, this));
         y += ROW;
 
         toggle(lx, y, colW, "Dynamic Goals", config.dynamicGoals, v -> config.dynamicGoals = v);
@@ -169,9 +171,9 @@ public class CompanionSettingsScreen extends Screen {
                 .pos(ix + iw - 20, y).size(20, 20).build());
         y += ROW;
 
-        chatDd = dd(ix, y, iw, "Chat Model", () -> config.chatModel, v -> config.chatModel = v);
+        chatDd = dd(ix, y, iw, "Chat Model", () -> config.chatModel, v -> config.chatModel = v, true);
         y += ROW;
-        sttDd = dd(ix, y, iw, "STT Model", () -> config.sttModel, v -> config.sttModel = v);
+        sttDd = dd(ix, y, iw, "STT Model", () -> config.sttModel, v -> config.sttModel = v, true);
         y += ROW;
         this.addRenderableWidget(new Slider(ix, y, iw, "Temperature", 0f, 1.5f, config.temperature, 2, "",
                 v -> config.temperature = Math.round(v * 100f) / 100f));
@@ -206,9 +208,9 @@ public class CompanionSettingsScreen extends Screen {
         spkDd.options = opts;
         y += ROW;
 
-        ttsDd = dd(ix, y, iw, "Speech Model", () -> config.speechModel, v -> { config.speechModel = v; loadVoices(); });
+        ttsDd = dd(ix, y, iw, "Speech Model", () -> config.speechModel, v -> { config.speechModel = v; loadVoices(); }, true);
         y += ROW;
-        voiceDd = dd(ix, y, iw, "Voice", () -> config.speechVoice, v -> config.speechVoice = v);
+        voiceDd = dd(ix, y, iw, "Voice", () -> config.speechVoice, v -> config.speechVoice = v, true);
         y += ROW;
 
         this.addRenderableWidget(new Slider(ix, y, iw, "Reply Volume", 0, 100, config.speechVolume * 100f, 0, "%",
@@ -218,11 +220,58 @@ public class CompanionSettingsScreen extends Screen {
     // ---- widget helpers -----------------------------------------------------------------------------------------
 
     private Dropdown dd(int x, int y, int w, String title, Supplier<String> get, Consumer<String> set) {
+        return dd(x, y, w, title, get, set, false);
+    }
+
+    /** {@code editable}: adds a pencil button that swaps the dropdown for a text box, so any value can be typed. */
+    private Dropdown dd(int x, int y, int w, String title, Supplier<String> get, Consumer<String> set, boolean editable) {
         Dropdown d = new Dropdown(title, get, set);
+        int hw = editable ? w - 22 : w;
         d.button = this.addRenderableWidget(Button.builder(Component.literal(title), b -> dropdowns.toggle(d))
-                .pos(x, y).size(w, 20).build());
+                .pos(x, y).size(hw, 20).build());
+        if (editable) {
+            EditBox box = new EditBox(this.font, x, y, hw, 20, Component.literal(title));
+            box.setMaxLength(120);
+            box.setHint(Component.literal("Type a name, Enter to confirm"));
+            box.visible = false;
+            d.editor = this.addRenderableWidget(box);
+            d.editButton = this.addRenderableWidget(Button.builder(Component.literal("\u270E"), b -> toggleEdit(d))
+                    .pos(x + w - 20, y).size(20, 20).build());
+            editables.add(d);
+        }
         dropdowns.register(d);
         return d;
+    }
+
+    private void toggleEdit(Dropdown d) {
+        if (d.editing) { commitEdit(d); return; }
+        dropdowns.close();
+        d.editing = true;
+        d.button.visible = false;
+        String cur = d.getter.get();
+        d.editor.setValue(cur == null ? "" : cur);
+        d.editor.visible = true;
+        this.setFocused(d.editor);
+        d.editButton.setMessage(Component.literal("\u2714"));
+    }
+
+    private void commitEdit(Dropdown d) {
+        String v = d.editor.getValue() == null ? "" : d.editor.getValue().trim();
+        endEdit(d);
+        d.setter.accept(v);
+        dropdowns.refresh(d);
+    }
+
+    private void cancelEdit(Dropdown d) {
+        endEdit(d);
+        dropdowns.refresh(d);
+    }
+
+    private void endEdit(Dropdown d) {
+        d.editing = false;
+        d.editor.visible = false;
+        d.button.visible = true;
+        d.editButton.setMessage(Component.literal("\u270E"));
     }
 
     private void nav(int x, int y, int w, String label, Supplier<Screen> target) {
@@ -321,7 +370,7 @@ public class CompanionSettingsScreen extends Screen {
     /** Pushes the freshest lists into whichever dropdowns the current tab has. */
     private void applyOptions() {
         if (dropdowns == null) return;
-        String modelEmpty = modelsFailed ? "Server unreachable" : "No models installed";
+        String modelEmpty = modelsFailed ? "Server unreachable - use the pencil" : "None found - use the pencil";
         if (chatDd != null) { chatDd.options = modelOptions(null); chatDd.loading = modelsLoading; chatDd.emptyText = modelEmpty; }
         if (sttDd != null) { sttDd.options = modelOptions("None (audio model)"); sttDd.loading = modelsLoading; sttDd.emptyText = modelEmpty; }
         if (ttsDd != null) { ttsDd.options = modelOptions("Auto"); ttsDd.loading = modelsLoading; ttsDd.emptyText = modelEmpty; }
@@ -331,8 +380,9 @@ public class CompanionSettingsScreen extends Screen {
             for (String n : voiceNames) v.add(new Option(n, n));
             voiceDd.options = v;
             voiceDd.loading = voicesLoading;
-            if (!voicesLoading) voiceDd.emptyText = "No voices answered - is the speech model installed? (ollama pull "
-                    + ((config.speechModel == null || config.speechModel.isBlank()) ? "phonon" : config.speechModel) + ")";
+            voiceDd.emptyText = "No voices - ollama pull "
+                    + ((config.speechModel == null || config.speechModel.isBlank()) ? "phonon" : config.speechModel)
+                    + " (or use the pencil)";
         }
         dropdowns.refreshAll();
     }
@@ -390,6 +440,11 @@ public class CompanionSettingsScreen extends Screen {
     @Override
     public boolean keyPressed(KeyEvent event) {
         int k = event.key();
+        for (Dropdown d : editables) {
+            if (!d.editing) continue;
+            if (k == GLFW.GLFW_KEY_ESCAPE) { cancelEdit(d); return true; }
+            if (k == GLFW.GLFW_KEY_ENTER || k == GLFW.GLFW_KEY_KP_ENTER) { commitEdit(d); return true; }
+        }
         if (k == GLFW.GLFW_KEY_ESCAPE && dropdowns.escape()) return true;
         if ((k == GLFW.GLFW_KEY_ENTER || k == GLFW.GLFW_KEY_KP_ENTER) && hostBox != null && hostBox.isFocused()) {
             reloadCatalog();
