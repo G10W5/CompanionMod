@@ -1141,10 +1141,16 @@ import net.minecraft.client.model.geom.builders.CubeDeformation;
 import net.minecraft.client.model.geom.builders.CubeListBuilder;
 import net.minecraft.client.model.geom.builders.MeshDefinition;
 import net.minecraft.client.model.geom.builders.PartDefinition;
+import net.minecraft.client.model.player.PlayerModel;
 
 /**
  * Player-shaped model with <b>both</b> arm widths baked in, so classic/slim can be switched per frame
  * without replacing the renderer's model instance.
+ *
+ * <p>The mesh is built from {@link PlayerModel#createMesh} (not {@link HumanoidModel#createMesh}) so the
+ * skin's second layer is complete: hat (head child), jacket (body child), sleeves (arm children) and pants
+ * (leg children) all render with the skin texture. HumanoidModel's mesh only carries the hat - which is why
+ * skins used to show on the head while the body kept the default look.</p>
  *
  * <p>Why not two models and a swap? {@code AgeableMobRenderer.submit()} overwrites
  * {@code this.model = state.isBaby ? babyModel : adultModel} right before {@code LivingEntityRenderer.submit()},
@@ -1152,9 +1158,10 @@ import net.minecraft.client.model.geom.builders.PartDefinition;
  * model instance and hiding the inactive arm pair is immune to that, and it is also correct with 26.1's deferred
  * model submission because {@code setupAnim(state)} runs per submitted entity at draw time.</p>
  *
- * <p>The slim arm boxes and pivots are identical to {@code PlayerModel.createMesh(..., true)}:
- * right arm {@code texOffs(40,16) box(-2,-2,-2, 3,12,4)} at {@code (-5,2,0)}, left arm
- * {@code texOffs(32,48) box(-1,-2,-2, 3,12,4)} at {@code (5,2,0)}.</p>
+ * <p>The slim arm boxes, sleeves and pivots are identical to {@code PlayerModel.createMesh(..., true)}:
+ * right arm {@code texOffs(40,16) box(-2,-2,-2, 3,12,4)} at {@code (-5,2,0)} with a {@code texOffs(40,32)}
+ * 3-wide sleeve, left arm {@code texOffs(32,48) box(-1,-2,-2, 3,12,4)} at {@code (5,2,0)} with a
+ * {@code texOffs(48,48)} sleeve. The overlays extend 0.25, exactly like vanilla.</p>
  */
 public final class CompanionHumanoidModel extends HumanoidModel<CompanionRenderState> {
     private final ModelPart slimRightArm;
@@ -1171,14 +1178,25 @@ public final class CompanionHumanoidModel extends HumanoidModel<CompanionRenderS
     }
 
     private static ModelPart buildRoot() {
-        MeshDefinition mesh = HumanoidModel.createMesh(CubeDeformation.NONE, 0.0f);
+        // Wide base straight from the player model: head+hat, body+jacket, wide arms+sleeves, legs+pants.
+        MeshDefinition mesh = PlayerModel.createMesh(CubeDeformation.NONE, false);
         PartDefinition root = mesh.getRoot();
-        root.addOrReplaceChild("right_arm_slim", CubeListBuilder.create()
+
+        // Slim pair (manually added so one baked mesh holds both widths; the wide pair is hidden per frame).
+        PartDefinition rightSlim = root.addOrReplaceChild("right_arm_slim", CubeListBuilder.create()
                         .texOffs(40, 16).addBox(-2.0f, -2.0f, -2.0f, 3.0f, 12.0f, 4.0f),
                 PartPose.offset(-5.0f, 2.0f, 0.0f));
-        root.addOrReplaceChild("left_arm_slim", CubeListBuilder.create()
+        rightSlim.addOrReplaceChild("right_sleeve_slim", CubeListBuilder.create()
+                .texOffs(40, 32).addBox(-2.0f, -2.0f, -2.0f, 3.0f, 12.0f, 4.0f, new CubeDeformation(0.25f)),
+                PartPose.ZERO);
+
+        PartDefinition leftSlim = root.addOrReplaceChild("left_arm_slim", CubeListBuilder.create()
                         .texOffs(32, 48).addBox(-1.0f, -2.0f, -2.0f, 3.0f, 12.0f, 4.0f),
                 PartPose.offset(5.0f, 2.0f, 0.0f));
+        leftSlim.addOrReplaceChild("left_sleeve_slim", CubeListBuilder.create()
+                .texOffs(48, 48).addBox(-1.0f, -2.0f, -2.0f, 3.0f, 12.0f, 4.0f, new CubeDeformation(0.25f)),
+                PartPose.ZERO);
+
         return root.bake(64, 64);
     }
 
@@ -1996,7 +2014,17 @@ public final class CompanionRadialScreen extends Screen {
             hint = task.isBlank() ? "Choose an order" : task;       // live progress lives here, not in chat
         }
         g.centeredText(this.font, title, cx, cy - 12, fade(0xFFFFFFFF, alpha));
-        g.centeredText(this.font, hint.length() > 16 ? hint.substring(0, 15) + "…" : hint, cx, cy - 1, fade(0xFFA0A0A0, alpha));
+        // Long hints (the live task text "Iron 6/16 - digging" and friends) are scaled down, not cut off.
+        String hintText = hint.length() > 26 ? hint.substring(0, 25) + "…" : hint;
+        if (hintText.length() > 16) {
+            g.pose().pushMatrix();
+            g.pose().translate(cx, cy - 1);
+            g.pose().scale(0.65f, 0.65f);
+            g.centeredText(this.font, hintText, 0, 0, fade(0xFFA0A0A0, alpha));
+            g.pose().popMatrix();
+        } else {
+            g.centeredText(this.font, hintText, cx, cy - 1, fade(0xFFA0A0A0, alpha));
+        }
         String goal = CompanionAutonomy.currentGoal();
         if (!goal.isBlank()) {
             String s = "Goal: " + (goal.length() > 14 ? goal.substring(0, 13) + "…" : goal);
@@ -4554,6 +4582,7 @@ package com.example.companionmod.entity.ai;
 import com.example.companionmod.entity.CompanionEntity;
 import com.example.companionmod.entity.CompanionProtection;
 import com.example.companionmod.entity.task.MineTask;
+import com.mojang.logging.LogUtils;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -4598,6 +4627,7 @@ import java.util.Set;
  * companion re-plans, and after four failed re-plans it pauses and asks to be told to continue.</p>
  */
 public class CompanionSeekBlockGoal extends Goal {
+    private static final org.slf4j.Logger LOG = LogUtils.getLogger();
     private static final double REACH_SQ = 4.5 * 4.5;
     private static final int LEG_LEN = 36, SIDE_LEN = 3, MAX_LEGS = 8;
     private static final int WALK_STAND = 0, WALK_REACH = 1, WALK_FREE = 2;
@@ -4619,6 +4649,10 @@ public class CompanionSeekBlockGoal extends Goal {
     private BlockPos bridgeCell;
     private long softRecoverAt;
     private int walkRetries;
+    private int branchBoxed;         // consecutive fully-blocked branch steps: rotate the leg before ending it
+    private long lastDiagLog;
+    private Vec3 lastHeartbeatPos = new Vec3(0, -10000, 0);   // movement-gated progress heartbeat
+    private boolean selected;        // goal selector has us running (see selected())
 
     public CompanionSeekBlockGoal(CompanionEntity mob) {
         this.mob = mob;
@@ -4636,16 +4670,22 @@ public class CompanionSeekBlockGoal extends Goal {
 
     @Override
     public void start() {
+        selected = true;
         resetTransient();
         lastProgress = mob.level().getGameTime();
+        lastHeartbeatPos = mob.position();
     }
 
     @Override
     public void stop() {
+        selected = false;
         if (mob.level() instanceof ServerLevel level) cancelBreak(level);
         resetTransient();
         mob.getNavigation().stop();
     }
+
+    /** True while this goal is actually selected and ticking - the entity uses it to spot "task assigned but goal dormant" stalls. */
+    public boolean selected() { return selected; }
 
     private void resetTransient() {
         pending.clear();
@@ -4655,7 +4695,8 @@ public class CompanionSeekBlockGoal extends Goal {
         approachTries.clear();
         approachTarget = pillarTarget = jumpCell = bridgeCell = null;
         pillarAir = 0;
-        if (unreachable.size() > 200) unreachable.clear();
+        branchBoxed = 0;
+        unreachable.clear();       // a fresh task retries every block: old "unreachable" marks must not leak into it
     }
 
     // ------------------------------------------------------------------ main loop
@@ -4667,21 +4708,30 @@ public class CompanionSeekBlockGoal extends Goal {
         long now = level.getGameTime();
 
         long idle = now - lastProgress;
+        if (idle > 200 && now - lastDiagLog > 200) {      // diagnostics FIRST: the watchdog branches below return early
+            lastDiagLog = now;
+            LOG.warn("[companionmod] mining stall ({}s idle): phase={} ore={} walk={} mode={} breaking={} pending={} pillar={} ground={} marked={}",
+                    idle / 20, t.phase, oreTarget, walkTo, walkMode, breaking, pending.size(), pillarTarget, mob.onGround(), unreachable.size());
+        }
         if (idle > 160 && idle <= 500 && softRecoverAt != lastProgress) {   // 8 s without progress: drop what we are fixated on, re-decide
             softRecoverAt = lastProgress;
+            LOG.warn("[companionmod] soft recovery after {}s idle, state={}", idle / 20, stateName());
             cancelBreak(level);
             if (approachTarget != null) giveUp(approachTarget);
             pending.clear();
             stepStand = walkTo = null;
             endPillar();
             bridgeCell = null;
+            mob.getNavigation().stop();      // else it keeps steering the old route while we re-decide
             return;
         }
         if (idle > 500) {                                         // 25 s without progress: re-plan, then give up politely
             lastProgress = now;
+            LOG.warn("[companionmod] hard re-plan after {}s idle (stuck={}), state={}", idle / 20, stuck, stateName());
             cancelBreak(level);
             pending.clear();
             stepStand = walkTo = oreTarget = null;
+            mob.getNavigation().stop();
             if (++stuck >= 4) {
                 t.pause();
                 say(level, "I'm stuck (" + stateName() + "). Say 'continue' and I'll try again.", true);
@@ -4690,6 +4740,7 @@ public class CompanionSeekBlockGoal extends Goal {
             t.dirData = Direction.from2DDataValue(t.dirData).getClockWise().get2DDataValue();
             return;
         }
+        if (now % 600 == 0) unreachable.clear();       // "unreachable" marks are retried every 30 s: never a permanent blacklist
         // Underground it gets dark: drop a torch from the bag every so often so the tunnels stay lit.
         if (t.phase != MineTask.Phase.SEARCH && --torchCooldown <= 0) {
             torchCooldown = 60;
@@ -4760,6 +4811,7 @@ public class CompanionSeekBlockGoal extends Goal {
                     t.leg = 0;
                     t.legLen = 0;
                     say(level, "This depth looks right. Branch mining.", true);
+                } else if (walkDownSlope(level)) {                       // cave slope / pit edge: just walk down it
                 } else if (!planStep(level, t, Direction.from2DDataValue(t.dirData), -1, true)) {
                     t.dirData = Direction.from2DDataValue(t.dirData).getClockWise().get2DDataValue();
                     if (++stuck >= 4) { t.pause(); say(level, "I can't dig down safely here. Move me and say 'continue'.", true); }
@@ -4784,15 +4836,36 @@ public class CompanionSeekBlockGoal extends Goal {
             t.dirData = d.getClockWise().get2DDataValue();
             return;
         }
-        if (planStep(level, t, d, 0, false)) { t.legLen++; return; }
+        if (planStep(level, t, d, 0, false)) { t.legLen++; branchBoxed = 0; return; }
         // Blocked ahead (lava pocket, bedrock bump): mine at a slight angle or step over it before ending the leg.
         // Without this one blocked cell ended the leg instantly, all 8 legs burned in seconds and the task paused.
         if (planStep(level, t, d.getClockWise(), 0, false)
                 || planStep(level, t, d.getCounterClockWise(), 0, false)
                 || planStep(level, t, d, -1, false) || planStep(level, t, d, 1, false)) {
             t.legLen++;
+            branchBoxed = 0;
             return;
         }
+        // Open space ahead (a cavern crossing the leg line): the tunnel logic refuses holes in the floor, so
+        // continue the leg ON the cave floor like a walker instead of burning the leg and pausing the task.
+        BlockPos ahead = mob.blockPosition().relative(d, 8);
+        Path p = mob.getNavigation().createPath(ahead, 2);
+        if (p != null && p.canReach()) {
+            walkTo = ahead;
+            walkMode = WALK_FREE;
+            walkTicks = 0;
+            mob.getNavigation().moveTo(p, 1.0);
+            t.legLen += 4;                          // credit progress: the leg keeps going, it does not exhaust
+            branchBoxed = 0;
+            return;
+        }
+        // Boxed in (lava pocket, bedrock wall): rotate the leg and mine at an angle to escape the pocket
+        // instead of ending the leg - two rotations (90 then 180) before the leg really ends.
+        if (branchBoxed++ < 2) {
+            t.dirData = d.getClockWise().get2DDataValue();
+            return;
+        }
+        branchBoxed = 0;
         t.legLen = len;                                                 // truly boxed in: end this leg early
     }
 
@@ -4837,17 +4910,18 @@ public class CompanionSeekBlockGoal extends Goal {
         boolean climbing = target.getY() - me.getY() >= 2
                 && Math.max(Math.abs(target.getX() - me.getX()), Math.abs(target.getZ() - me.getZ())) <= 3;
         if (!climbing && cleanupScaffold(level)) return;
-        if (t.phase == MineTask.Phase.SEARCH) {                          // above ground: walk if a path exists
-            Path p = mob.getNavigation().createPath(target, 1);
-            if (p != null && p.canReach()) {
-                walkTo = target;
-                walkMode = WALK_REACH;
-                walkTicks = 0;
-                mob.getNavigation().moveTo(p, 1.1);
-                return;
-            }
-            if (tryScaffold(level, t, target)) return;                   // high in a tree: build up to it
+        // Walk there whenever a path exists - surface, open caves and finished tunnels are crossed like a player
+        // crosses them. Only solid rock (no path through) is tunnelled; this is what froze it in caves before,
+        // where every tunnel step was "unsafe" (open space below) and the task paused itself.
+        Path p = mob.getNavigation().createPath(target, 1);
+        if (p != null && p.canReach()) {
+            walkTo = target;
+            walkMode = WALK_REACH;
+            walkTicks = 0;
+            mob.getNavigation().moveTo(p, 1.1);
+            return;
         }
+        if (tryScaffold(level, t, target)) return;                   // high in a tree / on a cave ceiling: build up to it
         tunnelToward(level, t, target);
     }
 
@@ -5025,6 +5099,19 @@ public class CompanionSeekBlockGoal extends Goal {
         return true;
     }
 
+    /** True when a walkable way down exists (cave slope, natural staircase, pit edge) - navigation walks it, no digging. */
+    private boolean walkDownSlope(ServerLevel level) {
+        BlockPos down = mob.blockPosition().below(6);
+        Path p = mob.getNavigation().createPath(down, 2);
+        if (p == null || !p.canReach()) return false;
+        walkTo = p.getTarget();
+        walkMode = WALK_FREE;
+        walkTicks = 0;
+        mob.getNavigation().moveTo(p, 1.0);
+        lastProgress = level.getGameTime();
+        return true;
+    }
+
     private void tunnelToward(ServerLevel level, MineTask t, BlockPos target) {
         BlockPos me = mob.blockPosition();
         int dx = target.getX() - me.getX(), dy = target.getY() - me.getY(), dz = target.getZ() - me.getZ();
@@ -5156,29 +5243,45 @@ public class CompanionSeekBlockGoal extends Goal {
     private void walk(ServerLevel level, long now) {
         walkTicks++;
         if (walkTicks == 1) walkRetries = 0;
+        // Progress heartbeat, but only for REAL movement: a mob pushing a wall in place (jam) must not keep
+        // refreshing the idle timers, or the watchdogs can never fire and a step-loop stalls silently forever.
+        if (walkTicks % 40 == 0 && mob.position().distanceToSqr(lastHeartbeatPos) > 0.25) {
+            lastProgress = now;
+            stuck = 0;
+            lastHeartbeatPos = mob.position();
+        }
         BlockPos w = walkTo;
         boolean arrived = switch (walkMode) {
             case WALK_REACH -> inReach(Vec3.atCenterOf(w));     // line of sight is handled by approach(): it digs the blocker out
             case WALK_FREE -> mob.distanceToSqr(Vec3.atCenterOf(w)) < 4.0;
+            // Must be standing IN the cell: the old 1.2 vertical tolerance let a mob pushing the wall BELOW a
+            // 1-block step-up count as "arrived" (dy=1.0) without ever mounting it -> infinite plan-walk loop.
             default -> Math.abs(mob.getX() - (w.getX() + 0.5)) < 0.7 && Math.abs(mob.getZ() - (w.getZ() + 0.5)) < 0.7
-                    && Math.abs(mob.getY() - w.getY()) < 1.2;
+                    && Math.abs(mob.getY() - w.getY()) < 0.5;
         };
         if (arrived) { walkTo = null; lastProgress = now; mob.getNavigation().stop(); return; }
         PathNavigation nav = mob.getNavigation();
         if (walkMode == WALK_STAND) {
-            // A tunnel / stair step is one block: drive the move control directly.
-            // No path request that can fail mid-air, so no more block-by-block teleporting.
-            nav.stop();
-            mob.getMoveControl().setWantedPosition(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
-            mob.getLookControl().setLookAt(w.getX() + 0.5, w.getY() + 1.0, w.getZ() + 0.5);
-            if (w.getY() > mob.blockPosition().getY() && mob.onGround() && walkTicks % 4 == 0) {
-                mob.getJumpControl().jump();   // the move control cannot climb a 1-block step on its own: hop onto it
-            }
-            if (walkTicks > 60) {                                   // really jammed (corner, entity in the way): last resort
-                mob.setPos(w.getX() + 0.5, w.getY(), w.getZ() + 0.5);
-                mob.resetFallDistance();
-                lastProgress = now;
-                walkTo = null;
+            // A tunnel / stair step is one block. Staged fallback, villager-style:
+            // 1) let the vanilla pathfinder walk it (it steps up single blocks by itself) for ~1.2 s;
+            // 2) no path / not arriving (tight tunnel, mid-air request, corner): take over with direct move
+            //    control + jump - the move control alone cannot climb a 1-block step;
+            // 3) truly jammed after ~3 s (entity in the way): teleport, the last resort so a tunnel never deadlocks.
+            if (walkTicks <= 25) {
+                if (walkTicks % 20 == 1) nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
+            } else {
+                nav.stop();
+                mob.getMoveControl().setWantedPosition(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
+                mob.getLookControl().setLookAt(w.getX() + 0.5, w.getY() + 1.0, w.getZ() + 0.5);
+                if (w.getY() > mob.blockPosition().getY() && mob.onGround() && walkTicks % 4 == 0) {
+                    mob.getJumpControl().jump();
+                }
+                if (walkTicks > 60) {
+                    mob.setPos(w.getX() + 0.5, w.getY(), w.getZ() + 0.5);
+                    mob.resetFallDistance();
+                    lastProgress = now;
+                    walkTo = null;
+                }
             }
             return;
         }
@@ -5191,6 +5294,8 @@ public class CompanionSeekBlockGoal extends Goal {
     }
 
     private void failWalk() {
+        LOG.warn("[companionmod] walk failed after {}t: mode={} target={} at={} ground={}",
+                walkTicks, walkMode, walkTo, mob.blockPosition(), mob.onGround());
         if (walkMode == WALK_REACH && approachTarget != null) giveUp(approachTarget);
         walkTo = null;
     }
@@ -5198,7 +5303,8 @@ public class CompanionSeekBlockGoal extends Goal {
     /** Block reach is measured from the eyes (like a player), not from the feet: 1.6 blocks more upward reach. */
     private boolean inReach(Vec3 c) { return mob.getEyePosition().distanceToSqr(c) <= REACH_SQ; }
 
-    private String stateName() {
+    /** What the goal is doing right now ("digging", "walking", ...) - shown in the radial hub next to the task. */
+    public String stateName() {
         return breaking != null ? "digging" : walkTo != null ? "walking" : pillarTarget != null ? "climbing"
                 : !pending.isEmpty() ? "clearing" : "planning";
     }
@@ -5233,9 +5339,11 @@ public class CompanionSeekBlockGoal extends Goal {
     // ------------------------------------------------------------------ sensing
 
     /**
-     * Nearest match a player could actually see. Exposed blocks (air on at least one face) win over buried ones
-     * at almost any range: a seeable ore 15 blocks away beats a buried ore 3 blocks away. Buried blocks only
-     * count when close, and the crown height penalty keeps high-up blocks from stealing the target.
+     * Nearest match a player could actually see. Exposed blocks (air on at least one face) are preferred, but
+     * the bonus is capped at ~12 blocks of distance so a seeable ore far away never hijacks the job from buried
+     * ore right next to the companion (that made it walk off across caves after the first vein was cleared).
+     * Buried blocks only count when close, and the crown height penalty keeps high-up blocks from stealing
+     * the target.
      */
     private BlockPos scan(ServerLevel level, MineTask t) {
         int r = t.phase == MineTask.Phase.SEARCH ? 22 : 10;
@@ -5247,7 +5355,7 @@ public class CompanionSeekBlockGoal extends Goal {
             double d = mob.distanceToSqr(Vec3.atCenterOf(p));
             boolean exp = exposed(level, p);
             if (d > 9.0 && !exp) continue;                              // buried blocks only count when close
-            double score = d + Math.max(0, p.getY() - (o.getY() + 2)) * 6.0 - (exp ? 50.0 : 0);
+            double score = d + Math.max(0, p.getY() - (o.getY() + 2)) * 6.0 - (exp ? Math.min(12.0, d) : 0);
             if (score >= bestD) continue;
             bestD = score;
             best = p.immutable();
@@ -5582,6 +5690,9 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     // "go and find/mine this block" job (server side, saved with the entity)
     private final MineTask mineTask = new MineTask();
+    // Assigned in registerGoals() - NOT a field initializer: registerGoals runs from the Mob constructor,
+    // before this subclass's field initializers, so an initialized field would still be null there (this-escape).
+    private com.example.companionmod.entity.ai.CompanionSeekBlockGoal seekGoal;
     // "pick this up from the ground" order (server side)
     private String pickupFilter = "";
     private boolean pickupRequested;
@@ -5610,6 +5721,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     private int selectedToolSlot = 0;          // which tool slot is held in the main hand
     private int targetSinceTick;               // when the current automatic target was acquired
     private long lastOuchTick;                 // hurt chatter throttle
+    private long lastNoToolNudge;              // "give me a tool" throttle
+    private long lastGoalInactiveLog;          // "task assigned but goal dormant" warning throttle
     private String lastPlanJson = "";          // last plan, so "continue" can resume it
 
     public CompanionEntity(EntityType<? extends CompanionEntity> type, Level level) {
@@ -5638,7 +5751,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         goalSelector.addGoal(1, new CompanionSitGoal(this));
         goalSelector.addGoal(1, new OpenDoorGoal(this, true));   // villager-style: open wooden doors on the path, close behind
         goalSelector.addGoal(2, new MeleeAttackGoal(this, 1.25, true));
-        goalSelector.addGoal(2, new CompanionSeekBlockGoal(this));   // explicit "find diamonds" pre-empts walking
+        seekGoal = new com.example.companionmod.entity.ai.CompanionSeekBlockGoal(this);
+        goalSelector.addGoal(2, seekGoal);                           // explicit "find diamonds" pre-empts walking
         goalSelector.addGoal(3, new CompanionPickupGoal(this));      // explicit "pick this up" pre-empts walking
         goalSelector.addGoal(4, new CompanionFarmGoal(this));
         goalSelector.addGoal(4, new CompanionPlantGoal(this));        // time-boxed jobs (farm / fish / build)
@@ -6435,6 +6549,14 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         if (bestSlot < 0) {
             selectedToolSlot = -1;
             refreshEquipment();
+            // Bare-hand mining is ~10x slower: nudge the player to put a tool in the bag (throttled).
+            if (state.getDestroySpeed(level(), blockPosition()) > 1.0f && tickCount - lastNoToolNudge > 6000) {
+                lastNoToolNudge = tickCount;
+                String tool = state.is(net.minecraft.tags.BlockTags.MINEABLE_WITH_PICKAXE) ? "pickaxe"
+                        : state.is(net.minecraft.tags.BlockTags.MINEABLE_WITH_SHOVEL) ? "shovel"
+                        : state.is(net.minecraft.tags.BlockTags.MINEABLE_WITH_AXE) ? "axe" : "tool";
+                speak("Mining bare-handed is slow - give me a " + tool + " in my bag.");
+            }
             return;
         }
         selectTool(bestSlot);
@@ -6706,10 +6828,20 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     private void refreshTaskText() {
         long now = level().getGameTime();
+        // "Task assigned but the seek goal is dormant" is its own stall class (sitting / injured / a locked target).
+        if (mineTask.exists() && !mineTask.paused && !seekGoal.selected() && tickCount - lastGoalInactiveLog > 600) {
+            lastGoalInactiveLog = tickCount;
+            com.mojang.logging.LogUtils.getLogger().warn("[companionmod] mining task active but the seek goal is NOT selected (sitting? injured? target locked? paused?)");
+        }
         String s = "";
         if (mineTask.exists()) {
             String p = prettyBlockId(mineTask.blockId).replace(" ore", "");
-            s = Character.toUpperCase(p.charAt(0)) + p.substring(1) + " " + mineTask.mined + "/" + mineTask.want + (mineTask.paused ? " ||" : "");
+            s = Character.toUpperCase(p.charAt(0)) + p.substring(1) + " " + mineTask.mined + "/" + mineTask.want;
+            if (mineTask.paused) s += " || say 'continue'";
+            else {
+                String st = seekGoal.stateName();
+                if (st != null && !st.isBlank()) s += " - " + st;
+            }
         } else if (plantUntil > now) s = "Planting";
         else if (farmUntil > now) s = "Farming";
         else if (fishUntil > now) s = "Fishing";
