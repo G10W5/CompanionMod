@@ -182,14 +182,24 @@ public final class ClientVoice {
             if (!r.heard().isBlank()) { subtitle = "You: " + r.heard(); subtitleUntil = System.currentTimeMillis() + 4000; }
             // Hard-stop phrases are deterministic. Safety/control must not depend on the LLM's JSON choice.
             CompanionCommand command = isHardStopPhrase(r.heard()) ? CompanionCommand.STOP : gateCommand(r.command(), r.heard());
-            if (command == CompanionCommand.NONE) command = heardOrder(r.heard());   // model talked but forgot the JSON action: plain order words still work
+            String target = r.target();
+            if (command == CompanionCommand.NONE) {
+                // Model talked but forgot the JSON action: plain order words still work. Mining / pickup orders
+                // also carry their material ("find me some coal" -> seek_block coal_ore / pickup filter "coal").
+                command = heardOrder(r.heard());
+                if ((command == CompanionCommand.SEEK_BLOCK || command == CompanionCommand.PICKUP) && target.isBlank()) {
+                    String mat = heardMaterial(r.heard());
+                    if (mat != null) target = mat;
+                    if (command == CompanionCommand.SEEK_BLOCK && mat == null) command = CompanionCommand.NONE;   // no material named: not a mine order
+                }
+            }
             if (!r.memory().isBlank()) CompanionMemory.remember(r.memory());
             if (command == CompanionCommand.REMEMBER)
-                CompanionMemory.remember(r.target().isBlank() ? r.say() : r.target());
+                CompanionMemory.remember(target.isBlank() ? r.say() : target);
             if (command == CompanionCommand.FORGET)
-                CompanionMemory.forget(r.target().isBlank() ? r.say() : r.target());
-            if (command != CompanionCommand.NONE || !r.say().isBlank() || !r.target().isBlank())
-                send(command.name(), r.say(), r.target());
+                CompanionMemory.forget(target.isBlank() ? r.say() : target);
+            if (command != CompanionCommand.NONE || !r.say().isBlank() || !target.isBlank())
+                send(command.name(), r.say(), target == null ? "" : target);
             if (cfg.dynamicGoals && command == CompanionCommand.NONE && !r.heard().isBlank())
                 CompanionAutonomy.onVoiceHeard(r.heard());
         });
@@ -224,6 +234,7 @@ public final class ClientVoice {
         if (words(s, "patrol")) return CompanionCommand.PATROL;
         if (words(s, "wander", "roam")) return CompanionCommand.WANDER;
         if (words(s, "pick up", "pickup", "grab", "collect")) return CompanionCommand.PICKUP;
+        if (words(s, "find", "mine", "dig", "get", "gather", "seek", "chop", "search", "look for")) return CompanionCommand.SEEK_BLOCK;
         if (words(s, "drop")) return CompanionCommand.DROP;
         if (words(s, "inventory", "bag")) return CompanionCommand.INVENTORY;
         if (words(s, "heal", "bandage")) return CompanionCommand.HEAL;
@@ -237,6 +248,21 @@ public final class ClientVoice {
                     .matcher(text).find()) return true;
         }
         return false;
+    }
+
+    /**
+     * First block / material word in what the player said, as a block id or family id
+     * ("find me some coal" -> "coal_ore", "get wood" -> "wood", "some diamonds" -> "diamond_ore").
+     * Null when nothing in the sentence names a block: a bare "find something" must not become a blind mine order.
+     */
+    private static String heardMaterial(String heard) {
+        if (heard == null || heard.isBlank()) return null;
+        for (String tok : heard.toLowerCase(java.util.Locale.ROOT).replaceAll("[^a-z0-9 ]+", " ").split(" ")) {
+            if (tok.isBlank()) continue;
+            String id = CompanionEntity.normalizeBlockId(tok);   // fillers/unknown words come back blank
+            if (!id.isBlank()) return id;
+        }
+        return null;
     }
 
     /**

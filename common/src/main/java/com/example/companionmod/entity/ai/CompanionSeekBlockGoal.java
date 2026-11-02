@@ -607,11 +607,14 @@ public class CompanionSeekBlockGoal extends Goal {
         if (arrived) { walkTo = null; lastProgress = now; mob.getNavigation().stop(); return; }
         PathNavigation nav = mob.getNavigation();
         if (walkMode == WALK_STAND) {
-            // A tunnel / stair step is one block: drive the move control directly (it jumps up a block by itself).
+            // A tunnel / stair step is one block: drive the move control directly.
             // No path request that can fail mid-air, so no more block-by-block teleporting.
             nav.stop();
             mob.getMoveControl().setWantedPosition(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
             mob.getLookControl().setLookAt(w.getX() + 0.5, w.getY() + 1.0, w.getZ() + 0.5);
+            if (w.getY() > mob.blockPosition().getY() && mob.onGround() && walkTicks % 4 == 0) {
+                mob.getJumpControl().jump();   // the move control cannot climb a 1-block step on its own: hop onto it
+            }
             if (walkTicks > 60) {                                   // really jammed (corner, entity in the way): last resort
                 mob.setPos(w.getX() + 0.5, w.getY(), w.getZ() + 0.5);
                 mob.resetFallDistance();
