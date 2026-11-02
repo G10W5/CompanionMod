@@ -165,6 +165,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     private int targetSinceTick;               // when the current automatic target was acquired
     private long lastOuchTick;                 // hurt chatter throttle
     private long lastNoToolNudge;              // "give me a tool" throttle
+    private long lastGoalInactiveLog;          // "task assigned but goal dormant" warning throttle
     private String lastPlanJson = "";          // last plan, so "continue" can resume it
 
     public CompanionEntity(EntityType<? extends CompanionEntity> type, Level level) {
@@ -1270,6 +1271,11 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     private void refreshTaskText() {
         long now = level().getGameTime();
+        // "Task assigned but the seek goal is dormant" is its own stall class (sitting / injured / a locked target).
+        if (mineTask.exists() && !mineTask.paused && !seekGoal.selected() && tickCount - lastGoalInactiveLog > 600) {
+            lastGoalInactiveLog = tickCount;
+            com.mojang.logging.LogUtils.getLogger().warn("[companionmod] mining task active but the seek goal is NOT selected (sitting? injured? target locked? paused?)");
+        }
         String s = "";
         if (mineTask.exists()) {
             String p = prettyBlockId(mineTask.blockId).replace(" ore", "");

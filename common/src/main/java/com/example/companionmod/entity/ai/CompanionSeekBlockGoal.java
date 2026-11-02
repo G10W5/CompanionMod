@@ -72,6 +72,8 @@ public class CompanionSeekBlockGoal extends Goal {
     private int walkRetries;
     private int branchBoxed;         // consecutive fully-blocked branch steps: rotate the leg before ending it
     private long lastDiagLog;
+    private Vec3 lastHeartbeatPos = new Vec3(0, -10000, 0);   // movement-gated progress heartbeat
+    private boolean selected;        // goal selector has us running (see selected())
 
     public CompanionSeekBlockGoal(CompanionEntity mob) {
         this.mob = mob;
@@ -89,16 +91,22 @@ public class CompanionSeekBlockGoal extends Goal {
 
     @Override
     public void start() {
+        selected = true;
         resetTransient();
         lastProgress = mob.level().getGameTime();
+        lastHeartbeatPos = mob.position();
     }
 
     @Override
     public void stop() {
+        selected = false;
         if (mob.level() instanceof ServerLevel level) cancelBreak(level);
         resetTransient();
         mob.getNavigation().stop();
     }
+
+    /** True while this goal is actually selected and ticking - the entity uses it to spot "task assigned but goal dormant" stalls. */
+    public boolean selected() { return selected; }
 
     private void resetTransient() {
         pending.clear();
@@ -121,8 +129,14 @@ public class CompanionSeekBlockGoal extends Goal {
         long now = level.getGameTime();
 
         long idle = now - lastProgress;
+        if (idle > 200 && now - lastDiagLog > 200) {      // diagnostics FIRST: the watchdog branches below return early
+            lastDiagLog = now;
+            LOG.warn("[companionmod] mining stall ({}s idle): phase={} ore={} walk={} mode={} breaking={} pending={} pillar={} ground={} marked={}",
+                    idle / 20, t.phase, oreTarget, walkTo, walkMode, breaking, pending.size(), pillarTarget, mob.onGround(), unreachable.size());
+        }
         if (idle > 160 && idle <= 500 && softRecoverAt != lastProgress) {   // 8 s without progress: drop what we are fixated on, re-decide
             softRecoverAt = lastProgress;
+            LOG.warn("[companionmod] soft recovery after {}s idle, state={}", idle / 20, stateName());
             cancelBreak(level);
             if (approachTarget != null) giveUp(approachTarget);
             pending.clear();
@@ -134,6 +148,7 @@ public class CompanionSeekBlockGoal extends Goal {
         }
         if (idle > 500) {                                         // 25 s without progress: re-plan, then give up politely
             lastProgress = now;
+            LOG.warn("[companionmod] hard re-plan after {}s idle (stuck={}), state={}", idle / 20, stuck, stateName());
             cancelBreak(level);
             pending.clear();
             stepStand = walkTo = oreTarget = null;
@@ -147,11 +162,6 @@ public class CompanionSeekBlockGoal extends Goal {
             return;
         }
         if (now % 600 == 0) unreachable.clear();       // "unreachable" marks are retried every 30 s: never a permanent blacklist
-        if (idle > 200 && now - lastDiagLog > 200) {
-            lastDiagLog = now;
-            LOG.warn("[companionmod] mining stall ({}t idle): phase={} ore={} walk={} mode={} breaking={} pending={} pillar={} ground={} marked={}",
-                    idle, t.phase, oreTarget, walkTo, walkMode, breaking, pending.size(), pillarTarget, mob.onGround(), unreachable.size());
-        }
         // Underground it gets dark: drop a torch from the bag every so often so the tunnels stay lit.
         if (t.phase != MineTask.Phase.SEARCH && --torchCooldown <= 0) {
             torchCooldown = 60;
@@ -654,13 +664,21 @@ public class CompanionSeekBlockGoal extends Goal {
     private void walk(ServerLevel level, long now) {
         walkTicks++;
         if (walkTicks == 1) walkRetries = 0;
-        if (walkTicks % 40 == 0) { lastProgress = now; stuck = 0; }   // covering ground IS progress: the watchdogs must not fire mid-route (long walks used to be reset every 8 s -> back-and-forth forever)
+        // Progress heartbeat, but only for REAL movement: a mob pushing a wall in place (jam) must not keep
+        // refreshing the idle timers, or the watchdogs can never fire and a step-loop stalls silently forever.
+        if (walkTicks % 40 == 0 && mob.position().distanceToSqr(lastHeartbeatPos) > 0.25) {
+            lastProgress = now;
+            stuck = 0;
+            lastHeartbeatPos = mob.position();
+        }
         BlockPos w = walkTo;
         boolean arrived = switch (walkMode) {
             case WALK_REACH -> inReach(Vec3.atCenterOf(w));     // line of sight is handled by approach(): it digs the blocker out
             case WALK_FREE -> mob.distanceToSqr(Vec3.atCenterOf(w)) < 4.0;
+            // Must be standing IN the cell: the old 1.2 vertical tolerance let a mob pushing the wall BELOW a
+            // 1-block step-up count as "arrived" (dy=1.0) without ever mounting it -> infinite plan-walk loop.
             default -> Math.abs(mob.getX() - (w.getX() + 0.5)) < 0.7 && Math.abs(mob.getZ() - (w.getZ() + 0.5)) < 0.7
-                    && Math.abs(mob.getY() - w.getY()) < 1.2;
+                    && Math.abs(mob.getY() - w.getY()) < 0.5;
         };
         if (arrived) { walkTo = null; lastProgress = now; mob.getNavigation().stop(); return; }
         PathNavigation nav = mob.getNavigation();
@@ -697,6 +715,8 @@ public class CompanionSeekBlockGoal extends Goal {
     }
 
     private void failWalk() {
+        LOG.warn("[companionmod] walk failed after {}t: mode={} target={} at={} ground={}",
+                walkTicks, walkMode, walkTo, mob.blockPosition(), mob.onGround());
         if (walkMode == WALK_REACH && approachTarget != null) giveUp(approachTarget);
         walkTo = null;
     }
