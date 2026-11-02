@@ -209,6 +209,7 @@ public class CompanionSeekBlockGoal extends Goal {
                     t.leg = 0;
                     t.legLen = 0;
                     say(level, "This depth looks right. Branch mining.", true);
+                } else if (walkDownSlope(level)) {                       // cave slope / pit edge: just walk down it
                 } else if (!planStep(level, t, Direction.from2DDataValue(t.dirData), -1, true)) {
                     t.dirData = Direction.from2DDataValue(t.dirData).getClockWise().get2DDataValue();
                     if (++stuck >= 4) { t.pause(); say(level, "I can't dig down safely here. Move me and say 'continue'.", true); }
@@ -240,6 +241,18 @@ public class CompanionSeekBlockGoal extends Goal {
                 || planStep(level, t, d.getCounterClockWise(), 0, false)
                 || planStep(level, t, d, -1, false) || planStep(level, t, d, 1, false)) {
             t.legLen++;
+            return;
+        }
+        // Open space ahead (a cavern crossing the leg line): the tunnel logic refuses holes in the floor, so
+        // continue the leg ON the cave floor like a walker instead of burning the leg and pausing the task.
+        BlockPos ahead = mob.blockPosition().relative(d, 8);
+        Path p = mob.getNavigation().createPath(ahead, 2);
+        if (p != null && p.canReach()) {
+            walkTo = ahead;
+            walkMode = WALK_FREE;
+            walkTicks = 0;
+            mob.getNavigation().moveTo(p, 1.0);
+            t.legLen += 4;                          // credit progress: the leg keeps going, it does not exhaust
             return;
         }
         t.legLen = len;                                                 // truly boxed in: end this leg early
@@ -286,17 +299,18 @@ public class CompanionSeekBlockGoal extends Goal {
         boolean climbing = target.getY() - me.getY() >= 2
                 && Math.max(Math.abs(target.getX() - me.getX()), Math.abs(target.getZ() - me.getZ())) <= 3;
         if (!climbing && cleanupScaffold(level)) return;
-        if (t.phase == MineTask.Phase.SEARCH) {                          // above ground: walk if a path exists
-            Path p = mob.getNavigation().createPath(target, 1);
-            if (p != null && p.canReach()) {
-                walkTo = target;
-                walkMode = WALK_REACH;
-                walkTicks = 0;
-                mob.getNavigation().moveTo(p, 1.1);
-                return;
-            }
-            if (tryScaffold(level, t, target)) return;                   // high in a tree: build up to it
+        // Walk there whenever a path exists - surface, open caves and finished tunnels are crossed like a player
+        // crosses them. Only solid rock (no path through) is tunnelled; this is what froze it in caves before,
+        // where every tunnel step was "unsafe" (open space below) and the task paused itself.
+        Path p = mob.getNavigation().createPath(target, 1);
+        if (p != null && p.canReach()) {
+            walkTo = target;
+            walkMode = WALK_REACH;
+            walkTicks = 0;
+            mob.getNavigation().moveTo(p, 1.1);
+            return;
         }
+        if (tryScaffold(level, t, target)) return;                   // high in a tree / on a cave ceiling: build up to it
         tunnelToward(level, t, target);
     }
 
@@ -471,6 +485,19 @@ public class CompanionSeekBlockGoal extends Goal {
         cleanupWait = 0;
         startBreak(level, top);
         if (breaking == null) scaffold.pollLast();                        // refused (protected / unbreakable): forget it
+        return true;
+    }
+
+    /** True when a walkable way down exists (cave slope, natural staircase, pit edge) - navigation walks it, no digging. */
+    private boolean walkDownSlope(ServerLevel level) {
+        BlockPos down = mob.blockPosition().below(6);
+        Path p = mob.getNavigation().createPath(down, 2);
+        if (p == null || !p.canReach()) return false;
+        walkTo = p.getTarget();
+        walkMode = WALK_FREE;
+        walkTicks = 0;
+        mob.getNavigation().moveTo(p, 1.0);
+        lastProgress = level.getGameTime();
         return true;
     }
 
