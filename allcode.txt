@@ -1,0 +1,319 @@
+# Why the companion loses the trees
+
+The cause is in `decide()`, and it explains the exact symptom you describe:
+
+```java
+if (--scanCooldown <= 0) { scanCooldown = 12; oreTarget = scan(...); }
+...
+case SEARCH -> wanderSearch(...)
+```
+
+`scanCooldown` only counts down when `decide()` runs, and `decide()` doesn't run while the companion is breaking or walking. This is what happens:
+
+1. It scans, finds tree #1 and chops it. `scanCooldown` is still around 11.
+2. The tree is gone, so `oreTarget` becomes null. `decide()` skips the scan because the cooldown is still positive, and falls straight into `wanderSearch()`. The companion walks 18 blocks away from trees it could have seen.
+3. Each wander walk ends, `decide()` runs again, the cooldown is still not at 0, and it wanders again. A real rescan only happens about once per 12 wanders, and `wanderTries > 10` pauses the task before that.
+
+There are secondary problems too:
+
+- `scan()` calls `BuiltInRegistries.BLOCK.getKey()` and does string compares on about 40k blocks per scan.
+- `scan()` can force-load chunks at the edge of the loaded area.
+- Wandering is random, with no memory, and it only looks 22 blocks around.
+- Tall floating trunk logs make it try to tunnel *upward* through dirt.
+
+The fixes below make scanning time-based and event-driven, so a scan always runs right after a break or an arrival. They also add a long-range "sight" scan that spots trees through the heightmap, and smarter exploration with a memory of visited spots.
+
+`MineTask` and `CompanionEntity` need no changes.
+
+---
+
+## 1. Fields and constants
+
+Remove `scanCooldown` from the field list and from `resetTransient()`, and add:
+
+```java
+private static final int WALK_EXPLORE = 3;
+private static final int MAX_EXPLORE_LEGS = 30, SIGHT_RADIUS = 56, SIGHT_MIN = 16;
+
+private long nextScanAt, nextSightAt, nextExploreAt, lastUnreachableClear;
+private final Deque<BlockPos> explored = new ArrayDeque<>();   // where we already looked (explore memory)
+
+// cache: does Block X match the current task? (replaces a registry lookup + string compare per scanned block)
+private static final Map<Block, Boolean> MATCH_CACHE = new HashMap<>();
+private static String matchCacheId = "";
+```
+
+In `resetTransient()`:
+
+```java
+breakProgress = walkTicks = stuck = wanderTries = 0;
+nextScanAt = nextSightAt = nextExploreAt = 0;
+explored.clear();
+```
+
+## 2. `tick()`: small tweaks
+
+Replace the `now % 600` line. It only fired if the goal happened to tick on exactly that game tick:
+
+```java
+if (now - lastUnreachableClear >= 600) { lastUnreachableClear = now; unreachable.clear(); }
+```
+
+In the soft-recovery branch, add `nextScanAt = 0;`.
+
+## 3. `decide()`: the actual bug fix
+
+Replace the scan section (everything from `if (--scanCooldown <= 0)` down to the `switch`):
+
+```java
+        long now = level.getGameTime();
+        if (oreTarget != null && !matches(t, level.getBlockState(oreTarget))) { oreTarget = null; nextScanAt = 0; }
+        if (oreTarget == null && now >= nextScanAt) {        // time based, and reset after every break/arrival
+            nextScanAt = now + 10;
+            oreTarget = scan(level, t);
+            if (oreTarget != null) wanderTries = 0;
+        }
+        if (oreTarget != null) { approach(level, t, oreTarget); return; }
+
+        if (cleanupScaffold(level)) return;
+
+        int y = mob.blockPosition().getY();
+        switch (t.phase) {
+            case SEARCH -> {
+                if (t.deep() && y > t.ty) {
+                    t.phase = MineTask.Phase.DESCEND;
+                    say(level, "Nothing on the surface. Heading down to y=" + t.ty + ".", true);
+                } else if (t.deep()) {
+                    t.phase = MineTask.Phase.BRANCH;
+                } else searchSurface(level, t);
+            }
+            // DESCEND and BRANCH unchanged
+```
+
+## 4. Smarter surface search
+
+Replace `wanderSearch` with these methods:
+
+```java
+    /** Surface search: first look far with the heightmap (trees show up as log columns), else explore somewhere new. */
+    private void searchSurface(ServerLevel level, MineTask t) {
+        long now = level.getGameTime();
+        if (now >= nextSightAt) {
+            nextSightAt = now + 40;
+            BlockPos seen = farSight(level, t);
+            if (seen != null) {
+                BlockPos me = mob.blockPosition();
+                BlockPos foot = groundBelow(level, t, seen).above();
+                double dx = foot.getX() - me.getX(), dz = foot.getZ() - me.getZ();
+                double hd = Math.sqrt(dx * dx + dz * dz);
+                BlockPos wp = foot;
+                if (hd > 24) {   // the pathfinder is limited by follow range: go in hops, the near scan takes over on arrival
+                    int wx = me.getX() + (int) (dx / hd * 24), wz = me.getZ() + (int) (dz / hd * 24);
+                    if (level.hasChunk(wx >> 4, wz >> 4)) {
+                        wp = new BlockPos(wx, level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, wx, wz), wz);
+                    }
+                }
+                Path p = mob.getNavigation().createPath(wp, 2);
+                if (p != null && p.canReach()) { startExplore(wp, p); return; }
+                unreachable.add(seen.immutable());   // cannot walk there (water, cliff): look at the next candidate next time
+            }
+        }
+        exploreSomewhereNew(level, t);
+    }
+
+    /** Nearest matching block at the top of a loaded column (trees are the highest non-leaf block of their column). */
+    private BlockPos farSight(ServerLevel level, MineTask t) {
+        BlockPos o = mob.blockPosition();
+        BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
+        BlockPos best = null;
+        double bestD = Double.MAX_VALUE, minSq = SIGHT_MIN * SIGHT_MIN;
+        for (int x = o.getX() - SIGHT_RADIUS; x <= o.getX() + SIGHT_RADIUS; x++) {
+            for (int z = o.getZ() - SIGHT_RADIUS; z <= o.getZ() + SIGHT_RADIUS; z++) {
+                double d = (double) (x - o.getX()) * (x - o.getX()) + (double) (z - o.getZ()) * (z - o.getZ());
+                if (d < minSq || d >= bestD) continue;
+                if (!level.hasChunk(x >> 4, z >> 4)) continue;          // never force-load chunks // 26.1-CHECK: LevelReader.hasChunk(int,int)
+                int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z) - 1;
+                m.set(x, y, z);
+                if (!matches(t, level.getBlockState(m)) || unreachable.contains(m)) continue;
+                bestD = d;
+                best = m.immutable();
+            }
+        }
+        return best;
+    }
+
+    private void exploreSomewhereNew(ServerLevel level, MineTask t) {
+        long now = level.getGameTime();
+        if (now < nextExploreAt) return;
+        if (wanderTries == 4) unreachable.clear();               // new vantage point: retry old "unreachable" marks
+        if (++wanderTries > MAX_EXPLORE_LEGS) {
+            t.pause();
+            say(level, "I can't find any " + CompanionEntity.prettyBlockId(t.blockId) + " around here.", true);
+            return;
+        }
+        BlockPos me = mob.blockPosition();
+        remember(me);
+
+        record Cand(BlockPos pos, double score) { }
+        List<Cand> cands = new ArrayList<>();
+        for (int i = 0; i < 14; i++) {
+            double ang = mob.getRandom().nextDouble() * Math.PI * 2;
+            double dist = 20 + mob.getRandom().nextDouble() * 16 + Math.min(wanderTries, 10);
+            int x = me.getX() + (int) (Math.cos(ang) * dist), z = me.getZ() + (int) (Math.sin(ang) * dist);
+            if (!level.hasChunk(x >> 4, z >> 4)) continue;
+            BlockPos dest = new BlockPos(x, level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z), z);
+            if (!level.getFluidState(dest).isEmpty() || !level.getFluidState(dest.below()).isEmpty()) continue;   // no lakes / lava
+            double nearest = 48;
+            for (BlockPos e : explored) nearest = Math.min(nearest, Math.sqrt(e.distSqr(dest)));
+            cands.add(new Cand(dest, nearest + mob.getRandom().nextDouble() * 6));   // prefer spots far from everywhere we looked
+        }
+        cands.sort((a, b) -> Double.compare(b.score(), a.score()));
+        for (int i = 0; i < Math.min(4, cands.size()); i++) {
+            Path p = mob.getNavigation().createPath(cands.get(i).pos(), 2);
+            if (p != null && p.canReach()) { startExplore(cands.get(i).pos(), p); return; }
+        }
+        nextExploreAt = now + 20;                                  // nothing reachable this time: pause a second, retry
+    }
+
+    private void startExplore(BlockPos dest, Path p) {
+        remember(dest);
+        walkTo = dest;
+        walkMode = WALK_EXPLORE;
+        walkTicks = 0;
+        mob.getNavigation().moveTo(p, 1.0);
+    }
+
+    private void remember(BlockPos p) {
+        explored.addLast(p.immutable());
+        while (explored.size() > 24) explored.pollFirst();
+    }
+```
+
+## 5. `walk()`: scan while exploring
+
+Change the arrival switch and the arrival handling:
+
+```java
+            case WALK_FREE, WALK_EXPLORE -> mob.distanceToSqr(Vec3.atCenterOf(w)) < 4.0;
+```
+```java
+        if (arrived) { walkTo = null; nextScanAt = 0; lastProgress = now; mob.getNavigation().stop(); return; }
+```
+
+Directly after `PathNavigation nav = mob.getNavigation();`, before the `WALK_STAND` block, add:
+
+```java
+        if (walkMode == WALK_EXPLORE) {
+            // Look around while walking: the moment something matching is in sight, stop exploring and go for it.
+            if (walkTicks % 10 == 0) {
+                BlockPos found = scan(level, mob.mineTask());
+                if (found != null) {
+                    oreTarget = found;
+                    wanderTries = 0;
+                    walkTo = null;
+                    nav.stop();
+                    lastProgress = now;
+                    return;
+                }
+            }
+            if ((walkTicks > 10 && nav.isDone()) || walkTicks > 400) {   // end of path (even a partial one) = this leg is done
+                walkTo = null;
+                nextScanAt = 0;
+            }
+            return;
+        }
+```
+
+In `failWalk()`, add `nextScanAt = 0;`.
+
+## 6. `keepBreaking()`: rescan right after a break
+
+After `breaking = null;` in the completion part:
+
+```java
+        nextScanAt = 0;      // always look for the next block immediately: this is what stops the "wander after the first tree" bug
+```
+
+## 7. Don't tunnel upward to floating logs
+
+At the top of `tunnelToward()`, after `dx, dy, dz` are computed:
+
+```java
+        if (!t.deep() && dy >= 2) {          // surface job, target high above (top of a tall trunk): pillar or skip, never dig stairs into the ground
+            if (!tryScaffold(level, t, target)) giveUp(target);
+            return;
+        }
+```
+
+Also raise `approachTries ... <= 8` to `<= 12` in `approach()`. Big canopies can have several leaf layers in front of a log.
+
+## 8. Faster, safer `scan()` and cached `matches()`
+
+```java
+    private BlockPos scan(ServerLevel level, MineTask t) {
+        int r = t.phase == MineTask.Phase.SEARCH ? 22 : 10;
+        int down = Math.min(r, 12), up = Math.min(r, 8);
+        BlockPos o = mob.blockPosition();
+        BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
+        BlockPos best = null;
+        double bestD = Double.MAX_VALUE;
+        for (int x = o.getX() - r; x <= o.getX() + r; x++) {
+            for (int z = o.getZ() - r; z <= o.getZ() + r; z++) {
+                if (!level.hasChunk(x >> 4, z >> 4)) continue;         // never force-load/generate chunks from a scan
+                for (int y = o.getY() - down; y <= o.getY() + up; y++) {
+                    m.set(x, y, z);
+                    if (!matches(t, level.getBlockState(m)) || unreachable.contains(m)) continue;
+                    double d = mob.distanceToSqr(x + 0.5, y + 0.5, z + 0.5);
+                    boolean exp = exposed(level, m);
+                    if (d > 9.0 && !exp) continue;                      // buried blocks only count when close
+                    double score = d + Math.max(0, y - (o.getY() + 2)) * 6.0 - (exp ? Math.min(12.0, d) : 0);
+                    if (score >= bestD) continue;
+                    bestD = score;
+                    best = m.immutable();
+                }
+            }
+        }
+        return best;
+    }
+```
+
+Replace `matches` with a cached version:
+
+```java
+    private static boolean matches(MineTask t, BlockState state) {
+        if (state.isAir()) return false;
+        if (!t.blockId.equals(matchCacheId)) { MATCH_CACHE.clear(); matchCacheId = t.blockId; }
+        return MATCH_CACHE.computeIfAbsent(state.getBlock(), b -> matchesSlow(t.blockId, b));
+    }
+
+    private static boolean matchesSlow(String bid, Block block) {
+        String path = BuiltInRegistries.BLOCK.getKey(block).getPath();
+        if (path.equals(bid)) return true;
+        if (bid.endsWith("_ore") && path.endsWith(bid)) return true;
+        return switch (bid) {
+            case "log", "wood" -> path.endsWith("_log") || path.endsWith("_wood");
+            case "planks", "plank" -> path.endsWith("_planks");
+            case "leaves" -> path.endsWith("_leaves");
+            case "wool" -> path.endsWith("_wool");
+            default -> false;
+        };
+    }
+```
+
+(The cache is only touched from the server thread, so a plain `HashMap` is fine.)
+
+---
+
+## What changes in behaviour
+
+| Before | After |
+|---|---|
+| Rescan only every 12th `decide()` call, so almost never after a break | Scan is time-based and forced right after every break, arrival or failed walk |
+| Wanders blindly the instant the scan is skipped | Wanders only after a fresh scan found nothing |
+| Random 18-block wander, no memory, 10 tries then pause | Picks the candidate farthest from the places already visited. It avoids water and unloaded chunks, and gets 30 legs |
+| Only sees 22 blocks | Heightmap "sight" scan sees trees up to 56 blocks away and walks to them in 24-block hops |
+| Doesn't look while walking | Rescans every half second while exploring and switches to a target immediately |
+| About 40k registry and string lookups per scan, may load chunks | Cached `Block` to boolean lookup, chunk-loaded check |
+| Tries to dig stairs up toward floating trunk tops | Pillars if it has blocks, otherwise skips that log |
+
+If it still stalls after this, the `mining stall` log lines print `phase / walk / mode / pending`, so paste one and I can see which state it is stuck in.
