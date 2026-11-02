@@ -1125,7 +1125,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         if (raw == null) return "";
         String s = raw.toLowerCase(Locale.ROOT).trim().replace(' ', '_').replace('-', '_');
         s = s.replaceAll("^(some|any|all|a|an|the|me|my|of|_)+", "");
-        if (s.startsWith("minecraft:")) s = s.substring(10);
+        int ns = s.indexOf(':');
+        if (ns >= 0) s = s.substring(ns + 1);                    // any namespace: a bare path resolves in every namespace
         s = BLOCK_ALIASES.getOrDefault(s, s);
         if (isBlock(s)) return s;
         if (s.endsWith("s") && s.length() > 3) {                 // plurals: stones -> stone, logs -> log
@@ -1135,16 +1136,27 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         return FAMILY_IDS.contains(s) ? s : "";
     }
 
+    /** True for any registered block id - vanilla or modded. A bare path ("zanite_ore") is matched in EVERY
+     *  namespace: Identifier.tryParse defaults an unqualified name to minecraft, which would miss aether's. */
     private static boolean isBlock(String id) {
         if (id == null || id.isEmpty()) return false;
-        Identifier loc = Identifier.tryParse(id);
-        return loc != null && BuiltInRegistries.BLOCK.containsKey(loc);
+        if (id.indexOf(':') >= 0) {
+            Identifier loc = Identifier.tryParse(id);
+            return loc != null && BuiltInRegistries.BLOCK.containsKey(loc);
+        }
+        Identifier vanilla = Identifier.tryParse("minecraft:" + id);
+        if (vanilla != null && BuiltInRegistries.BLOCK.containsKey(vanilla)) return true;
+        for (Identifier loc : BuiltInRegistries.BLOCK.keySet()) {
+            if (loc.getPath().equals(id)) return true;
+        }
+        return false;
     }
 
     public static String prettyBlockId(String id) {
         if (id == null || id.isBlank()) return "that block";
         String s = id;
-        if (s.startsWith("minecraft:")) s = s.substring(10);
+        int ns = s.indexOf(':');
+        if (ns >= 0) s = s.substring(ns + 1);
         return switch (s) {
             case "log", "wood" -> "wood";
             case "planks", "plank" -> "planks";

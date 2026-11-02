@@ -91,7 +91,9 @@ import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.item.ItemEntity;
@@ -263,6 +265,7 @@ public final class ClientVoice {
                 command = heardOrder(r.heard());
                 if ((command == CompanionCommand.SEEK_BLOCK || command == CompanionCommand.PICKUP) && target.isBlank()) {
                     String mat = heardMaterial(r.heard());
+                    if (mat == null) mat = heardBlockId(r.heard());   // any registered block id, modded included ("find me zanite ore")
                     if (mat != null) target = mat;
                     if (command == CompanionCommand.SEEK_BLOCK && mat == null) command = CompanionCommand.NONE;   // no material named: not a mine order
                 }
@@ -324,7 +327,7 @@ public final class ClientVoice {
         if (heard == null || heard.isBlank()) return false;
         String s = heard.toLowerCase(java.util.Locale.ROOT);
         if (!(s.contains("surface") || s.contains("daylight"))) return false;
-        return heardMaterial(heard) == null;      // a named material ("dig up iron") stays a mining order
+        return heardMaterial(heard) == null && heardBlockId(heard) == null;   // a named block ("dig up zanite ore") stays a mining order
     }
 
     /** Whole-word match for any of the phrases (padded so "sit" never matches "situation"). */
@@ -349,6 +352,22 @@ public final class ClientVoice {
             if (!id.isBlank()) return id;
         }
         return null;
+    }
+
+    /**
+     * Longest registered block path contained in what the player said - modded ids included ("find me zanite ore"
+     * -> "zanite_ore"). Only runs when the vanilla material vocabulary missed, so the registry scan is rare.
+     */
+    private static String heardBlockId(String heard) {
+        if (heard == null || heard.isBlank()) return null;
+        String s = heard.toLowerCase(java.util.Locale.ROOT).replaceAll("[^a-z0-9]+", "_");
+        String best = null;
+        for (Identifier id : BuiltInRegistries.BLOCK.keySet()) {
+            String p = id.getPath();
+            if (p.length() < 3) continue;
+            if (s.contains(p) && (best == null || p.length() > best.length())) best = p;
+        }
+        return best;
     }
 
     /**
@@ -6959,7 +6978,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         if (raw == null) return "";
         String s = raw.toLowerCase(Locale.ROOT).trim().replace(' ', '_').replace('-', '_');
         s = s.replaceAll("^(some|any|all|a|an|the|me|my|of|_)+", "");
-        if (s.startsWith("minecraft:")) s = s.substring(10);
+        int ns = s.indexOf(':');
+        if (ns >= 0) s = s.substring(ns + 1);                    // any namespace: a bare path resolves in every namespace
         s = BLOCK_ALIASES.getOrDefault(s, s);
         if (isBlock(s)) return s;
         if (s.endsWith("s") && s.length() > 3) {                 // plurals: stones -> stone, logs -> log
@@ -6969,16 +6989,27 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         return FAMILY_IDS.contains(s) ? s : "";
     }
 
+    /** True for any registered block id - vanilla or modded. A bare path ("zanite_ore") is matched in EVERY
+     *  namespace: Identifier.tryParse defaults an unqualified name to minecraft, which would miss aether's. */
     private static boolean isBlock(String id) {
         if (id == null || id.isEmpty()) return false;
-        Identifier loc = Identifier.tryParse(id);
-        return loc != null && BuiltInRegistries.BLOCK.containsKey(loc);
+        if (id.indexOf(':') >= 0) {
+            Identifier loc = Identifier.tryParse(id);
+            return loc != null && BuiltInRegistries.BLOCK.containsKey(loc);
+        }
+        Identifier vanilla = Identifier.tryParse("minecraft:" + id);
+        if (vanilla != null && BuiltInRegistries.BLOCK.containsKey(vanilla)) return true;
+        for (Identifier loc : BuiltInRegistries.BLOCK.keySet()) {
+            if (loc.getPath().equals(id)) return true;
+        }
+        return false;
     }
 
     public static String prettyBlockId(String id) {
         if (id == null || id.isBlank()) return "that block";
         String s = id;
-        if (s.startsWith("minecraft:")) s = s.substring(10);
+        int ns = s.indexOf(':');
+        if (ns >= 0) s = s.substring(ns + 1);
         return switch (s) {
             case "log", "wood" -> "wood";
             case "planks", "plank" -> "planks";
@@ -8659,7 +8690,7 @@ public final class OllamaVoiceBackend {
              + "surface (dig a staircase up to the daylight; target empty), "
              + "inventory (only when the player asks to SEE your bag), "
              + "pickup (walk to a dropped item ON THE GROUND and store it; put the item name in target, e.g. bone, diamond, rotten_flesh - only for items already lying around), "
-             + "seek_block (walk to the named block and mine it; target = a vanilla block id: oak_log or log for wood/trees, stone, cobblestone, dirt, coal_ore, iron_ore, gold_ore, redstone_ore, lapis_ore, emerald_ore, diamond_ore, copper_ore, ancient_debris; 'wood', 'logs' and 'planks' mean the whole family), "
+             + "seek_block (walk to the named block and mine it; target = a block id - vanilla or from ANY mod, with or without namespace: oak_log or log for wood/trees, stone, cobblestone, dirt, coal_ore, iron_ore, zanite_ore, aether:zanite_ore; 'wood', 'logs' and 'planks' mean the whole family), "
              + "drop, heal, patrol, wander, explore, build (target = schematic name, e.g. house; places it block by block from the bag), "
              + "farm (harvest ripe crops nearby and replant), plant (target = sapling name e.g. birch_sapling; plants saplings from your bag on nearby soil), equip (target = tool name, e.g. pickaxe), trade, craft, smelt, brew, enchant, "
              + "fish (fish at nearby water), cook, open, close, dance, jump, sneak, sleep, wake, remember, forget, set_name (rename; new name in target), "
@@ -8670,6 +8701,7 @@ public final class OllamaVoiceBackend {
              + "target rules: "
              + "'attack this creeper'/'kill that sheep' -> attack, target the mob. "
              + "'find diamonds'/'look for coal'/'mine iron' -> seek_block, target diamond_ore/coal_ore/iron_ore. "
+             + "'find zanite ore'/'mine gravitite' -> seek_block, target zanite_ore/gravitite_ore (any mod's block id works). "
              + "'pick up this bone'/'grab that diamond' -> pickup, target bone/diamond. "
              + "'call yourself Alex' -> set_name, target Alex. "
              + "'build the house' -> build, target house. "

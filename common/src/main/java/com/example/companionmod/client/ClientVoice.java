@@ -17,7 +17,9 @@ import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.item.ItemEntity;
@@ -189,6 +191,7 @@ public final class ClientVoice {
                 command = heardOrder(r.heard());
                 if ((command == CompanionCommand.SEEK_BLOCK || command == CompanionCommand.PICKUP) && target.isBlank()) {
                     String mat = heardMaterial(r.heard());
+                    if (mat == null) mat = heardBlockId(r.heard());   // any registered block id, modded included ("find me zanite ore")
                     if (mat != null) target = mat;
                     if (command == CompanionCommand.SEEK_BLOCK && mat == null) command = CompanionCommand.NONE;   // no material named: not a mine order
                 }
@@ -250,7 +253,7 @@ public final class ClientVoice {
         if (heard == null || heard.isBlank()) return false;
         String s = heard.toLowerCase(java.util.Locale.ROOT);
         if (!(s.contains("surface") || s.contains("daylight"))) return false;
-        return heardMaterial(heard) == null;      // a named material ("dig up iron") stays a mining order
+        return heardMaterial(heard) == null && heardBlockId(heard) == null;   // a named block ("dig up zanite ore") stays a mining order
     }
 
     /** Whole-word match for any of the phrases (padded so "sit" never matches "situation"). */
@@ -275,6 +278,22 @@ public final class ClientVoice {
             if (!id.isBlank()) return id;
         }
         return null;
+    }
+
+    /**
+     * Longest registered block path contained in what the player said - modded ids included ("find me zanite ore"
+     * -> "zanite_ore"). Only runs when the vanilla material vocabulary missed, so the registry scan is rare.
+     */
+    private static String heardBlockId(String heard) {
+        if (heard == null || heard.isBlank()) return null;
+        String s = heard.toLowerCase(java.util.Locale.ROOT).replaceAll("[^a-z0-9]+", "_");
+        String best = null;
+        for (Identifier id : BuiltInRegistries.BLOCK.keySet()) {
+            String p = id.getPath();
+            if (p.length() < 3) continue;
+            if (s.contains(p) && (best == null || p.length() > best.length())) best = p;
+        }
+        return best;
     }
 
     /**
