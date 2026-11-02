@@ -51,7 +51,6 @@ import net.minecraft.world.entity.ai.goal.OpenDoorGoal;
 import net.minecraft.world.entity.ai.goal.RandomLookAroundGoal;
 import net.minecraft.world.entity.ai.navigation.GroundPathNavigation;
 import net.minecraft.world.entity.item.ItemEntity;
-import net.minecraft.world.entity.monster.Creeper;
 import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.player.Player;
@@ -877,9 +876,9 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         if (forcedTarget != null) return forcedTarget;
         if (owner != null) {
             LivingEntity a = owner.getLastHurtByMob();
-            if (a != null && owner.tickCount - owner.getLastHurtByMobTimestamp() < 200 && isValidTarget(a, owner) && !(a instanceof Creeper) && visibleOrAggro(a, owner)) return a;
+            if (a != null && owner.tickCount - owner.getLastHurtByMobTimestamp() < 200 && isValidTarget(a, owner) && visibleOrAggro(a, owner)) return a;
             LivingEntity b = owner.getLastHurtMob();
-            if (b != null && owner.tickCount - owner.getLastHurtMobTimestamp() < 200 && isValidTarget(b, owner) && !(b instanceof Creeper) && visibleOrAggro(b, owner)) return b;
+            if (b != null && owner.tickCount - owner.getLastHurtMobTimestamp() < 200 && isValidTarget(b, owner) && visibleOrAggro(b, owner)) return b;
         }
         LivingEntity c = getLastHurtByMob();
         if (c != null && c.isAlive() && c != owner && !(c instanceof CompanionEntity) && !(c instanceof Player) && visibleOrAggro(c, owner)) return c;
@@ -889,7 +888,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         double r = mining ? 4 : (stance() == Stance.GUARD ? 16 : 6);
         var centre = (owner != null && moveMode() == MoveMode.FOLLOW) ? owner : this;
         List<LivingEntity> near = level().getEntitiesOfClass(LivingEntity.class, centre.getBoundingBox().inflate(r),
-                e -> isValidTarget(e, owner) && !(e instanceof Creeper) && distanceToSqr(e) < (mining ? 8 * 8 : 28 * 28));
+                e -> isValidTarget(e, owner) && distanceToSqr(e) < (mining ? 8 * 8 : 28 * 28));
         LivingEntity best = null;
         double bestD = Double.MAX_VALUE;
         for (LivingEntity e : near) {

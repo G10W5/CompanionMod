@@ -182,6 +182,7 @@ public final class ClientVoice {
             if (!r.heard().isBlank()) { subtitle = "You: " + r.heard(); subtitleUntil = System.currentTimeMillis() + 4000; }
             // Hard-stop phrases are deterministic. Safety/control must not depend on the LLM's JSON choice.
             CompanionCommand command = isHardStopPhrase(r.heard()) ? CompanionCommand.STOP : gateCommand(r.command(), r.heard());
+            if (command == CompanionCommand.NONE) command = heardOrder(r.heard());   // model talked but forgot the JSON action: plain order words still work
             if (!r.memory().isBlank()) CompanionMemory.remember(r.memory());
             if (command == CompanionCommand.REMEMBER)
                 CompanionMemory.remember(r.target().isBlank() ? r.say() : r.target());
@@ -202,6 +203,40 @@ public final class ClientVoice {
                     "cancel the task", "never mind", "nevermind", "halt", "abort" -> true;
             default -> false;
         };
+    }
+
+    /**
+     * Last-resort deterministic order detection. A chatty or non-compliant model sometimes answers in prose
+     * and forgets the JSON action object, so "kill the zombie" would otherwise stay just talk. Only unambiguous
+     * order words (whole words, not substrings) are mapped here; anything fuzzy stays NONE and the companion
+     * just replies. The server still resolves targets (attack with no target = what you aim at, then nearest).
+     */
+    private static CompanionCommand heardOrder(String heard) {
+        if (heard == null || heard.isBlank()) return CompanionCommand.NONE;
+        String s = heard.toLowerCase(java.util.Locale.ROOT);
+        if (words(s, "follow", "come along", "come with me")) return CompanionCommand.FOLLOW;
+        if (words(s, "sit")) return CompanionCommand.SIT;
+        if (words(s, "stay", "hold position", "wait here", "wait")) return CompanionCommand.STAY;
+        if (words(s, "stand", "stand up", "get up")) return CompanionCommand.STAND;
+        if (words(s, "come", "come here", "to me", "over here")) return CompanionCommand.COME;
+        if (words(s, "attack", "kill", "fight", "hit", "smash", "destroy")) return CompanionCommand.ATTACK;
+        if (words(s, "guard", "protect", "defend")) return CompanionCommand.GUARD;
+        if (words(s, "patrol")) return CompanionCommand.PATROL;
+        if (words(s, "wander", "roam")) return CompanionCommand.WANDER;
+        if (words(s, "pick up", "pickup", "grab", "collect")) return CompanionCommand.PICKUP;
+        if (words(s, "drop")) return CompanionCommand.DROP;
+        if (words(s, "inventory", "bag")) return CompanionCommand.INVENTORY;
+        if (words(s, "heal", "bandage")) return CompanionCommand.HEAL;
+        return CompanionCommand.NONE;
+    }
+
+    /** Whole-word match for any of the phrases (padded so "sit" never matches "situation"). */
+    private static boolean words(String text, String... phrases) {
+        for (String p : phrases) {
+            if (java.util.regex.Pattern.compile("(?<![a-z])" + java.util.regex.Pattern.quote(p) + "(?![a-z])")
+                    .matcher(text).find()) return true;
+        }
+        return false;
     }
 
     /**
