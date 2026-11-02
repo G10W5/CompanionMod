@@ -740,9 +740,11 @@ public class CompanionSeekBlockGoal extends Goal {
     // ------------------------------------------------------------------ sensing
 
     /**
-     * Nearest match a player could actually see. Exposed blocks (air on at least one face) win over buried ones
-     * at almost any range: a seeable ore 15 blocks away beats a buried ore 3 blocks away. Buried blocks only
-     * count when close, and the crown height penalty keeps high-up blocks from stealing the target.
+     * Nearest match a player could actually see. Exposed blocks (air on at least one face) are preferred, but
+     * the bonus is capped at ~12 blocks of distance so a seeable ore far away never hijacks the job from buried
+     * ore right next to the companion (that made it walk off across caves after the first vein was cleared).
+     * Buried blocks only count when close, and the crown height penalty keeps high-up blocks from stealing
+     * the target.
      */
     private BlockPos scan(ServerLevel level, MineTask t) {
         int r = t.phase == MineTask.Phase.SEARCH ? 22 : 10;
@@ -754,7 +756,7 @@ public class CompanionSeekBlockGoal extends Goal {
             double d = mob.distanceToSqr(Vec3.atCenterOf(p));
             boolean exp = exposed(level, p);
             if (d > 9.0 && !exp) continue;                              // buried blocks only count when close
-            double score = d + Math.max(0, p.getY() - (o.getY() + 2)) * 6.0 - (exp ? 50.0 : 0);
+            double score = d + Math.max(0, p.getY() - (o.getY() + 2)) * 6.0 - (exp ? Math.min(12.0, d) : 0);
             if (score >= bestD) continue;
             bestD = score;
             best = p.immutable();
