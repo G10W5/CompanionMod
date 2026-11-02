@@ -645,19 +645,26 @@ public class CompanionSeekBlockGoal extends Goal {
         if (arrived) { walkTo = null; lastProgress = now; mob.getNavigation().stop(); return; }
         PathNavigation nav = mob.getNavigation();
         if (walkMode == WALK_STAND) {
-            // A tunnel / stair step is one block: drive the move control directly.
-            // No path request that can fail mid-air, so no more block-by-block teleporting.
-            nav.stop();
-            mob.getMoveControl().setWantedPosition(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
-            mob.getLookControl().setLookAt(w.getX() + 0.5, w.getY() + 1.0, w.getZ() + 0.5);
-            if (w.getY() > mob.blockPosition().getY() && mob.onGround() && walkTicks % 4 == 0) {
-                mob.getJumpControl().jump();   // the move control cannot climb a 1-block step on its own: hop onto it
-            }
-            if (walkTicks > 60) {                                   // really jammed (corner, entity in the way): last resort
-                mob.setPos(w.getX() + 0.5, w.getY(), w.getZ() + 0.5);
-                mob.resetFallDistance();
-                lastProgress = now;
-                walkTo = null;
+            // A tunnel / stair step is one block. Staged fallback, villager-style:
+            // 1) let the vanilla pathfinder walk it (it steps up single blocks by itself) for ~1.2 s;
+            // 2) no path / not arriving (tight tunnel, mid-air request, corner): take over with direct move
+            //    control + jump - the move control alone cannot climb a 1-block step;
+            // 3) truly jammed after ~3 s (entity in the way): teleport, the last resort so a tunnel never deadlocks.
+            if (walkTicks <= 25) {
+                if (walkTicks % 20 == 1) nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
+            } else {
+                nav.stop();
+                mob.getMoveControl().setWantedPosition(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
+                mob.getLookControl().setLookAt(w.getX() + 0.5, w.getY() + 1.0, w.getZ() + 0.5);
+                if (w.getY() > mob.blockPosition().getY() && mob.onGround() && walkTicks % 4 == 0) {
+                    mob.getJumpControl().jump();
+                }
+                if (walkTicks > 60) {
+                    mob.setPos(w.getX() + 0.5, w.getY(), w.getZ() + 0.5);
+                    mob.resetFallDistance();
+                    lastProgress = now;
+                    walkTo = null;
+                }
             }
             return;
         }
