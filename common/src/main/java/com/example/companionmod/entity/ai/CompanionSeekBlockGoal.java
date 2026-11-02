@@ -233,8 +233,16 @@ public class CompanionSeekBlockGoal extends Goal {
             t.dirData = d.getClockWise().get2DDataValue();
             return;
         }
-        if (planStep(level, t, d, 0, false)) t.legLen++;
-        else t.legLen = len;                                            // lava/water/hole ahead: end this leg early
+        if (planStep(level, t, d, 0, false)) { t.legLen++; return; }
+        // Blocked ahead (lava pocket, bedrock bump): mine at a slight angle or step over it before ending the leg.
+        // Without this one blocked cell ended the leg instantly, all 8 legs burned in seconds and the task paused.
+        if (planStep(level, t, d.getClockWise(), 0, false)
+                || planStep(level, t, d.getCounterClockWise(), 0, false)
+                || planStep(level, t, d, -1, false) || planStep(level, t, d, 1, false)) {
+            t.legLen++;
+            return;
+        }
+        t.legLen = len;                                                 // truly boxed in: end this leg early
     }
 
     private void wanderSearch(ServerLevel level, MineTask t) {
@@ -673,7 +681,11 @@ public class CompanionSeekBlockGoal extends Goal {
 
     // ------------------------------------------------------------------ sensing
 
-    /** Nearest match that a player could actually see (touching air) or that is within 2 blocks of the companion. */
+    /**
+     * Nearest match a player could actually see. Exposed blocks (air on at least one face) win over buried ones
+     * at almost any range: a seeable ore 15 blocks away beats a buried ore 3 blocks away. Buried blocks only
+     * count when close, and the crown height penalty keeps high-up blocks from stealing the target.
+     */
     private BlockPos scan(ServerLevel level, MineTask t) {
         int r = t.phase == MineTask.Phase.SEARCH ? 22 : 10;
         BlockPos o = mob.blockPosition();
@@ -682,8 +694,10 @@ public class CompanionSeekBlockGoal extends Goal {
         for (BlockPos p : BlockPos.betweenClosed(o.offset(-r, -Math.min(r, 12), -r), o.offset(r, Math.min(r, 8), r))) {
             if (!matches(t, level.getBlockState(p)) || unreachable.contains(p)) continue;
             double d = mob.distanceToSqr(Vec3.atCenterOf(p));
-            double score = d + Math.max(0, p.getY() - (o.getY() + 2)) * 6.0;   // prefer reachable blocks over ones high in a crown
-            if (score >= bestD || (d > 9.0 && !exposed(level, p))) continue;
+            boolean exp = exposed(level, p);
+            if (d > 9.0 && !exp) continue;                              // buried blocks only count when close
+            double score = d + Math.max(0, p.getY() - (o.getY() + 2)) * 6.0 - (exp ? 50.0 : 0);
+            if (score >= bestD) continue;
             bestD = score;
             best = p.immutable();
         }
