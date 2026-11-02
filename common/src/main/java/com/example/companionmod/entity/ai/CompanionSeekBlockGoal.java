@@ -124,6 +124,7 @@ public class CompanionSeekBlockGoal extends Goal {
             stepStand = walkTo = null;
             endPillar();
             bridgeCell = null;
+            mob.getNavigation().stop();      // else it keeps steering the old route while we re-decide
             return;
         }
         if (idle > 500) {                                         // 25 s without progress: re-plan, then give up politely
@@ -131,6 +132,7 @@ public class CompanionSeekBlockGoal extends Goal {
             cancelBreak(level);
             pending.clear();
             stepStand = walkTo = oreTarget = null;
+            mob.getNavigation().stop();
             if (++stuck >= 4) {
                 t.pause();
                 say(level, "I'm stuck (" + stateName() + "). Say 'continue' and I'll try again.", true);
@@ -632,6 +634,7 @@ public class CompanionSeekBlockGoal extends Goal {
     private void walk(ServerLevel level, long now) {
         walkTicks++;
         if (walkTicks == 1) walkRetries = 0;
+        if (walkTicks % 40 == 0) { lastProgress = now; stuck = 0; }   // covering ground IS progress: the watchdogs must not fire mid-route (long walks used to be reset every 8 s -> back-and-forth forever)
         BlockPos w = walkTo;
         boolean arrived = switch (walkMode) {
             case WALK_REACH -> inReach(Vec3.atCenterOf(w));     // line of sight is handled by approach(): it digs the blocker out
