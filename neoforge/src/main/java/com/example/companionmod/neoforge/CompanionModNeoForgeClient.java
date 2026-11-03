@@ -28,7 +28,11 @@ import net.neoforged.neoforge.common.NeoForge;
 public class CompanionModNeoForgeClient {
     public CompanionModNeoForgeClient(IEventBus modBus) {
         ClientVoice.setSender(ClientPacketDistributor::sendToServer);
-        modBus.addListener(RegisterKeyMappingsEvent.class, e -> e.register(ClientVoice.talkKey()));
+        modBus.addListener(RegisterKeyMappingsEvent.class, e -> {
+            e.register(ClientVoice.talkKey());
+            e.register(ClientVoice.radialKey());
+            e.register(ClientVoice.settingsKey());
+        });
         modBus.addListener(EntityRenderersEvent.RegisterRenderers.class, e -> e.registerEntityRenderer(ModContent.COMPANION, CompanionRenderer::new));
         modBus.addListener(RegisterMenuScreensEvent.class, e ->
                 e.register(ModContent.COMPANION_INV_MENU, CompanionInventoryScreen::new));

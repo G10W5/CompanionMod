@@ -118,7 +118,7 @@ public final class CompanionRadialScreen extends Screen {
     @Override public boolean isPauseScreen() { return false; }
 
     private static boolean rDown() {
-        return GLFW.glfwGetKey(Minecraft.getInstance().getWindow().handle(), GLFW.GLFW_KEY_R) == GLFW.GLFW_PRESS;
+        return ClientVoice.radialKey().isDown();    // rebindable (was hardcoded GLFW_KEY_R); updates even while this screen is open
     }
 
     private List<Entry> buildRoot() {
@@ -296,7 +296,7 @@ public final class CompanionRadialScreen extends Screen {
     public boolean keyPressed(KeyEvent event) {
         int k = event.key();
         if (k == GLFW.GLFW_KEY_ESCAPE) { onClose(); return true; }
-        if (k == GLFW.GLFW_KEY_R) {                             // ignore key-repeat while R is still held from opening
+        if (ClientVoice.radialKey().matches(event)) {              // ignore key-repeat while the open key is still held
             if (!holdMode && System.currentTimeMillis() - openedAt > 300) onClose();
             return true;
         }

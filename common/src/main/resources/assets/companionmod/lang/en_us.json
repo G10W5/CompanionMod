@@ -2,5 +2,7 @@
   "block.companionmod.shrine_core": "Companion Shrine",
   "entity.companionmod.companion": "Companion",
   "key.companionmod.talk": "Talk to Companion (hold)",
+  "key.companionmod.radial": "Companion Radial Wheel",
+  "key.companionmod.settings": "Companion Settings",
   "key.category.companionmod.main": "Companion Mod"
 }

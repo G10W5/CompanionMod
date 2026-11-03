@@ -18,7 +18,9 @@ public class CompanionModFabricClient implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         ClientVoice.setSender(ClientPlayNetworking::send);
-        KeyMappingHelper.registerKeyMapping(ClientVoice.talkKey());   // shows up in Controls, rebindable
+        KeyMappingHelper.registerKeyMapping(ClientVoice.talkKey());   // all three show up in Controls, rebindable
+        KeyMappingHelper.registerKeyMapping(ClientVoice.radialKey());
+        KeyMappingHelper.registerKeyMapping(ClientVoice.settingsKey());
         EntityRendererRegistry.register(ModContent.COMPANION, CompanionRenderer::new);
         MenuScreens.register(ModContent.COMPANION_INV_MENU, CompanionInventoryScreen::new);
         HudElementRegistry.addLast(CompanionMod.id("voice_hud"),

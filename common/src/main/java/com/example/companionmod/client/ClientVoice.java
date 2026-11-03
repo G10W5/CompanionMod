@@ -41,6 +41,9 @@ import java.util.function.Consumer;
  */
 public final class ClientVoice {
     private static KeyMapping talkKey;
+    private static KeyMapping radialKey;
+    private static KeyMapping settingsKey;
+    private static KeyMapping.Category category;
     private static PushToTalkController controller;
     private static VoiceConfig cfg;
     private static Path configFile;
@@ -76,13 +79,34 @@ public final class ClientVoice {
 
     public static void setSender(Consumer<CommandPayload> s) { sender = s; }
 
+    /** One shared Controls category for all companionmod keys (registered lazily, exactly once). */
+    private static KeyMapping.Category category() {
+        if (category == null) category = KeyMapping.Category.register(CompanionMod.id("main"));
+        return category;
+    }
+
     public static KeyMapping talkKey() {
         if (talkKey == null) {
             // 26.1-CHECK: KeyMapping needs a Category since 1.21.9
-            talkKey = new KeyMapping("key.companionmod.talk", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_V,
-                    KeyMapping.Category.register(CompanionMod.id("main")));
+            talkKey = new KeyMapping("key.companionmod.talk", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_V, category());
         }
         return talkKey;
+    }
+
+    /** Opens the radial wheel (was hardcoded GLFW_KEY_R). Registered + rebindable in Controls. */
+    public static KeyMapping radialKey() {
+        if (radialKey == null) {
+            radialKey = new KeyMapping("key.companionmod.radial", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_R, category());
+        }
+        return radialKey;
+    }
+
+    /** Opens the settings screen (was hardcoded GLFW_KEY_O). Registered + rebindable in Controls. */
+    public static KeyMapping settingsKey() {
+        if (settingsKey == null) {
+            settingsKey = new KeyMapping("key.companionmod.settings", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_O, category());
+        }
+        return settingsKey;
     }
 
     public static VoiceConfig config() {
@@ -154,11 +178,11 @@ public final class ClientVoice {
         }
 
         if (mc.screen == null) {
-            boolean radial = InputConstants.isKeyDown(mc.getWindow(), GLFW.GLFW_KEY_R);
+            boolean radial = radialKey().isDown();                    // 26.1: real KeyMapping, rebindable in Controls
             if (radial && !radialWasDown && companion != null) mc.setScreen(new CompanionRadialScreen());
             radialWasDown = radial;
 
-            boolean settings = InputConstants.isKeyDown(mc.getWindow(), GLFW.GLFW_KEY_O);
+            boolean settings = settingsKey().isDown();
             if (settings && !settingsWasDown) mc.setScreen(new CompanionSettingsScreen(config(), configFile()));
             settingsWasDown = settings;
         } else {
