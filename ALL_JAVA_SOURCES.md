@@ -506,12 +506,12 @@ public final class ClientVoice {
 
     private static long lastReviveSend;
 
-    /** Holding left click on a downed companion sends revive pulses to the server. */
+    /** Holding right click (interact, like doors) on a downed companion sends revive pulses to the server. */
     private static void handleReviveInput(Minecraft mc, CompanionEntity companion) {
-        if (!companion.isInjured() || mc.screen != null || mc.player == null) return;
-        boolean holdingAttack = mc.options.keyAttack.isDown();
+        if (!companion.isInjured() || companion.isDeadOrDying() || mc.screen != null || mc.player == null) return;
+        boolean holdingUse = mc.options.keyUse.isDown();
         boolean onIt = mc.crosshairPickEntity == companion || mc.player.distanceToSqr(companion) <= 9.0;
-        if (holdingAttack && onIt && System.currentTimeMillis() - lastReviveSend > 200) {
+        if (holdingUse && onIt && System.currentTimeMillis() - lastReviveSend > 200) {
             lastReviveSend = System.currentTimeMillis();
             ClientVoice.send("revive", "", "");
         }
@@ -2171,7 +2171,7 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         FemaleGenderCompat.verifyAtSubmit(state);
         super.submit(state, poseStack, collector, camera);
         if (state.injured) submitInjured(state, poseStack, collector, camera);
-        else submitSubtitle(state, poseStack, collector, camera);
+        else { downedAt.remove(state.entityId); submitSubtitle(state, poseStack, collector, camera); }
     }
 
     @Override
@@ -2218,33 +2218,69 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         poseStack.popPose();
     }
 
-    /** Downed state: red countdown + revive progress (depth-tested so they can't be seen through walls). */
+    /**
+     * Downed text: the same playful per-word bubbles as the chat (pastel color, tilt, wobble, pop-in with
+     * overshoot) but persistent - words never fade, they breathe, bob and wiggle forever until revived.
+     * One line: "REVIVE ME <n>s". No green "Reviving..." line: the bar above the hotbar owns progress.
+     */
+    private static final java.util.Map<Integer, Long> downedAt = new java.util.concurrent.ConcurrentHashMap<>();
+
     private void submitInjured(CompanionRenderState state, PoseStack poseStack, SubmitNodeCollector collector, CameraRenderState camera) {
+        if (!state.injured) { downedAt.remove(state.entityId); return; }
         if (state.injuredLeft <= 0) return;
         int seconds = (state.injuredLeft + 19) / 20;
-        FormattedCharSequence seq = getFont().split(Component.literal("REVIVE ME  " + seconds + "s"), 220).get(0);
-        int color = seconds <= 10 ? 0xFFFF4444 : 0xFFFF8888;
-        renderBillboardText(poseStack, collector, camera, state, seq,
-                state.boundingBoxHeight + 0.35f, false, color, 0x33000000, seconds <= 10 ? 0xFFFF0000 : 0xFF880000);
-        if (state.reviveProgress > 0.01f) {
-            FormattedCharSequence rev = getFont().split(
-                    Component.literal("Reviving... " + Math.round(state.reviveProgress * 100) + "%"), 220).get(0);
-            renderBillboardText(poseStack, collector, camera, state, rev,
-                    state.boundingBoxHeight + 0.05f, false, 0xFF7CFC7C, 0x33000000, 0xFF2E8B2E);
-        }
-    }
+        long now = System.currentTimeMillis();
+        long since = downedAt.computeIfAbsent(state.entityId, id -> now);
 
-    private void renderBillboardText(PoseStack poseStack, SubmitNodeCollector collector, CameraRenderState camera,
-                                     CompanionRenderState state, FormattedCharSequence line,
-                                     float worldY, boolean seeThrough, int color, int background, int outline) {
+        String[] words = {"REVIVE", "ME", seconds + "s"};
+        long[] reveal = {0, 300, 600};               // one-time sequential pop; afterwards perpetual bounce
+
+        Font font = getFont();
         poseStack.pushPose();
-        poseStack.translate(0.0, worldY, 0.0);
+        poseStack.translate(0.0, state.boundingBoxHeight + 0.45f, 0.0);
         poseStack.mulPose(camera.orientation);
         poseStack.scale(SUBTITLE_SCALE, -SUBTITLE_SCALE, SUBTITLE_SCALE);
-        Font.DisplayMode mode = seeThrough ? Font.DisplayMode.SEE_THROUGH : Font.DisplayMode.NORMAL;
-        float width = this.getFont().width(line);
-        collector.submitText(poseStack, -width / 2.0f, 0.0f, line, false, mode,
-                state.lightCoords, color, background, outline);
+
+        float[] widths = new float[words.length];
+        float total = 0;
+        for (int i = 0; i < words.length; i++) {
+            widths[i] = font.width(font.split(Component.literal(words[i]), 220).get(0));
+            total += widths[i] + 4;
+        }
+        total -= 4;
+        float cursor = -total / 2;
+
+        for (int i = 0; i < words.length; i++) {
+            FormattedCharSequence seq = font.split(Component.literal(words[i]), 220).get(0);
+            java.util.Random rng = new java.util.Random((long) state.entityId * 31 + i);
+            float tilt = (rng.nextBoolean() ? 1 : -1) * (3f + rng.nextFloat() * 7f);
+            float phase = rng.nextFloat() * 6.283f;
+            float sizeMul = 0.9f + rng.nextFloat() * 0.45f;
+
+            float age = now - since - reveal[i];
+            float cx = cursor + widths[i] / 2f;
+            cursor += widths[i] + 4;
+            if (age < 0) continue;
+
+            float pop = Math.min(1, age / 300f);
+            float q = pop - 1;
+            float popIn = 1 + 2.70158f * q * q * q + 1.70158f * q * q;   // easeOutBack: overshoot bounce
+            float breathe = 1 + (float) Math.sin(now * 0.005 + phase) * 0.06f;
+            float bob = (float) Math.sin(now * 0.003 + phase) * 2.5f;
+            float wobble = (float) Math.sin(now * 0.0045 + phase) * 4f;
+            float scale = Math.max(0.16f, (0.2f + 0.8f * popIn) * sizeMul * (pop >= 1 ? breathe : 1));
+            float flash = Math.max(0, 1 - age / 150f);                    // white burst on the pop, then pastel
+            int argb = CompanionSubtitles.blend(0xFF000000
+                    | (CompanionSubtitles.PALETTE[i % CompanionSubtitles.PALETTE.length] & 0xFFFFFF), flash);
+
+            poseStack.pushPose();
+            poseStack.translate(cx, -bob, 0);
+            poseStack.mulPose(Axis.ZP.rotationDegrees(tilt + wobble));
+            poseStack.scale(scale, scale, 1f);
+            collector.submitText(poseStack, -widths[i] / 2f, 0f, seq, false,
+                    Font.DisplayMode.SEE_THROUGH, state.lightCoords, argb, 0xC814181E, 0);
+            poseStack.popPose();
+        }
         poseStack.popPose();
     }
 }
@@ -2986,8 +3022,8 @@ final class CompanionSubtitles {
     /** Extra smoothing factor: how much of the audio-clock's coarse jump we accept per rendered frame. */
     private static final float CLOCK_EASE = 0.45f;
 
-    /** Pastel bubbles: one color per word, cycling. */
-    private static final int[] PALETTE = {
+    /** Pastel bubbles: one color per word, cycling. Shared with the downed text (same playful style). */
+    static final int[] PALETTE = {
             0xFFC9DBFF,   // sky blue
             0xFFFFC2E0,   // pink
             0xFFFFE3B3,   // amber
@@ -3106,7 +3142,7 @@ final class CompanionSubtitles {
     }
 
     /** Pushes the base color toward white during the first moments of a word. */
-    private static int blend(int base, float flash) {
+    static int blend(int base, float flash) {
         if (flash <= 0) return base;
         int r = (base >> 16) & 0xFF, g = (base >> 8) & 0xFF, b = base & 0xFF;
         r += (int) ((255 - r) * flash);
@@ -6283,7 +6319,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             case FEMININE -> setFeminine(true);
             case MASCULINE -> setFeminine(false);
             case REVIVE -> {
-                // Must be the owner and actually next to the body (the client sends pulses while holding left click).
+                // Must be the owner and actually next to the body (the client sends pulses while holding right click).
                 if (from != null && isOwner(from) && from.distanceToSqr(this) <= 49.0) revivePulse();
             }
             case PLAN -> { lastPlanJson = target == null ? "" : target; planner.accept(target, this, tickCount); }
@@ -6620,18 +6656,19 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         setPickupEnabled(false);
         if (isSitting()) setMoveMode(MoveMode.STAY);
         getNavigation().stop();
-        speak("I'm down! Hold left click on me to revive me!");
+        speak("I'm down! Hold right click on me to revive me!");
         makeMobsForgetMe();
     }
 
-    /** Called from the REVIVE order while the player holds left mouse button on the companion. */
+    /** Called from the REVIVE order while the player holds right mouse button on the companion. */
     public void revivePulse() {
-        if (!isInjured()) return;
+        if (!isInjured() || isDeadOrDying()) return;
         lastRevivePulse = System.currentTimeMillis();
     }
 
     /** Revives the companion (used by the revive command for testing and by the revive timer). */
     public void revive() {
+        if (isDeadOrDying() || isRemoved()) return;   // reviving a fully-died body corrupted the death state and crashed
         entityData.set(DATA_INJURED, 0);
         entityData.set(DATA_REVIVE, 0f);
         entityData.set(DATA_INJURED_LEFT, 0);
@@ -6643,9 +6680,18 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     /** The 60 s revive window ran out: drop the gear and really die. */
     private void bleedOut() {
+        if (forceDeath || isRemoved()) return;      // never re-enter: a half-committed death used to re-run die() every tick
         speak("I'm fading...");
         dropStorageAndClear();
         forceDeath = true;
+        // Downed flow is OVER: clearing the flag stops the per-tick injured branch (which re-entered
+        // bleedOut forever) and disables revive input on the client and server.
+        entityData.set(DATA_INJURED, 0);
+        entityData.set(DATA_REVIVE, 0f);
+        entityData.set(DATA_INJURED_LEFT, 0);
+        reviveProgress = 0f;
+        injuredLeftTicks = 0;
+        setHealth(0f);                             // real death: isAlive()==false -> vanilla tickDeath advances and removes us
         die(injurySource != null ? injurySource : level().damageSources().generic());
     }
 
@@ -8832,7 +8878,7 @@ public final class OllamaVoiceBackend {
              + "Leave target empty for toggle commands.\n"
              + "Your bag has 4 armor slots (auto-worn so they protect you), 4 tool slots (you automatically hold the best tool for the block you are mining) "
              + "and 18 storage slots; pickup/store puts items where they belong and you can also be given items via the "
-             + "inventory UI. When you are downed the player must hold left click on you for 3 seconds to revive you. "
+             + "inventory UI. When you are downed the player must hold right click on you for 3 seconds to revive you. "
              + "Current situation: " + context;
     }
 

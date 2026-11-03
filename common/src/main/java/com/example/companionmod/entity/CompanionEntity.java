@@ -451,7 +451,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             case FEMININE -> setFeminine(true);
             case MASCULINE -> setFeminine(false);
             case REVIVE -> {
-                // Must be the owner and actually next to the body (the client sends pulses while holding left click).
+                // Must be the owner and actually next to the body (the client sends pulses while holding right click).
                 if (from != null && isOwner(from) && from.distanceToSqr(this) <= 49.0) revivePulse();
             }
             case PLAN -> { lastPlanJson = target == null ? "" : target; planner.accept(target, this, tickCount); }
@@ -788,18 +788,19 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         setPickupEnabled(false);
         if (isSitting()) setMoveMode(MoveMode.STAY);
         getNavigation().stop();
-        speak("I'm down! Hold left click on me to revive me!");
+        speak("I'm down! Hold right click on me to revive me!");
         makeMobsForgetMe();
     }
 
-    /** Called from the REVIVE order while the player holds left mouse button on the companion. */
+    /** Called from the REVIVE order while the player holds right mouse button on the companion. */
     public void revivePulse() {
-        if (!isInjured()) return;
+        if (!isInjured() || isDeadOrDying()) return;
         lastRevivePulse = System.currentTimeMillis();
     }
 
     /** Revives the companion (used by the revive command for testing and by the revive timer). */
     public void revive() {
+        if (isDeadOrDying() || isRemoved()) return;   // reviving a fully-died body corrupted the death state and crashed
         entityData.set(DATA_INJURED, 0);
         entityData.set(DATA_REVIVE, 0f);
         entityData.set(DATA_INJURED_LEFT, 0);
@@ -811,9 +812,18 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     /** The 60 s revive window ran out: drop the gear and really die. */
     private void bleedOut() {
+        if (forceDeath || isRemoved()) return;      // never re-enter: a half-committed death used to re-run die() every tick
         speak("I'm fading...");
         dropStorageAndClear();
         forceDeath = true;
+        // Downed flow is OVER: clearing the flag stops the per-tick injured branch (which re-entered
+        // bleedOut forever) and disables revive input on the client and server.
+        entityData.set(DATA_INJURED, 0);
+        entityData.set(DATA_REVIVE, 0f);
+        entityData.set(DATA_INJURED_LEFT, 0);
+        reviveProgress = 0f;
+        injuredLeftTicks = 0;
+        setHealth(0f);                             // real death: isAlive()==false -> vanilla tickDeath advances and removes us
         die(injurySource != null ? injurySource : level().damageSources().generic());
     }
 

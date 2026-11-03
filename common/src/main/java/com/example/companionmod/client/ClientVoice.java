@@ -432,12 +432,12 @@ public final class ClientVoice {
 
     private static long lastReviveSend;
 
-    /** Holding left click on a downed companion sends revive pulses to the server. */
+    /** Holding right click (interact, like doors) on a downed companion sends revive pulses to the server. */
     private static void handleReviveInput(Minecraft mc, CompanionEntity companion) {
-        if (!companion.isInjured() || mc.screen != null || mc.player == null) return;
-        boolean holdingAttack = mc.options.keyAttack.isDown();
+        if (!companion.isInjured() || companion.isDeadOrDying() || mc.screen != null || mc.player == null) return;
+        boolean holdingUse = mc.options.keyUse.isDown();
         boolean onIt = mc.crosshairPickEntity == companion || mc.player.distanceToSqr(companion) <= 9.0;
-        if (holdingAttack && onIt && System.currentTimeMillis() - lastReviveSend > 200) {
+        if (holdingUse && onIt && System.currentTimeMillis() - lastReviveSend > 200) {
             lastReviveSend = System.currentTimeMillis();
             ClientVoice.send("revive", "", "");
         }

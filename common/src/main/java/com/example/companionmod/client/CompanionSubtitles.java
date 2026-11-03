@@ -24,8 +24,8 @@ final class CompanionSubtitles {
     /** Extra smoothing factor: how much of the audio-clock's coarse jump we accept per rendered frame. */
     private static final float CLOCK_EASE = 0.45f;
 
-    /** Pastel bubbles: one color per word, cycling. */
-    private static final int[] PALETTE = {
+    /** Pastel bubbles: one color per word, cycling. Shared with the downed text (same playful style). */
+    static final int[] PALETTE = {
             0xFFC9DBFF,   // sky blue
             0xFFFFC2E0,   // pink
             0xFFFFE3B3,   // amber
@@ -144,7 +144,7 @@ final class CompanionSubtitles {
     }
 
     /** Pushes the base color toward white during the first moments of a word. */
-    private static int blend(int base, float flash) {
+    static int blend(int base, float flash) {
         if (flash <= 0) return base;
         int r = (base >> 16) & 0xFF, g = (base >> 8) & 0xFF, b = base & 0xFF;
         r += (int) ((255 - r) * flash);
