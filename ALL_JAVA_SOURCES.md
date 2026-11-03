@@ -1,6 +1,6 @@
 # All Java Sources
 
-Generated from 72 files. Paths are relative to the project root.
+Generated from 71 files. Paths are relative to the project root.
 
 ## common\src\main\java\com\example\companionmod\block\CompanionShrineBlock.java
 
@@ -2021,7 +2021,8 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         // so slim arms get slim armor sleeves instead of wide sleeves clipping through.
         addLayer(new SelectableArmorLayer(this, wideArmor, ctx, false));
         addLayer(new SelectableArmorLayer(this, slimArmor, ctx, true));
-        addLayer(new FeminineChestLayer(this));
+        // No chest overlay of our own: when Wildfire's Female Gender Mod is installed its real GenderLayer
+        // draws the chest (fed by FemaleGenderCompat.populateRenderState), otherwise the companion is flat.
     }
 
     /**
@@ -2072,7 +2073,6 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
     public void extractRenderState(CompanionEntity entity, CompanionRenderState state, float partialTick) {
         super.extractRenderState(entity, state, partialTick);
         state.isPassenger = entity.isSitting();
-        state.feminine = entity.isFeminine();
         state.skin = entity.skin();
         state.speech = entity.speech();
         state.speechId = entity.speechId();
@@ -2084,8 +2084,8 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         state.injuredLeft = entity.injuredLeftTicks();
         resolveSkin(state, entity.skin(), entity.syncedOwner());
         // Wildfire's layer reads its data from the render state. The mod only fills it for players,
-        // so we build it from the owner's config; false means the fallback overlay should draw instead.
-        state.wildfireChest = FemaleGenderCompat.populateRenderState(state, entity, entity.syncedOwner(), partialTick);
+        // so we build it from the owner's config, gated by the companion's own feminine toggle.
+        FemaleGenderCompat.populateRenderState(state, entity, entity.syncedOwner(), partialTick);
     }
 
     private void resolveSkin(CompanionRenderState state, String name, UUID owner) {
@@ -2234,7 +2234,7 @@ import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.resources.Identifier;
 
 /**
- * Extra render data carried from the entity to the renderer (skin + optional feminine/slim model +
+ * Extra render data carried from the entity to the renderer (skin + slim model +
  * injury state + subtitle). The resolved texture/render-type lives here, not in the renderer,
  * because 26.1 extracts every entity before submitting any of them — a field on the renderer would be
  * shared between companions.
@@ -2243,12 +2243,10 @@ public class CompanionRenderState extends HumanoidRenderState {
     public static final Identifier DEFAULT = CompanionMod.id("textures/entity/companion.png");
 
     public String skin = "";
-    public boolean feminine;
     public boolean slim;
     public boolean slimSkin;             // auto-detected from the resolved skin (Alex model)
     public Identifier texture = DEFAULT;
     public RenderType renderType;         // null = use the model texture (bundled skin), non-null = live player skin
-    public boolean wildfireChest;         // true = Wildfire's own layer supplies the chest, skip the fallback overlay
 
     /** Current floating line and the local animation clock (milliseconds). */
     public String speech = "";
@@ -2426,18 +2424,21 @@ public class CompanionSettingsScreen extends Screen {
         this.addRenderableWidget(CycleButton.<String>builder(CompanionSettingsScreen::bodyName, config.companionBody == null ? "auto" : config.companionBody)
                 .withValues("auto", "slim", "classic")
                 .create(lx, y, colW - 24, 20, Component.literal("Body Type"), (b, v) -> config.companionBody = v));
-        femButton = Button.builder(Component.empty(), b -> {
-            feminine = !feminine;
+        if (com.example.companionmod.voice.FemaleGenderCompat.isPresent()) {   // only meaningful with Wildfire's mod
+            femButton = Button.builder(Component.empty(), b -> {
+                feminine = !feminine;
+                updateFemButton();
+            }).pos(lx + colW - 20, y).size(20, 20).build();
             updateFemButton();
-        }).pos(lx + colW - 20, y).size(20, 20).build();
-        updateFemButton();
-        this.addRenderableWidget(femButton);
+            this.addRenderableWidget(femButton);
+        }
         this.addRenderableWidget(new Slider(rx, y, colW, "Think Every", 15, 180, config.autonomyIntervalSeconds, 0, "s",
                 v -> config.autonomyIntervalSeconds = Math.round(v)));
     }
 
     /** Circle icon: filled pink = on, hollow grey = off. The state is only named in the hover tooltip. */
     private void updateFemButton() {
+        if (femButton == null) return;                          // hidden when Wildfire's mod is not installed
         femButton.setMessage(feminine
                 ? Component.literal("\u25CF").withStyle(ChatFormatting.LIGHT_PURPLE)
                 : Component.literal("\u25CB").withStyle(ChatFormatting.GRAY));
@@ -3335,72 +3336,6 @@ final class CompanionWorldContext {
 
     private static String pos(BlockPos p) {
         return p.getX() + "," + p.getY() + "," + p.getZ();
-    }
-}
-```
-
-## common\src\main\java\com\example\companionmod\client\FeminineChestLayer.java
-
-```java
-package com.example.companionmod.client;
-
-import com.mojang.blaze3d.vertex.PoseStack;
-import net.minecraft.client.model.HumanoidModel;
-import net.minecraft.client.model.geom.ModelPart;
-import net.minecraft.client.model.geom.PartPose;
-import net.minecraft.client.model.geom.builders.CubeDeformation;
-import net.minecraft.client.model.geom.builders.CubeListBuilder;
-import net.minecraft.client.model.geom.builders.MeshDefinition;
-import net.minecraft.client.renderer.SubmitNodeCollector;
-import net.minecraft.client.renderer.entity.RenderLayerParent;
-import net.minecraft.client.renderer.entity.layers.RenderLayer;
-import net.minecraft.client.renderer.rendertype.RenderType;
-import net.minecraft.client.renderer.rendertype.RenderTypes;
-import net.minecraft.client.renderer.texture.OverlayTexture;
-
-/**
- * Fallback chest overlay on the vanilla player model, used when Wildfire's Female Gender Mod is not
- * driving the chest. With the mod installed and the owner configured as female, the mod's own
- * {@code GenderLayer} is attached instead and this layer stays hidden.
- *
- * <p>Model space (26.1 player model): the body part pivot sits at the shoulders, the torso cube spans
- * local y 0..12 (shoulders to waist) and z -2..+2, front = -z. Cups are baked around their own centres.</p>
- */
-public class FeminineChestLayer extends RenderLayer<CompanionRenderState, HumanoidModel<CompanionRenderState>> {
-    private static final float CUP_GAP = 0.2f;      // inner-edge distance from the centre line
-    private final ModelPart cupL, cupR;
-
-    public FeminineChestLayer(RenderLayerParent<CompanionRenderState, HumanoidModel<CompanionRenderState>> parent) {
-        super(parent);
-        this.cupL = bake(-2.05f);
-        this.cupR = bake(2.05f);
-    }
-
-    /** One cup centred on {@code centreX} (body-local). */
-    private static ModelPart bake(float centreX) {
-        MeshDefinition mesh = new MeshDefinition();
-        CubeListBuilder box = CubeListBuilder.create()
-                .texOffs(20, 20).addBox(-1.65f, -1.7f, -0.55f, 3.3f, 3.4f, 1.1f, new CubeDeformation(0.15f));
-        mesh.getRoot().addOrReplaceChild("cup", box, PartPose.offset(centreX, 3.3f, -2.55f));
-        return mesh.getRoot().bake(64, 64);
-    }
-
-    @Override
-    public void submit(PoseStack poseStack, SubmitNodeCollector collector, int light, CompanionRenderState state,
-                       float limbSwing, float limbSwingAmount) {
-        if (!state.feminine || state.isInvisible || state.wildfireChest) return;
-        RenderType type = state.renderType != null ? state.renderType : RenderTypes.entityCutout(state.texture);
-        poseStack.pushPose();
-        getParentModel().body.translateAndRotate(poseStack);
-        poseStack.pushPose();
-        poseStack.translate(-CUP_GAP, 0, 0);
-        collector.submitModelPart(cupL, poseStack, type, light, OverlayTexture.NO_OVERLAY, null);
-        poseStack.popPose();
-        poseStack.pushPose();
-        poseStack.translate(CUP_GAP, 0, 0);
-        collector.submitModelPart(cupR, poseStack, type, light, OverlayTexture.NO_OVERLAY, null);
-        poseStack.popPose();
-        poseStack.popPose();
     }
 }
 ```
@@ -8125,6 +8060,7 @@ public class AudioRecorder {
 package com.example.companionmod.voice;
 
 import com.example.companionmod.client.CompanionRenderState;
+import com.example.companionmod.entity.CompanionEntity;
 import com.mojang.logging.LogUtils;
 import net.minecraft.client.model.HumanoidModel;
 import net.minecraft.client.renderer.entity.RenderLayerParent;
@@ -8156,6 +8092,7 @@ import java.util.UUID;
 public final class FemaleGenderCompat {
     private static Boolean present;
     private static boolean layerAttached;
+    private static String lastOutcome;             // diagnostics: log only when the outcome changes
 
     private static final Logger LOG = LogUtils.getLogger();
     private static boolean initDone;
@@ -8216,40 +8153,82 @@ public final class FemaleGenderCompat {
      * Fills the render state with a {@code GenderRenderState} built from the owner's Wildfire settings, which is
      * exactly what the mod's layer expects to find. Called from the companion's {@code extractRenderState}.
      *
-     * @return true when the mod's layer will draw the chest (so the fallback overlay must stay hidden)
+     * <p>Runs only while the companion's own feminine toggle is on: with the mod installed that switch decides
+     * <b>whether</b> the chest renders at all, the mod's data (owner's gender/UVs/physics) decides <b>how</b>.
+     * Without the mod the settings screen hides the switch and this method never gets past the layer check.</p>
+     *
+     * <p>Every distinct outcome logs one line (only when the outcome CHANGES, never per frame), so latest.log
+     * always states exactly why the chest did or did not render.</p>
+     *
+     * @return true when the mod's layer will draw the chest
      */
     public static boolean populateRenderState(HumanoidRenderState state, LivingEntity entity, UUID ownerUuid,
                                               float partialTick) {
-        if (!layerAttached || state == null || entity == null || ownerUuid == null) return false;
+        if (state == null || entity == null) return false;
+        if (!(entity instanceof CompanionEntity companion)) return false;
+        if (!layerAttached) {
+            outcome(isPresent() ? "layer not attached (see warning above)" : "mod not installed");
+            return false;
+        }
         init();
         if (playerCache == null || cacheGetOrCreate == null || genderRenderStateCtor == null
-                || stateKey == null || setRenderData == null) return false;
+                || stateKey == null || setRenderData == null) {
+            outcome("reflection incomplete (attempt " + initAttempts + "/5)");
+            return false;
+        }
+        if (!companion.isFeminine()) { clearRenderData(state); outcome("feminine toggle OFF"); return false; }
+        if (ownerUuid == null)      { clearRenderData(state); outcome("owner uuid not synced on the entity"); return false; }
         try {
             Object holder = cacheGetOrCreate.invoke(playerCache, ownerUuid);
-            if (holder == null || !isFemale(holder)) {
-                setRenderData.invoke(state, stateKey, (Object) null);   // clear stale data from a previous frame
+            if (holder == null) { clearRenderData(state); outcome("no Wildfire config for the owner"); return false; }
+            Object gender = genderOf(holder);
+            if (gender == null || !Boolean.TRUE.equals(genderCanHaveBreasts.invoke(gender))) {
+                clearRenderData(state);
+                outcome("owner gender " + gender + " has no chest - hidden");
                 return false;
             }
             Object genderState = genderRenderStateCtor.newInstance(holder, entity, state, partialTick);
             setRenderData.invoke(state, stateKey, genderState);
+            outcome("rendering: gender=" + gender + ", bust=" + fmtBust(genderState));
             return true;
         } catch (Throwable t) {
             if (!populateFailureLogged) {
                 populateFailureLogged = true;
                 LOG.warn("Female Gender Mod: could not build the chest render state for the companion", t);
             }
+            outcome("exception: " + t);
             return false;
         }
     }
 
-    private static boolean isFemale(Object holder) {
+    /** genderOf(holder) - the raw {@code Gender} enum value, or null when reflection fails. */
+    private static Object genderOf(Object holder) {
+        try { return valueGet.invoke(holderGender.invoke(holder)); } catch (Throwable t) { return null; }
+    }
+
+    /**
+     * The mod's layer refuses to draw below physics size 0.02, so report both the configured bust and the LIVE
+     * physics size: if the live size stays at 0 the mod's per-entity physics tick is not reaching our holder.
+     */
+    private static String fmtBust(Object genderState) {
         try {
-            Object value = holderGender.invoke(holder);
-            Object gender = valueGet.invoke(value);
-            return Boolean.TRUE.equals(genderCanHaveBreasts.invoke(gender));
-        } catch (Throwable ignored) {
-            return false;
-        }
+            float config = (Float) genderState.getClass().getField("bustSize").get(genderState);
+            Object phys = genderState.getClass().getField("leftBreastPhysics").get(genderState);
+            float live = (Float) phys.getClass().getMethod("getBreastSize").invoke(phys);
+            return String.format(java.util.Locale.ROOT, "%.2f, physics %s",
+                    config, live < 0.02f ? "TOO SMALL (" + live + ") - mod will not draw!" : "ok");
+        } catch (Throwable t) { return "?"; }
+    }
+
+    /** Clears stale render data from a previous frame so a gated-off chest can never keep drawing. */
+    private static void clearRenderData(HumanoidRenderState state) {
+        if (setRenderData == null || stateKey == null || state == null) return;
+        try { setRenderData.invoke(state, stateKey, (Object) null); } catch (Throwable ignored) { }
+    }
+
+    /** Logs {@code s} only when it differs from the previous outcome - one line per real state change. */
+    private static void outcome(String s) {
+        if (!s.equals(lastOutcome)) { lastOutcome = s; LOG.info("[companionmod] WGM chest: {}", s); }
     }
 
     /**

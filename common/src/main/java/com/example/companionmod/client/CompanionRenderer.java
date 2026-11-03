@@ -56,7 +56,8 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         // so slim arms get slim armor sleeves instead of wide sleeves clipping through.
         addLayer(new SelectableArmorLayer(this, wideArmor, ctx, false));
         addLayer(new SelectableArmorLayer(this, slimArmor, ctx, true));
-        addLayer(new FeminineChestLayer(this));
+        // No chest overlay of our own: when Wildfire's Female Gender Mod is installed its real GenderLayer
+        // draws the chest (fed by FemaleGenderCompat.populateRenderState), otherwise the companion is flat.
     }
 
     /**
@@ -107,7 +108,6 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
     public void extractRenderState(CompanionEntity entity, CompanionRenderState state, float partialTick) {
         super.extractRenderState(entity, state, partialTick);
         state.isPassenger = entity.isSitting();
-        state.feminine = entity.isFeminine();
         state.skin = entity.skin();
         state.speech = entity.speech();
         state.speechId = entity.speechId();
@@ -119,8 +119,8 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         state.injuredLeft = entity.injuredLeftTicks();
         resolveSkin(state, entity.skin(), entity.syncedOwner());
         // Wildfire's layer reads its data from the render state. The mod only fills it for players,
-        // so we build it from the owner's config; false means the fallback overlay should draw instead.
-        state.wildfireChest = FemaleGenderCompat.populateRenderState(state, entity, entity.syncedOwner(), partialTick);
+        // so we build it from the owner's config, gated by the companion's own feminine toggle.
+        FemaleGenderCompat.populateRenderState(state, entity, entity.syncedOwner(), partialTick);
     }
 
     private void resolveSkin(CompanionRenderState state, String name, UUID owner) {

@@ -1,6 +1,7 @@
 package com.example.companionmod.voice;
 
 import com.example.companionmod.client.CompanionRenderState;
+import com.example.companionmod.entity.CompanionEntity;
 import com.mojang.logging.LogUtils;
 import net.minecraft.client.model.HumanoidModel;
 import net.minecraft.client.renderer.entity.RenderLayerParent;
@@ -32,6 +33,7 @@ import java.util.UUID;
 public final class FemaleGenderCompat {
     private static Boolean present;
     private static boolean layerAttached;
+    private static String lastOutcome;             // diagnostics: log only when the outcome changes
 
     private static final Logger LOG = LogUtils.getLogger();
     private static boolean initDone;
@@ -92,40 +94,82 @@ public final class FemaleGenderCompat {
      * Fills the render state with a {@code GenderRenderState} built from the owner's Wildfire settings, which is
      * exactly what the mod's layer expects to find. Called from the companion's {@code extractRenderState}.
      *
-     * @return true when the mod's layer will draw the chest (so the fallback overlay must stay hidden)
+     * <p>Runs only while the companion's own feminine toggle is on: with the mod installed that switch decides
+     * <b>whether</b> the chest renders at all, the mod's data (owner's gender/UVs/physics) decides <b>how</b>.
+     * Without the mod the settings screen hides the switch and this method never gets past the layer check.</p>
+     *
+     * <p>Every distinct outcome logs one line (only when the outcome CHANGES, never per frame), so latest.log
+     * always states exactly why the chest did or did not render.</p>
+     *
+     * @return true when the mod's layer will draw the chest
      */
     public static boolean populateRenderState(HumanoidRenderState state, LivingEntity entity, UUID ownerUuid,
                                               float partialTick) {
-        if (!layerAttached || state == null || entity == null || ownerUuid == null) return false;
+        if (state == null || entity == null) return false;
+        if (!(entity instanceof CompanionEntity companion)) return false;
+        if (!layerAttached) {
+            outcome(isPresent() ? "layer not attached (see warning above)" : "mod not installed");
+            return false;
+        }
         init();
         if (playerCache == null || cacheGetOrCreate == null || genderRenderStateCtor == null
-                || stateKey == null || setRenderData == null) return false;
+                || stateKey == null || setRenderData == null) {
+            outcome("reflection incomplete (attempt " + initAttempts + "/5)");
+            return false;
+        }
+        if (!companion.isFeminine()) { clearRenderData(state); outcome("feminine toggle OFF"); return false; }
+        if (ownerUuid == null)      { clearRenderData(state); outcome("owner uuid not synced on the entity"); return false; }
         try {
             Object holder = cacheGetOrCreate.invoke(playerCache, ownerUuid);
-            if (holder == null || !isFemale(holder)) {
-                setRenderData.invoke(state, stateKey, (Object) null);   // clear stale data from a previous frame
+            if (holder == null) { clearRenderData(state); outcome("no Wildfire config for the owner"); return false; }
+            Object gender = genderOf(holder);
+            if (gender == null || !Boolean.TRUE.equals(genderCanHaveBreasts.invoke(gender))) {
+                clearRenderData(state);
+                outcome("owner gender " + gender + " has no chest - hidden");
                 return false;
             }
             Object genderState = genderRenderStateCtor.newInstance(holder, entity, state, partialTick);
             setRenderData.invoke(state, stateKey, genderState);
+            outcome("rendering: gender=" + gender + ", bust=" + fmtBust(genderState));
             return true;
         } catch (Throwable t) {
             if (!populateFailureLogged) {
                 populateFailureLogged = true;
                 LOG.warn("Female Gender Mod: could not build the chest render state for the companion", t);
             }
+            outcome("exception: " + t);
             return false;
         }
     }
 
-    private static boolean isFemale(Object holder) {
+    /** genderOf(holder) - the raw {@code Gender} enum value, or null when reflection fails. */
+    private static Object genderOf(Object holder) {
+        try { return valueGet.invoke(holderGender.invoke(holder)); } catch (Throwable t) { return null; }
+    }
+
+    /**
+     * The mod's layer refuses to draw below physics size 0.02, so report both the configured bust and the LIVE
+     * physics size: if the live size stays at 0 the mod's per-entity physics tick is not reaching our holder.
+     */
+    private static String fmtBust(Object genderState) {
         try {
-            Object value = holderGender.invoke(holder);
-            Object gender = valueGet.invoke(value);
-            return Boolean.TRUE.equals(genderCanHaveBreasts.invoke(gender));
-        } catch (Throwable ignored) {
-            return false;
-        }
+            float config = (Float) genderState.getClass().getField("bustSize").get(genderState);
+            Object phys = genderState.getClass().getField("leftBreastPhysics").get(genderState);
+            float live = (Float) phys.getClass().getMethod("getBreastSize").invoke(phys);
+            return String.format(java.util.Locale.ROOT, "%.2f, physics %s",
+                    config, live < 0.02f ? "TOO SMALL (" + live + ") - mod will not draw!" : "ok");
+        } catch (Throwable t) { return "?"; }
+    }
+
+    /** Clears stale render data from a previous frame so a gated-off chest can never keep drawing. */
+    private static void clearRenderData(HumanoidRenderState state) {
+        if (setRenderData == null || stateKey == null || state == null) return;
+        try { setRenderData.invoke(state, stateKey, (Object) null); } catch (Throwable ignored) { }
+    }
+
+    /** Logs {@code s} only when it differs from the previous outcome - one line per real state change. */
+    private static void outcome(String s) {
+        if (!s.equals(lastOutcome)) { lastOutcome = s; LOG.info("[companionmod] WGM chest: {}", s); }
     }
 
     /**

@@ -157,18 +157,21 @@ public class CompanionSettingsScreen extends Screen {
         this.addRenderableWidget(CycleButton.<String>builder(CompanionSettingsScreen::bodyName, config.companionBody == null ? "auto" : config.companionBody)
                 .withValues("auto", "slim", "classic")
                 .create(lx, y, colW - 24, 20, Component.literal("Body Type"), (b, v) -> config.companionBody = v));
-        femButton = Button.builder(Component.empty(), b -> {
-            feminine = !feminine;
+        if (com.example.companionmod.voice.FemaleGenderCompat.isPresent()) {   // only meaningful with Wildfire's mod
+            femButton = Button.builder(Component.empty(), b -> {
+                feminine = !feminine;
+                updateFemButton();
+            }).pos(lx + colW - 20, y).size(20, 20).build();
             updateFemButton();
-        }).pos(lx + colW - 20, y).size(20, 20).build();
-        updateFemButton();
-        this.addRenderableWidget(femButton);
+            this.addRenderableWidget(femButton);
+        }
         this.addRenderableWidget(new Slider(rx, y, colW, "Think Every", 15, 180, config.autonomyIntervalSeconds, 0, "s",
                 v -> config.autonomyIntervalSeconds = Math.round(v)));
     }
 
     /** Circle icon: filled pink = on, hollow grey = off. The state is only named in the hover tooltip. */
     private void updateFemButton() {
+        if (femButton == null) return;                          // hidden when Wildfire's mod is not installed
         femButton.setMessage(feminine
                 ? Component.literal("\u25CF").withStyle(ChatFormatting.LIGHT_PURPLE)
                 : Component.literal("\u25CB").withStyle(ChatFormatting.GRAY));
