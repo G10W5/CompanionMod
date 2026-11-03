@@ -84,6 +84,9 @@ public class CompanionSeekBlockGoal extends Goal {
     private int lastTaskSerial;      // MineTask.serial at the last tick: a new order drops stale state same-tick
     private Vec3 lastHeartbeatPos = new Vec3(0, -10000, 0);   // movement-gated progress heartbeat
     private boolean selected;        // goal selector has us running (see selected())
+    private int lastDescendY = Integer.MIN_VALUE;   // DESCEND: only trust slope-walks while height is actually lost
+    private long lastDescendDrop;
+    private String lastDiag = "";    // change-gated diagnostic lines (one per real state change, never per frame)
 
     public CompanionSeekBlockGoal(CompanionEntity mob) {
         this.mob = mob;
@@ -129,7 +132,14 @@ public class CompanionSeekBlockGoal extends Goal {
         approachTarget = pillarTarget = jumpCell = bridgeCell = null;
         pillarAir = 0;
         branchBoxed = 0;
+        lastDescendY = Integer.MIN_VALUE;
+        lastDiag = "";
         unreachable.clear();       // a fresh task retries every block: old "unreachable" marks must not leak into it
+    }
+
+    /** One diagnostic line per real state change - latest.log shows the movement state without flooding. */
+    private void diag(String s) {
+        if (!s.equals(lastDiag)) { lastDiag = s; LOG.info("[companionmod] seek: {}", s); }
     }
 
     // ------------------------------------------------------------------ main loop
@@ -249,11 +259,25 @@ public class CompanionSeekBlockGoal extends Goal {
                     t.phase = MineTask.Phase.BRANCH;
                     t.leg = 0;
                     t.legLen = 0;
+                    lastDescendY = Integer.MIN_VALUE;
                     say(level, "This depth looks right. Branch mining.", true);
-                } else if (walkDownSlope(level)) {                       // cave slope / pit edge: just walk down it
-                } else if (!planStep(level, t, Direction.from2DDataValue(t.dirData), -1, true)) {
-                    t.dirData = Direction.from2DDataValue(t.dirData).getClockWise().get2DDataValue();
-                    if (++stuck >= 4) { t.pause(); say(level, "I can't dig down safely here. Move me and say 'continue'.", true); }
+                } else {
+                    if (lastDescendY == Integer.MIN_VALUE || y < lastDescendY) {
+                        lastDescendY = y;
+                        lastDescendDrop = now;                          // height lost recently -> walkable slopes are fine
+                    }
+                    // Slope-walks are only trusted while they actually lose height. A path that walks
+                    // without descending used to refresh the progress heartbeat forever - the old
+                    // "stuck on planning and walking" loop. After 5 s without losing height: dig stairs.
+                    if (now - lastDescendDrop < 100 && walkDownSlope(level)) {
+                        diag("descending by walking (y=" + y + " -> ty=" + t.ty + ")");
+                    } else if (!planStep(level, t, Direction.from2DDataValue(t.dirData), -1, true)) {
+                        diag("cannot dig down at y=" + y + " dir=" + t.dirData + " stuck=" + stuck);
+                        t.dirData = Direction.from2DDataValue(t.dirData).getClockWise().get2DDataValue();
+                        if (++stuck >= 4) { t.pause(); say(level, "I can't dig down safely here. Move me and say 'continue'.", true); }
+                    } else {
+                        diag("digging stairs down (y=" + y + " -> ty=" + t.ty + ")");
+                    }
                 }
             }
             case BRANCH -> branch(level, t);
@@ -589,6 +613,8 @@ public class CompanionSeekBlockGoal extends Goal {
             }
             jumpCell = feet.immutable();
             pillarAir = 0;
+            diag("tower jump #" + pillarPlaced + " from y=" + String.format(java.util.Locale.ROOT, "%.1f", mob.getY())
+                    + " to cell y=" + jumpCell.getY());
             mob.getJumpControl().jump();
             return;
         }
@@ -607,6 +633,8 @@ public class CompanionSeekBlockGoal extends Goal {
             }
             jumpCell = null;
         } else if (pillarAir > 25) {
+            diag("TOWER JUMP DID NOT LIFT: y=" + String.format(java.util.Locale.ROOT, "%.2f", mob.getY())
+                    + " cell=" + jumpCell.getY() + " ground=" + mob.onGround() + " water=" + mob.isInWater());
             jumpCell = null;                                              // the jump did not happen (head bump, water): retry
         }
     }
@@ -800,6 +828,13 @@ public class CompanionSeekBlockGoal extends Goal {
         };
         if (arrived) { walkTo = null; nextScanAt = 0; lastProgress = now; mob.getNavigation().stop(); return; }
         PathNavigation nav = mob.getNavigation();
+        // Slope/step stalls: the path finished (or keeps ending) while the body stands still against a ledge.
+        // One log per distinct stall state so latest.log shows exactly where and why it stopped moving.
+        if (walkTicks > 60 && walkTicks % 40 == 0 && mob.position().distanceToSqr(lastHeartbeatPos) <= 0.25) {
+            diag("STUCK walking mode=" + walkMode + " retries=" + walkRetries + " navDone=" + nav.isDone()
+                    + " ground=" + mob.onGround() + " dy=" + (w.getY() - mob.getY())
+                    + " target=" + w + " at=" + mob.blockPosition());
+        }
         if (walkMode == WALK_EXPLORE) {
             // Look around while walking: the moment something matching is in sight, stop exploring and go for it.
             if (walkTicks % 10 == 0) {
@@ -839,6 +874,16 @@ public class CompanionSeekBlockGoal extends Goal {
         // Long walks use the pathfinder: re-request the path when it finished early or could not be made (airborne).
         if (walkTicks % 10 == 1 && nav.isDone() && mob.onGround()) {
             if (++walkRetries > 4) { failWalk(); return; }
+            // Ledge hop: the pathfinder marks a 1-block step as reachable but the body just stands against
+            // it ("stuck on slopes, can't jump"). One hop on the first retry, then normal re-pathing.
+            if (walkRetries == 1) {
+                double dx = w.getX() + 0.5 - mob.getX(), dz = w.getZ() + 0.5 - mob.getZ();
+                double dy = w.getY() - mob.getY();
+                if (dx * dx + dz * dz < 3.0 && dy > 0.3 && dy <= 1.6) {
+                    diag("ledge hop toward " + w + " (dy=" + String.format(java.util.Locale.ROOT, "%.2f", dy) + ")");
+                    mob.getJumpControl().jump();
+                }
+            }
             nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, walkMode == WALK_FREE ? 1.0 : 1.1);
         }
         if (walkTicks > 160) failWalk();

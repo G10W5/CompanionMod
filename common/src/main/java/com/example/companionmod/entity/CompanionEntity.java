@@ -321,10 +321,15 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     public void clearBuild() { buildSchematic = ""; }
 
     public String seekBlock() { return mineTask.exists() ? mineTask.blockId : ""; }
-    /** Starts (or restarts) a mining job; a blank id cancels it. */
+    /** Starts (or restarts) a mining job; a blank id cancels it. Re-issuing the SAME id never resets progress. */
     public void setSeekBlock(String blockId) {
-        if (blockId == null || blockId.isBlank()) mineTask.finish();
-        else {
+        if (blockId == null || blockId.isBlank()) {
+            mineTask.finish();
+        } else if (mineTask.exists() && mineTask.blockId.equals(blockId)) {
+            // The model/plans re-issue the same order constantly; restarting reset mined to 0 every time,
+            // so the job could never finish and the companion looked obsessed (always iron, never done).
+            mineTask.resume();
+        } else {
             boolean nether = level().dimension() == net.minecraft.world.level.Level.NETHER;
             mineTask.begin(blockId, nether, getDirection().get2DDataValue());
         }
@@ -480,12 +485,18 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
                 getNavigation().stop();
                 speak("Digging up.");
             }
-            case FARM -> { farmUntil = level().getGameTime() + 600; setAnchor(blockPosition()); speak("Farming."); }
-            case FISH -> { fishUntil = level().getGameTime() + 600; setAnchor(blockPosition()); speak("Going fishing."); }
+            case FARM -> {
+                clearSeekBlock();      // a running mine task has HIGHER goal priority: without this it starved every job order
+                farmUntil = level().getGameTime() + 600; setAnchor(blockPosition()); speak("Farming.");
+            }
+            case FISH -> {
+                clearSeekBlock();
+                fishUntil = level().getGameTime() + 600; setAnchor(blockPosition()); speak("Going fishing.");
+            }
             case BUILD -> {
                 String name = target == null ? "" : target.trim().toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9_\\-]", "_");
                 if (name.isEmpty()) speak("Build what? Give me a schematic name.");
-                else { buildSchematic = name; setAnchor(blockPosition()); speak("Building " + name + "."); }
+                else { clearSeekBlock(); buildSchematic = name; setAnchor(blockPosition()); speak("Building " + name + "."); }
             }
             case REMEMBER, FORGET -> { /* handled client-side by CompanionMemory */ }
             default -> { }

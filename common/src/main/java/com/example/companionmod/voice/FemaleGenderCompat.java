@@ -245,10 +245,12 @@ public final class FemaleGenderCompat {
 
     /**
      * Submit-phase probe: the mod's GenderLayer reads the render data during submit, so if it vanished between
-     * extract and submit that is the bug. Only logs on FAILURE (presence is the normal state - no line).
+     * extract and submit that is the bug. Only runs when we EXPECT data (wgmData set) - otherwise a gated-off
+     * chest would log a "failure" every frame.
      */
     public static void verifyAtSubmit(HumanoidRenderState state) {
         if (getRenderData == null || stateKey == null) return;
+        if (state == null || !(state instanceof CompanionRenderState cs) || cs.wgmData == null) return;
         try {
             if (getRenderData.invoke(state, stateKey) == null) outcome("submit: DATA MISSING - cleared between extract and submit!");
         } catch (Throwable ignored) { }
