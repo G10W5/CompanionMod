@@ -5,12 +5,14 @@ import com.example.companionmod.voice.LevelMeter;
 import com.example.companionmod.voice.MicCapture;
 import com.example.companionmod.voice.OllamaCatalog;
 import com.example.companionmod.voice.VoiceConfig;
+import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.AbstractSliderButton;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.CycleButton;
 import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
 import net.minecraft.client.input.MouseButtonEvent;
@@ -58,6 +60,7 @@ public class CompanionSettingsScreen extends Screen {
     private CompanionDropdowns dropdowns;
     private Dropdown chatDd, sttDd, ttsDd, voiceDd, micDd, spkDd;
     private EditBox hostBox;
+    private Button femButton;
     private final List<Dropdown> editables = new ArrayList<>();
 
     // server catalog (survives tab switches and resizes)
@@ -147,16 +150,29 @@ public class CompanionSettingsScreen extends Screen {
         toggle(rx, y, colW, "Autonomy", config.autonomyEnabled, v -> config.autonomyEnabled = v);
         y += ROW;
 
-        toggle(lx, y, colW, "Memory", config.memoryEnabled, v -> config.memoryEnabled = v);
-        toggle(rx, y, colW, "Feminine Model", feminine, v -> feminine = v);
+        toggle(lx, y, iw, "Memory", config.memoryEnabled, v -> config.memoryEnabled = v);
         y += ROW;
 
         // 26.1-CHECK: CycleButton.builder signature (copied unchanged from the old screen)
         this.addRenderableWidget(CycleButton.<String>builder(CompanionSettingsScreen::bodyName, config.companionBody == null ? "auto" : config.companionBody)
                 .withValues("auto", "slim", "classic")
-                .create(lx, y, colW, 20, Component.literal("Body Type"), (b, v) -> config.companionBody = v));
+                .create(lx, y, colW - 24, 20, Component.literal("Body Type"), (b, v) -> config.companionBody = v));
+        femButton = Button.builder(Component.empty(), b -> {
+            feminine = !feminine;
+            updateFemButton();
+        }).pos(lx + colW - 20, y).size(20, 20).build();
+        updateFemButton();
+        this.addRenderableWidget(femButton);
         this.addRenderableWidget(new Slider(rx, y, colW, "Think Every", 15, 180, config.autonomyIntervalSeconds, 0, "s",
                 v -> config.autonomyIntervalSeconds = Math.round(v)));
+    }
+
+    /** Circle icon: filled pink = on, hollow grey = off. The state is only named in the hover tooltip. */
+    private void updateFemButton() {
+        femButton.setMessage(feminine
+                ? Component.literal("\u25CF").withStyle(ChatFormatting.LIGHT_PURPLE)
+                : Component.literal("\u25CB").withStyle(ChatFormatting.GRAY));
+        femButton.setTooltip(Tooltip.create(Component.literal(feminine ? "Feminine: On" : "Feminine: Off")));
     }
 
     private void buildAi() {

@@ -2274,12 +2274,14 @@ import com.example.companionmod.voice.LevelMeter;
 import com.example.companionmod.voice.MicCapture;
 import com.example.companionmod.voice.OllamaCatalog;
 import com.example.companionmod.voice.VoiceConfig;
+import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.AbstractSliderButton;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.CycleButton;
 import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
 import net.minecraft.client.input.MouseButtonEvent;
@@ -2327,6 +2329,7 @@ public class CompanionSettingsScreen extends Screen {
     private CompanionDropdowns dropdowns;
     private Dropdown chatDd, sttDd, ttsDd, voiceDd, micDd, spkDd;
     private EditBox hostBox;
+    private Button femButton;
     private final List<Dropdown> editables = new ArrayList<>();
 
     // server catalog (survives tab switches and resizes)
@@ -2416,16 +2419,29 @@ public class CompanionSettingsScreen extends Screen {
         toggle(rx, y, colW, "Autonomy", config.autonomyEnabled, v -> config.autonomyEnabled = v);
         y += ROW;
 
-        toggle(lx, y, colW, "Memory", config.memoryEnabled, v -> config.memoryEnabled = v);
-        toggle(rx, y, colW, "Feminine Model", feminine, v -> feminine = v);
+        toggle(lx, y, iw, "Memory", config.memoryEnabled, v -> config.memoryEnabled = v);
         y += ROW;
 
         // 26.1-CHECK: CycleButton.builder signature (copied unchanged from the old screen)
         this.addRenderableWidget(CycleButton.<String>builder(CompanionSettingsScreen::bodyName, config.companionBody == null ? "auto" : config.companionBody)
                 .withValues("auto", "slim", "classic")
-                .create(lx, y, colW, 20, Component.literal("Body Type"), (b, v) -> config.companionBody = v));
+                .create(lx, y, colW - 24, 20, Component.literal("Body Type"), (b, v) -> config.companionBody = v));
+        femButton = Button.builder(Component.empty(), b -> {
+            feminine = !feminine;
+            updateFemButton();
+        }).pos(lx + colW - 20, y).size(20, 20).build();
+        updateFemButton();
+        this.addRenderableWidget(femButton);
         this.addRenderableWidget(new Slider(rx, y, colW, "Think Every", 15, 180, config.autonomyIntervalSeconds, 0, "s",
                 v -> config.autonomyIntervalSeconds = Math.round(v)));
+    }
+
+    /** Circle icon: filled pink = on, hollow grey = off. The state is only named in the hover tooltip. */
+    private void updateFemButton() {
+        femButton.setMessage(feminine
+                ? Component.literal("\u25CF").withStyle(ChatFormatting.LIGHT_PURPLE)
+                : Component.literal("\u25CB").withStyle(ChatFormatting.GRAY));
+        femButton.setTooltip(Tooltip.create(Component.literal(feminine ? "Feminine: On" : "Feminine: Off")));
     }
 
     private void buildAi() {
@@ -8109,14 +8125,16 @@ public class AudioRecorder {
 package com.example.companionmod.voice;
 
 import com.example.companionmod.client.CompanionRenderState;
+import com.mojang.logging.LogUtils;
 import net.minecraft.client.model.HumanoidModel;
 import net.minecraft.client.renderer.entity.RenderLayerParent;
 import net.minecraft.client.renderer.entity.layers.RenderLayer;
 import net.minecraft.client.renderer.entity.state.HumanoidRenderState;
 import net.minecraft.world.entity.LivingEntity;
 
+import org.slf4j.Logger;
+
 import java.lang.reflect.Constructor;
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.UUID;
 
@@ -8139,7 +8157,10 @@ public final class FemaleGenderCompat {
     private static Boolean present;
     private static boolean layerAttached;
 
-    private static boolean initTried;
+    private static final Logger LOG = LogUtils.getLogger();
+    private static boolean initDone;
+    private static int initAttempts;
+    private static boolean populateFailureLogged;
     private static Object playerCache;                  // WildfireClientAPI.players()
     private static Method cacheGetOrCreate;             // EntityCache.getOrCreate(UUID)
     private static Method holderGender;                 // EntityConfigHolder.gender()
@@ -8147,7 +8168,7 @@ public final class FemaleGenderCompat {
     private static Method genderCanHaveBreasts;         // Gender.canHaveBreasts()
     private static Constructor<?> genderRenderStateCtor;// GenderRenderState(holder, entity, state, partialTick)
     private static Object stateKey;                     // ClientHelper impl's static STATE ContextKey
-    private static Method setRenderData;                // HumanoidRenderState.setRenderData(ContextKey, Object)
+    private static Method setRenderData;                // NeoForge: setRenderData(ContextKey, Object); Fabric: setData(RenderStateDataKey, Object)
 
     private FemaleGenderCompat() {}
 
@@ -8176,13 +8197,17 @@ public final class FemaleGenderCompat {
         if (!isPresent()) return null;
         init();
         if (playerCache == null || cacheGetOrCreate == null || genderRenderStateCtor == null
-                || stateKey == null || setRenderData == null) return null;
+                || stateKey == null || setRenderData == null) {
+            LOG.warn("Female Gender Mod is installed but its chest layer cannot be attached; using the built-in overlay");
+            return null;
+        }
         try {
             Class<?> layerClass = Class.forName("com.wildfire.client.render.GenderLayer");
             Object layer = layerClass.getConstructor(RenderLayerParent.class).newInstance(parent);
             layerAttached = true;
             return (RenderLayer<CompanionRenderState, HumanoidModel<CompanionRenderState>>) layer;
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            LOG.warn("Female Gender Mod: GenderLayer could not be constructed", t);
             return null;
         }
     }
@@ -8208,7 +8233,11 @@ public final class FemaleGenderCompat {
             Object genderState = genderRenderStateCtor.newInstance(holder, entity, state, partialTick);
             setRenderData.invoke(state, stateKey, genderState);
             return true;
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            if (!populateFailureLogged) {
+                populateFailureLogged = true;
+                LOG.warn("Female Gender Mod: could not build the chest render state for the companion", t);
+            }
             return false;
         }
     }
@@ -8223,9 +8252,14 @@ public final class FemaleGenderCompat {
         }
     }
 
+    /**
+     * Resolves every Wildfire class/method we call. Retries a few times (the mod's services may not be up on the very
+     * first frame) and logs exactly what is missing, so a failure shows up in latest.log instead of a silent no-chest.
+     */
     private static synchronized void init() {
-        if (initTried) return;
-        initTried = true;
+        if (initDone || initAttempts >= 5) return;
+        initAttempts++;
+        StringBuilder problems = new StringBuilder();
         try {
             Class<?> api = Class.forName("com.wildfire.api.client.WildfireClientAPI");
             playerCache = api.getMethod("players").invoke(null);
@@ -8236,15 +8270,40 @@ public final class FemaleGenderCompat {
             genderCanHaveBreasts = Class.forName("com.wildfire.api.Gender").getMethod("canHaveBreasts");
             genderRenderStateCtor = Class.forName("com.wildfire.client.render.GenderRenderState")
                     .getConstructor(holderClass, LivingEntity.class, HumanoidRenderState.class, float.class);
-        } catch (Throwable ignored) { }
+        } catch (Throwable t) {
+            problems.append("\n  config/API lookup failed: ").append(t);
+        }
         try {
             Class<?> helper = Class.forName("com.wildfire.client.ClientHelper");
             Object instance = helper.getField("INSTANCE").get(null);
-            Field keyField = instance.getClass().getField("STATE");
-            stateKey = keyField.get(null);
-            Class<?> contextKey = Class.forName("net.minecraft.util.context.ContextKey");
-            setRenderData = HumanoidRenderState.class.getMethod("setRenderData", contextKey, Object.class);
-        } catch (Throwable ignored) { }
+            // NeoClientHelper.STATE is a ContextKey, FabricClientHelper.STATE is a Fabric RenderStateDataKey
+            stateKey = instance.getClass().getField("STATE").get(null);
+            setRenderData = findSetter(stateKey);
+            if (setRenderData == null) {
+                problems.append("\n  no render-state setter accepts a ").append(stateKey.getClass().getName());
+            }
+        } catch (Throwable t) {
+            problems.append("\n  render-state key lookup failed: ").append(t);
+        }
+        if (playerCache != null && cacheGetOrCreate != null && genderRenderStateCtor != null
+                && stateKey != null && setRenderData != null) {
+            initDone = true;
+            LOG.info("Female Gender Mod hookup ready (render-state setter: {})", setRenderData.getName());
+        } else {
+            LOG.warn("Female Gender Mod hookup incomplete (attempt {}/5){}", initAttempts, problems);
+        }
+    }
+
+    /** NeoForge exposes {@code setRenderData(ContextKey, Object)}, Fabric API exposes {@code setData(RenderStateDataKey, Object)}. */
+    private static Method findSetter(Object key) {
+        if (key == null) return null;
+        for (Method m : HumanoidRenderState.class.getMethods()) {
+            if (m.getParameterCount() != 2) continue;
+            String n = m.getName();
+            if (!n.equals("setRenderData") && !n.equals("setData")) continue;
+            if (m.getParameterTypes()[0].isInstance(key)) return m;
+        }
+        return null;
     }
 
     private static boolean classExists(String name) {
