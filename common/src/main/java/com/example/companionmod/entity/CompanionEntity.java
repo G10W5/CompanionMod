@@ -4,6 +4,7 @@ import com.example.companionmod.command.CompanionCommand;
 import com.example.companionmod.entity.ai.CompanionBuildGoal;
 import com.example.companionmod.entity.ai.CompanionFarmGoal;
 import com.example.companionmod.entity.ai.CompanionFollowGoal;
+import com.example.companionmod.entity.ai.CompanionMeleeGoal;
 import com.example.companionmod.entity.ai.CompanionFishGoal;
 import com.example.companionmod.entity.ai.CompanionPatrolGoal;
 import com.example.companionmod.entity.ai.CompanionPickupGoal;
@@ -46,7 +47,6 @@ import net.minecraft.world.entity.ai.attributes.AttributeSupplier;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.ai.goal.FloatGoal;
 import net.minecraft.world.entity.ai.goal.LookAtPlayerGoal;
-import net.minecraft.world.entity.ai.goal.MeleeAttackGoal;
 import net.minecraft.world.entity.ai.goal.OpenDoorGoal;
 import net.minecraft.world.entity.ai.goal.RandomLookAroundGoal;
 import net.minecraft.world.entity.ai.navigation.GroundPathNavigation;
@@ -98,6 +98,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     private static final EntityDataAccessor<Integer> DATA_INJURED = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
     private static final EntityDataAccessor<Float> DATA_REVIVE = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.FLOAT);
     private static final EntityDataAccessor<Integer> DATA_INJURED_LEFT = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
+    private LivingEntity lastTargetSeen;      // combat chaining: our target as of the previous tick
+    private int lastKillAt = -1000;           // when it died: chooseTarget chains to the next enemy for ~10 s
 
     /** Aliases the language model is likely to produce -> real block ids or family ids. */
     private static final Map<String, String> BLOCK_ALIASES = Map.ofEntries(
@@ -193,7 +195,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         goalSelector.addGoal(0, new FloatGoal(this));
         goalSelector.addGoal(1, new CompanionSitGoal(this));
         goalSelector.addGoal(1, new OpenDoorGoal(this, true));   // villager-style: open wooden doors on the path, close behind
-        goalSelector.addGoal(2, new MeleeAttackGoal(this, 1.25, true));
+        goalSelector.addGoal(2, new CompanionMeleeGoal(this, 1.25, true));   // + creeper hit-and-run (attack - retreat - attack)
         seekGoal = new com.example.companionmod.entity.ai.CompanionSeekBlockGoal(this);
         goalSelector.addGoal(2, seekGoal);                           // explicit "find diamonds" pre-empts walking
         goalSelector.addGoal(3, new CompanionPickupGoal(this));      // explicit "pick this up" pre-empts walking
@@ -897,27 +899,34 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         if (isSitting() || stance() == Stance.PASSIVE || isInjured()) return null;
         if (forcedTarget != null && (!forcedTarget.isAlive() || tickCount > forcedTargetUntil)) forcedTarget = null;
         if (forcedTarget != null) return forcedTarget;
+        // Combat chaining: right after a kill keep fighting instead of walking back to the owner first.
+        boolean combatChain = tickCount - lastKillAt < 200;
         if (owner != null) {
             LivingEntity a = owner.getLastHurtByMob();
             if (a != null && owner.tickCount - owner.getLastHurtByMobTimestamp() < 200 && isValidTarget(a, owner) && visibleOrAggro(a, owner)) return a;
             LivingEntity b = owner.getLastHurtMob();
-            if (b != null && owner.tickCount - owner.getLastHurtMobTimestamp() < 200 && isValidTarget(b, owner) && visibleOrAggro(b, owner)) return b;
+            // Explicit hit = order to help: no LOS/aggro requirement (creepers and other calm mobs never
+            // retaliate, which made "I hit it, you help" silently fail), just a sane chase range.
+            if (b != null && owner.tickCount - owner.getLastHurtMobTimestamp() < 200
+                    && isValidTarget(b, owner) && owner.distanceToSqr(b) < 30 * 30) return b;
         }
         LivingEntity c = getLastHurtByMob();
         if (c != null && c.isAlive() && c != owner && !(c instanceof CompanionEntity) && !(c instanceof Player) && visibleOrAggro(c, owner)) return c;
 
         boolean mining = mineTask().running();
         // While a mining job is running, only an adjacent threat interrupts it (a far zombie must not stall the dig).
-        double r = mining ? 4 : (stance() == Stance.GUARD ? 16 : 6);
-        var centre = (owner != null && moveMode() == MoveMode.FOLLOW) ? owner : this;
+        double r = mining ? 4 : (combatChain ? 24 : (stance() == Stance.GUARD ? 16 : 6));
+        var centre = combatChain ? this
+                : ((owner != null && moveMode() == MoveMode.FOLLOW) ? owner : this);
         List<LivingEntity> near = level().getEntitiesOfClass(LivingEntity.class, centre.getBoundingBox().inflate(r),
                 e -> isValidTarget(e, owner) && distanceToSqr(e) < (mining ? 8 * 8 : 28 * 28));
         LivingEntity best = null;
         double bestD = Double.MAX_VALUE;
         for (LivingEntity e : near) {
             Mob asMob = e instanceof Mob m ? m : null;
-            // DEFENSIVE only reacts to mobs that are actually coming for us or the owner
-            if (stance() == Stance.DEFENSIVE && asMob != null && asMob.getTarget() != owner && asMob.getTarget() != this) continue;
+            // DEFENSIVE only reacts to mobs that are actually coming for us or the owner - unless we just
+            // killed something and the next hostile is standing right there (chain the fight).
+            if (stance() == Stance.DEFENSIVE && !combatChain && asMob != null && asMob.getTarget() != owner && asMob.getTarget() != this) continue;
             // No attacking through walls: a mob we cannot see only counts if it is already fighting the owner,
             // or (when aggressive) fighting the companion itself. Everything else must be visible. Closer wins.
             if (!getSensing().hasLineOfSight(e)) {
@@ -1227,6 +1236,15 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             if (!claimRegistry()) return;       // stale duplicate: it dropped its bag and removed itself
         }
         if (tickCount % 10 == 0) refreshTaskText();
+        // Combat chaining bookkeeping: when our target dies, open a window in which chooseTarget keeps
+        // picking the next nearby hostile (wider radius, no "must be attacking us" filter) instead of
+        // wandering back to the owner between kills.
+        if (lastTargetSeen != null) {
+            if (!lastTargetSeen.isAlive()) lastKillAt = tickCount;
+            lastTargetSeen = null;
+        }
+        LivingEntity nowTarget = getTarget();
+        if (nowTarget != null && nowTarget.isAlive()) lastTargetSeen = nowTarget;
         if (isSitting()) {
             getNavigation().stop();
             if (tickCount % 40 == 0) heal(1.0f);               // resting heals

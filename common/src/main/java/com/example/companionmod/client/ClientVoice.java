@@ -157,6 +157,7 @@ public final class ClientVoice {
 
         CompanionEntity companion = findCompanion(mc);
         if (companion != null) {
+            com.example.companionmod.voice.FemaleGenderCompat.tickPhysics(companion);   // our holder isn't ticked by WGM
             CompanionMemory.tick(mc, companion);
             syncEntitySettings(mc, companion);
             handleReviveInput(mc, companion);

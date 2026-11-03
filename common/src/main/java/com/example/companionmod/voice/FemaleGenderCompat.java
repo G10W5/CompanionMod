@@ -23,12 +23,14 @@ import java.util.UUID;
  * {@code HumanoidRenderState}/{@code HumanoidModel}, so it <b>can</b> be attached to the companion's renderer
  * (the old player-typed layer could not). The layer reads its data from the render state through
  * {@code ClientHelper.getRenderState(state)}; the mod only fills that for players / mannequins / armor stands,
- * so we fill it ourselves from the <b>owner's</b> Wildfire configuration. The result is the mod's real chest
- * model, UV layouts, physics, jacket overlay and textures on the companion - not our own approximation.</p>
+ * so we fill it ourselves - from a <b>companion-owned</b> Wildfire config holder whose gender is always
+ * FEMALE (set once, never touching disk/cloud). The owner's own gender therefore does NOT matter: a male
+ * player still gets the companion's female chest. The result is the mod's real chest model, UV layouts,
+ * physics, jacket overlay and textures - not our own approximation. We tick the holder's breast physics
+ * ourselves each client tick because the mod only ticks players/mannequins/armor stands.</p>
  *
  * <p>Everything is reflective (no compile-time dependency, no crash when the mod is absent or on a loader where
- * the render-data setter is unavailable). When the layer cannot be attached, or the owner's gender has no
- * chest, the renderer falls back to its own overlay.</p>
+ * the render-data setter is unavailable). The settings screen hides the feminine switch without the mod.</p>
  */
 public final class FemaleGenderCompat {
     private static Boolean present;
@@ -39,12 +41,17 @@ public final class FemaleGenderCompat {
     private static boolean initDone;
     private static int initAttempts;
     private static boolean populateFailureLogged;
-    private static Object playerCache;                  // WildfireClientAPI.players()
-    private static Method cacheGetOrCreate;             // EntityCache.getOrCreate(UUID)
     private static Method holderGender;                 // EntityConfigHolder.gender()
     private static Method valueGet;                     // ConfigValue.get()
     private static Method genderCanHaveBreasts;         // Gender.canHaveBreasts()
     private static Constructor<?> genderRenderStateCtor;// GenderRenderState(holder, entity, state, partialTick)
+    private static Constructor<?> holderCtor;           // new PlayerConfigHolder(UUID) - companion's own config
+    private static Method genderUpdate;                 // ConfigValue.update(value) - force FEMALE on our holder
+    private static Object femaleConst;                  // Gender.FEMALE
+    private static Method breastPhysics;                // EntityConfigHolder.breastPhysics()
+    private static Method physicsTick;                  // BothBreastsPhysics.tick(entity) - we tick it ourselves
+    private static Object companionHolder;              // cached own-holder (created once per companion)
+    private static UUID companionHolderId;
     private static Object stateKey;                     // ClientHelper impl's static STATE ContextKey
     private static Method setRenderData;                // NeoForge: setRenderData(ContextKey, Object); Fabric: setData(RenderStateDataKey, Object)
     private static Method getRenderData;                // read-back check: proves the layer can find our data
@@ -75,9 +82,9 @@ public final class FemaleGenderCompat {
             RenderLayerParent<CompanionRenderState, HumanoidModel<CompanionRenderState>> parent) {
         if (!isPresent()) return null;
         init();
-        if (playerCache == null || cacheGetOrCreate == null || genderRenderStateCtor == null
-                || stateKey == null || setRenderData == null) {
-            LOG.warn("Female Gender Mod is installed but its chest layer cannot be attached; using the built-in overlay");
+        if (genderRenderStateCtor == null || stateKey == null || setRenderData == null
+                || holderCtor == null || genderUpdate == null || femaleConst == null) {
+            LOG.warn("Female Gender Mod is installed but its chest layer cannot be attached (see hookup log)");
             return null;
         }
         try {
@@ -92,20 +99,16 @@ public final class FemaleGenderCompat {
     }
 
     /**
-     * Fills the render state with a {@code GenderRenderState} built from the owner's Wildfire settings, which is
-     * exactly what the mod's layer expects to find. Called from the companion's {@code extractRenderState}.
+     * Fills the render state with a {@code GenderRenderState} built from the companion's OWN Wildfire config
+     * holder (gender always FEMALE) - exactly what the mod's layer expects. Called from extractRenderState.
      *
-     * <p>Runs only while the companion's own feminine toggle is on: with the mod installed that switch decides
-     * <b>whether</b> the chest renders at all, the mod's data (owner's gender/UVs/physics) decides <b>how</b>.
-     * Without the mod the settings screen hides the switch and this method never gets past the layer check.</p>
-     *
-     * <p>Every distinct outcome logs one line (only when the outcome CHANGES, never per frame), so latest.log
-     * always states exactly why the chest did or did not render.</p>
+     * <p>Runs only while the companion's feminine toggle is on: with the mod installed that switch decides
+     * <b>whether</b> the chest renders; the owner's gender is irrelevant (a male player still gets the chest).
+     * Every distinct outcome logs one line (only when it CHANGES), so latest.log always states why.</p>
      *
      * @return true when the mod's layer will draw the chest
      */
-    public static boolean populateRenderState(HumanoidRenderState state, LivingEntity entity, UUID ownerUuid,
-                                              float partialTick) {
+    public static boolean populateRenderState(HumanoidRenderState state, LivingEntity entity, float partialTick) {
         if (state == null || entity == null) return false;
         if (!(entity instanceof CompanionEntity companion)) return false;
         if (!layerAttached) {
@@ -113,22 +116,15 @@ public final class FemaleGenderCompat {
             return false;
         }
         init();
-        if (playerCache == null || cacheGetOrCreate == null || genderRenderStateCtor == null
-                || stateKey == null || setRenderData == null) {
+        if (genderRenderStateCtor == null || stateKey == null || setRenderData == null
+                || holderCtor == null || genderUpdate == null || femaleConst == null) {
             outcome("reflection incomplete (attempt " + initAttempts + "/5)");
             return false;
         }
         if (!companion.isFeminine()) { clearRenderData(state); outcome("feminine toggle OFF"); return false; }
-        if (ownerUuid == null)      { clearRenderData(state); outcome("owner uuid not synced on the entity"); return false; }
         try {
-            Object holder = cacheGetOrCreate.invoke(playerCache, ownerUuid);
-            if (holder == null) { clearRenderData(state); outcome("no Wildfire config for the owner"); return false; }
+            Object holder = ensureHolder(companion.getUUID());
             Object gender = genderOf(holder);
-            if (gender == null || !Boolean.TRUE.equals(genderCanHaveBreasts.invoke(gender))) {
-                clearRenderData(state);
-                outcome("owner gender " + gender + " has no chest - hidden");
-                return false;
-            }
             Object genderState = genderRenderStateCtor.newInstance(holder, entity, state, partialTick);
             setRenderData.invoke(state, stateKey, genderState);
             if (state instanceof CompanionRenderState cs) cs.wgmData = genderState;   // stash for the submit phase
@@ -145,6 +141,48 @@ public final class FemaleGenderCompat {
             }
             outcome("exception: " + t);
             return false;
+        }
+    }
+
+    /**
+     * The companion's own config holder: created once per companion UUID, gender forced to FEMALE.
+     * Never calls loadGenderInfo, so no disk read and no cloud fetch can fail or lag it.
+     */
+    private static Object ensureHolder(UUID id) throws Throwable {
+        if (companionHolder == null || !id.equals(companionHolderId)) {
+            companionHolder = holderCtor.newInstance(id);
+            companionHolderId = id;
+            genderUpdate.invoke(holderGender.invoke(companionHolder), femaleConst);
+        }
+        return companionHolder;
+    }
+
+    /**
+     * Once per client tick: the mod only ticks breast physics for players/mannequins/armor stands, so the
+     * companion's holder would stay at size 0 (and the mod's layer refuses to draw below 0.02) without this.
+     */
+    public static void tickPhysics(LivingEntity companion) {
+        if (companionHolder == null || breastPhysics == null || physicsTick == null) return;
+        try { physicsTick.invoke(breastPhysics.invoke(companionHolder), companion); } catch (Throwable ignored) { }
+    }
+
+    /**
+     * WGM's breast-shaped armor layer ({@code GenderArmorLayer}): draws the chestplate over the female chest
+     * so armor actually renders on it. Needs the vanilla EquipmentLayerRenderer the armor layers already use.
+     */
+    @SuppressWarnings("unchecked")
+    public static RenderLayer<CompanionRenderState, HumanoidModel<CompanionRenderState>> createArmorLayer(
+            RenderLayerParent<CompanionRenderState, HumanoidModel<CompanionRenderState>> parent,
+            Object equipmentRenderer) {
+        if (!isPresent() || !layerAttached || equipmentRenderer == null) return null;
+        try {
+            Class<?> cls = Class.forName("com.wildfire.client.render.GenderArmorLayer");
+            Class<?> eq = Class.forName("net.minecraft.client.renderer.entity.layers.EquipmentLayerRenderer");
+            Object layer = cls.getConstructor(RenderLayerParent.class, eq).newInstance(parent, equipmentRenderer);
+            return (RenderLayer<CompanionRenderState, HumanoidModel<CompanionRenderState>>) layer;
+        } catch (Throwable t) {
+            LOG.warn("Female Gender Mod: GenderArmorLayer could not be constructed", t);
+            return null;
         }
     }
 
@@ -225,15 +263,18 @@ public final class FemaleGenderCompat {
         initAttempts++;
         StringBuilder problems = new StringBuilder();
         try {
-            Class<?> api = Class.forName("com.wildfire.api.client.WildfireClientAPI");
-            playerCache = api.getMethod("players").invoke(null);
-            cacheGetOrCreate = Class.forName("com.wildfire.api.EntityCache").getMethod("getOrCreate", UUID.class);
             Class<?> holderClass = Class.forName("com.wildfire.common.entities.EntityConfigHolder");
             holderGender = holderClass.getMethod("gender");
             valueGet = Class.forName("com.wildfire.common.config.value.ConfigValue").getMethod("get");
             genderCanHaveBreasts = Class.forName("com.wildfire.api.Gender").getMethod("canHaveBreasts");
             genderRenderStateCtor = Class.forName("com.wildfire.client.render.GenderRenderState")
                     .getConstructor(holderClass, LivingEntity.class, HumanoidRenderState.class, float.class);
+            // companion-owned holder: constructor + force-FEMALE + physics ticking (no loadGenderInfo -> no IO)
+            holderCtor = Class.forName("com.wildfire.common.entities.players.PlayerConfigHolder").getConstructor(UUID.class);
+            genderUpdate = Class.forName("com.wildfire.common.config.value.ConfigValue").getMethod("update", Object.class);
+            femaleConst = Class.forName("com.wildfire.api.Gender").getField("FEMALE").get(null);
+            breastPhysics = holderClass.getMethod("breastPhysics");
+            physicsTick = Class.forName("com.wildfire.client.physics.BothBreastsPhysics").getMethod("tick", LivingEntity.class);
         } catch (Throwable t) {
             problems.append("\n  config/API lookup failed: ").append(t);
         }
@@ -250,8 +291,8 @@ public final class FemaleGenderCompat {
         } catch (Throwable t) {
             problems.append("\n  render-state key lookup failed: ").append(t);
         }
-        if (playerCache != null && cacheGetOrCreate != null && genderRenderStateCtor != null
-                && stateKey != null && setRenderData != null) {
+        if (genderRenderStateCtor != null && stateKey != null && setRenderData != null
+                && holderCtor != null && genderUpdate != null && femaleConst != null && breastPhysics != null && physicsTick != null) {
             initDone = true;
             LOG.info("Female Gender Mod hookup ready (render-state setter: {})", setRenderData.getName());
         } else {

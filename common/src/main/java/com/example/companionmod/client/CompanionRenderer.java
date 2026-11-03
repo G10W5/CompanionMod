@@ -13,6 +13,7 @@ import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.renderer.entity.ArmorModelSet;
 import net.minecraft.client.renderer.entity.EntityRendererProvider;
 import net.minecraft.client.renderer.entity.HumanoidMobRenderer;
+import net.minecraft.client.renderer.entity.layers.EquipmentLayerRenderer;
 import net.minecraft.client.renderer.entity.layers.HumanoidArmorLayer;
 import net.minecraft.client.renderer.entity.layers.RenderLayer;
 import net.minecraft.client.renderer.rendertype.RenderType;
@@ -43,11 +44,13 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
     private static final float SUBTITLE_SCALE = 0.025f;
 
     private final PlayerSkinRenderCache skinCache;
+    private final EquipmentLayerRenderer equipmentRenderer;   // for WGM's breast-shaped armor layer
     private boolean genderLayerTried;           // Wildfire layer is attached lazily on the first draw
 
     public CompanionRenderer(EntityRendererProvider.Context ctx) {
         super(ctx, new CompanionHumanoidModel(), 0.5f);
         this.skinCache = ctx.getPlayerSkinRenderCache();
+        this.equipmentRenderer = ctx.getEquipmentRenderer();
         ArmorModelSet<HumanoidModel<CompanionRenderState>> wideArmor =
                 ArmorModelSet.bake(ModelLayers.PLAYER_ARMOR, ctx.getModelSet(), HumanoidModel::new);
         ArmorModelSet<HumanoidModel<CompanionRenderState>> slimArmor =
@@ -63,6 +66,7 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
     /**
      * Attaches Wildfire's real chest layer on the first draw instead of in the constructor, so the mod's
      * client services (render-state key, player config cache) are guaranteed to be initialised.
+     * Also attaches GenderArmorLayer so a worn chestplate renders over the female chest.
      */
     private void attachGenderLayer() {
         if (genderLayerTried) return;
@@ -70,7 +74,12 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         // Wildfire's 5.x GenderLayer is generic over HumanoidRenderState, so it fits this renderer.
         RenderLayer<CompanionRenderState, HumanoidModel<CompanionRenderState>> gender =
                 FemaleGenderCompat.createLayer(this);
-        if (gender != null) addLayer(gender);
+        if (gender != null) {
+            addLayer(gender);
+            RenderLayer<CompanionRenderState, HumanoidModel<CompanionRenderState>> armor =
+                    FemaleGenderCompat.createArmorLayer(this, equipmentRenderer);
+            if (armor != null) addLayer(armor);
+        }
     }
 
     /** Armor layer that only submits when the companion's body model matches its geometry (wide vs slim arms). */
@@ -119,8 +128,8 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         state.injuredLeft = entity.injuredLeftTicks();
         resolveSkin(state, entity.skin(), entity.syncedOwner());
         // Wildfire's layer reads its data from the render state. The mod only fills it for players,
-        // so we build it from the owner's config, gated by the companion's own feminine toggle.
-        FemaleGenderCompat.populateRenderState(state, entity, entity.syncedOwner(), partialTick);
+        // so we build it from the companion's own holder (owner gender irrelevant), gated by the feminine toggle.
+        FemaleGenderCompat.populateRenderState(state, entity, partialTick);
     }
 
     private void resolveSkin(CompanionRenderState state, String name, UUID owner) {
@@ -191,9 +200,10 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         if (state.isPassenger) poseStack.translate(0.0f, 0.5f, 0.0f); // sit pose offset (already scaled)
     }
 
-    /** Name tag only while the player is aiming at the companion. */
+    /** Name tag only while the player is aiming at the companion - never over a downed body. */
     @Override
     protected boolean shouldShowName(CompanionEntity entity, double distance) {
+        if (entity.isInjured()) return false;
         return this.entityRenderDispatcher.crosshairPickEntity == entity;
     }
 

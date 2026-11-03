@@ -1,6 +1,6 @@
 # All Java Sources
 
-Generated from 71 files. Paths are relative to the project root.
+Generated from 72 files. Paths are relative to the project root.
 
 ## common\src\main\java\com\example\companionmod\block\CompanionShrineBlock.java
 
@@ -231,6 +231,7 @@ public final class ClientVoice {
 
         CompanionEntity companion = findCompanion(mc);
         if (companion != null) {
+            com.example.companionmod.voice.FemaleGenderCompat.tickPhysics(companion);   // our holder isn't ticked by WGM
             CompanionMemory.tick(mc, companion);
             syncEntitySettings(mc, companion);
             handleReviveInput(mc, companion);
@@ -2002,6 +2003,7 @@ import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.renderer.entity.ArmorModelSet;
 import net.minecraft.client.renderer.entity.EntityRendererProvider;
 import net.minecraft.client.renderer.entity.HumanoidMobRenderer;
+import net.minecraft.client.renderer.entity.layers.EquipmentLayerRenderer;
 import net.minecraft.client.renderer.entity.layers.HumanoidArmorLayer;
 import net.minecraft.client.renderer.entity.layers.RenderLayer;
 import net.minecraft.client.renderer.rendertype.RenderType;
@@ -2032,11 +2034,13 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
     private static final float SUBTITLE_SCALE = 0.025f;
 
     private final PlayerSkinRenderCache skinCache;
+    private final EquipmentLayerRenderer equipmentRenderer;   // for WGM's breast-shaped armor layer
     private boolean genderLayerTried;           // Wildfire layer is attached lazily on the first draw
 
     public CompanionRenderer(EntityRendererProvider.Context ctx) {
         super(ctx, new CompanionHumanoidModel(), 0.5f);
         this.skinCache = ctx.getPlayerSkinRenderCache();
+        this.equipmentRenderer = ctx.getEquipmentRenderer();
         ArmorModelSet<HumanoidModel<CompanionRenderState>> wideArmor =
                 ArmorModelSet.bake(ModelLayers.PLAYER_ARMOR, ctx.getModelSet(), HumanoidModel::new);
         ArmorModelSet<HumanoidModel<CompanionRenderState>> slimArmor =
@@ -2052,6 +2056,7 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
     /**
      * Attaches Wildfire's real chest layer on the first draw instead of in the constructor, so the mod's
      * client services (render-state key, player config cache) are guaranteed to be initialised.
+     * Also attaches GenderArmorLayer so a worn chestplate renders over the female chest.
      */
     private void attachGenderLayer() {
         if (genderLayerTried) return;
@@ -2059,7 +2064,12 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         // Wildfire's 5.x GenderLayer is generic over HumanoidRenderState, so it fits this renderer.
         RenderLayer<CompanionRenderState, HumanoidModel<CompanionRenderState>> gender =
                 FemaleGenderCompat.createLayer(this);
-        if (gender != null) addLayer(gender);
+        if (gender != null) {
+            addLayer(gender);
+            RenderLayer<CompanionRenderState, HumanoidModel<CompanionRenderState>> armor =
+                    FemaleGenderCompat.createArmorLayer(this, equipmentRenderer);
+            if (armor != null) addLayer(armor);
+        }
     }
 
     /** Armor layer that only submits when the companion's body model matches its geometry (wide vs slim arms). */
@@ -2108,8 +2118,8 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         state.injuredLeft = entity.injuredLeftTicks();
         resolveSkin(state, entity.skin(), entity.syncedOwner());
         // Wildfire's layer reads its data from the render state. The mod only fills it for players,
-        // so we build it from the owner's config, gated by the companion's own feminine toggle.
-        FemaleGenderCompat.populateRenderState(state, entity, entity.syncedOwner(), partialTick);
+        // so we build it from the companion's own holder (owner gender irrelevant), gated by the feminine toggle.
+        FemaleGenderCompat.populateRenderState(state, entity, partialTick);
     }
 
     private void resolveSkin(CompanionRenderState state, String name, UUID owner) {
@@ -2180,9 +2190,10 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
         if (state.isPassenger) poseStack.translate(0.0f, 0.5f, 0.0f); // sit pose offset (already scaled)
     }
 
-    /** Name tag only while the player is aiming at the companion. */
+    /** Name tag only while the player is aiming at the companion - never over a downed body. */
     @Override
     protected boolean shouldShowName(CompanionEntity entity, double distance) {
+        if (entity.isInjured()) return false;
         return this.entityRenderDispatcher.crosshairPickEntity == entity;
     }
 
@@ -4432,6 +4443,46 @@ public class CompanionFollowGoal extends Goal {
 }
 ```
 
+## common\src\main\java\com\example\companionmod\entity\ai\CompanionMeleeGoal.java
+
+```java
+package com.example.companionmod.entity.ai;
+
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.PathfinderMob;
+import net.minecraft.world.entity.ai.goal.MeleeAttackGoal;
+import net.minecraft.world.entity.monster.Creeper;
+import net.minecraft.world.phys.Vec3;
+
+/**
+ * Melee with creeper hit-and-run: while the target's fuse is lit the companion backs off out of blast
+ * range instead of trading hits (vanilla creepers defuse when their target gets away), then closes back
+ * in once the fuse is out - the classic attack - retreat - attack loop. Every other mob fights normally.
+ */
+public class CompanionMeleeGoal extends MeleeAttackGoal {
+    private static final double RETREAT_DIST = 7.0;    // well past the 3.5 block creeper blast radius
+
+    public CompanionMeleeGoal(PathfinderMob mob, double speed, boolean followingTarget) {
+        super(mob, speed, followingTarget);
+    }
+
+    @Override
+    public void tick() {
+        LivingEntity target = this.mob.getTarget();
+        if (target instanceof Creeper creeper && creeper.isAlive() && creeper.getSwellDir() > 0) {
+            Vec3 away = this.mob.position().subtract(creeper.position());
+            away = new Vec3(away.x, 0, away.z);
+            if (away.lengthSqr() < 1.0e-4) away = new Vec3(0, 0, 1);   // standing on top of it: pick a direction
+            away = away.normalize().scale(RETREAT_DIST);
+            this.mob.getNavigation().moveTo(this.mob.getX() + away.x, this.mob.getY(), this.mob.getZ() + away.z, 1.35);
+            this.mob.getLookControl().setLookAt(creeper.getX(), creeper.getY() + creeper.getEyeHeight(), creeper.getZ(), 30.0f, 30.0f);
+            return;                               // never walk into a lit fuse
+        }
+        super.tick();
+    }
+}
+```
+
 ## common\src\main\java\com\example\companionmod\entity\ai\CompanionPatrolGoal.java
 
 ```java
@@ -5872,6 +5923,7 @@ import com.example.companionmod.command.CompanionCommand;
 import com.example.companionmod.entity.ai.CompanionBuildGoal;
 import com.example.companionmod.entity.ai.CompanionFarmGoal;
 import com.example.companionmod.entity.ai.CompanionFollowGoal;
+import com.example.companionmod.entity.ai.CompanionMeleeGoal;
 import com.example.companionmod.entity.ai.CompanionFishGoal;
 import com.example.companionmod.entity.ai.CompanionPatrolGoal;
 import com.example.companionmod.entity.ai.CompanionPickupGoal;
@@ -5914,7 +5966,6 @@ import net.minecraft.world.entity.ai.attributes.AttributeSupplier;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.ai.goal.FloatGoal;
 import net.minecraft.world.entity.ai.goal.LookAtPlayerGoal;
-import net.minecraft.world.entity.ai.goal.MeleeAttackGoal;
 import net.minecraft.world.entity.ai.goal.OpenDoorGoal;
 import net.minecraft.world.entity.ai.goal.RandomLookAroundGoal;
 import net.minecraft.world.entity.ai.navigation.GroundPathNavigation;
@@ -5966,6 +6017,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     private static final EntityDataAccessor<Integer> DATA_INJURED = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
     private static final EntityDataAccessor<Float> DATA_REVIVE = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.FLOAT);
     private static final EntityDataAccessor<Integer> DATA_INJURED_LEFT = SynchedEntityData.defineId(CompanionEntity.class, EntityDataSerializers.INT);
+    private LivingEntity lastTargetSeen;      // combat chaining: our target as of the previous tick
+    private int lastKillAt = -1000;           // when it died: chooseTarget chains to the next enemy for ~10 s
 
     /** Aliases the language model is likely to produce -> real block ids or family ids. */
     private static final Map<String, String> BLOCK_ALIASES = Map.ofEntries(
@@ -6061,7 +6114,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         goalSelector.addGoal(0, new FloatGoal(this));
         goalSelector.addGoal(1, new CompanionSitGoal(this));
         goalSelector.addGoal(1, new OpenDoorGoal(this, true));   // villager-style: open wooden doors on the path, close behind
-        goalSelector.addGoal(2, new MeleeAttackGoal(this, 1.25, true));
+        goalSelector.addGoal(2, new CompanionMeleeGoal(this, 1.25, true));   // + creeper hit-and-run (attack - retreat - attack)
         seekGoal = new com.example.companionmod.entity.ai.CompanionSeekBlockGoal(this);
         goalSelector.addGoal(2, seekGoal);                           // explicit "find diamonds" pre-empts walking
         goalSelector.addGoal(3, new CompanionPickupGoal(this));      // explicit "pick this up" pre-empts walking
@@ -6765,27 +6818,34 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         if (isSitting() || stance() == Stance.PASSIVE || isInjured()) return null;
         if (forcedTarget != null && (!forcedTarget.isAlive() || tickCount > forcedTargetUntil)) forcedTarget = null;
         if (forcedTarget != null) return forcedTarget;
+        // Combat chaining: right after a kill keep fighting instead of walking back to the owner first.
+        boolean combatChain = tickCount - lastKillAt < 200;
         if (owner != null) {
             LivingEntity a = owner.getLastHurtByMob();
             if (a != null && owner.tickCount - owner.getLastHurtByMobTimestamp() < 200 && isValidTarget(a, owner) && visibleOrAggro(a, owner)) return a;
             LivingEntity b = owner.getLastHurtMob();
-            if (b != null && owner.tickCount - owner.getLastHurtMobTimestamp() < 200 && isValidTarget(b, owner) && visibleOrAggro(b, owner)) return b;
+            // Explicit hit = order to help: no LOS/aggro requirement (creepers and other calm mobs never
+            // retaliate, which made "I hit it, you help" silently fail), just a sane chase range.
+            if (b != null && owner.tickCount - owner.getLastHurtMobTimestamp() < 200
+                    && isValidTarget(b, owner) && owner.distanceToSqr(b) < 30 * 30) return b;
         }
         LivingEntity c = getLastHurtByMob();
         if (c != null && c.isAlive() && c != owner && !(c instanceof CompanionEntity) && !(c instanceof Player) && visibleOrAggro(c, owner)) return c;
 
         boolean mining = mineTask().running();
         // While a mining job is running, only an adjacent threat interrupts it (a far zombie must not stall the dig).
-        double r = mining ? 4 : (stance() == Stance.GUARD ? 16 : 6);
-        var centre = (owner != null && moveMode() == MoveMode.FOLLOW) ? owner : this;
+        double r = mining ? 4 : (combatChain ? 24 : (stance() == Stance.GUARD ? 16 : 6));
+        var centre = combatChain ? this
+                : ((owner != null && moveMode() == MoveMode.FOLLOW) ? owner : this);
         List<LivingEntity> near = level().getEntitiesOfClass(LivingEntity.class, centre.getBoundingBox().inflate(r),
                 e -> isValidTarget(e, owner) && distanceToSqr(e) < (mining ? 8 * 8 : 28 * 28));
         LivingEntity best = null;
         double bestD = Double.MAX_VALUE;
         for (LivingEntity e : near) {
             Mob asMob = e instanceof Mob m ? m : null;
-            // DEFENSIVE only reacts to mobs that are actually coming for us or the owner
-            if (stance() == Stance.DEFENSIVE && asMob != null && asMob.getTarget() != owner && asMob.getTarget() != this) continue;
+            // DEFENSIVE only reacts to mobs that are actually coming for us or the owner - unless we just
+            // killed something and the next hostile is standing right there (chain the fight).
+            if (stance() == Stance.DEFENSIVE && !combatChain && asMob != null && asMob.getTarget() != owner && asMob.getTarget() != this) continue;
             // No attacking through walls: a mob we cannot see only counts if it is already fighting the owner,
             // or (when aggressive) fighting the companion itself. Everything else must be visible. Closer wins.
             if (!getSensing().hasLineOfSight(e)) {
@@ -7095,6 +7155,15 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             if (!claimRegistry()) return;       // stale duplicate: it dropped its bag and removed itself
         }
         if (tickCount % 10 == 0) refreshTaskText();
+        // Combat chaining bookkeeping: when our target dies, open a window in which chooseTarget keeps
+        // picking the next nearby hostile (wider radius, no "must be attacking us" filter) instead of
+        // wandering back to the owner between kills.
+        if (lastTargetSeen != null) {
+            if (!lastTargetSeen.isAlive()) lastKillAt = tickCount;
+            lastTargetSeen = null;
+        }
+        LivingEntity nowTarget = getTarget();
+        if (nowTarget != null && nowTarget.isAlive()) lastTargetSeen = nowTarget;
         if (isSitting()) {
             getNavigation().stop();
             if (tickCount % 40 == 0) heal(1.0f);               // resting heals
@@ -8156,12 +8225,14 @@ import java.util.UUID;
  * {@code HumanoidRenderState}/{@code HumanoidModel}, so it <b>can</b> be attached to the companion's renderer
  * (the old player-typed layer could not). The layer reads its data from the render state through
  * {@code ClientHelper.getRenderState(state)}; the mod only fills that for players / mannequins / armor stands,
- * so we fill it ourselves from the <b>owner's</b> Wildfire configuration. The result is the mod's real chest
- * model, UV layouts, physics, jacket overlay and textures on the companion - not our own approximation.</p>
+ * so we fill it ourselves - from a <b>companion-owned</b> Wildfire config holder whose gender is always
+ * FEMALE (set once, never touching disk/cloud). The owner's own gender therefore does NOT matter: a male
+ * player still gets the companion's female chest. The result is the mod's real chest model, UV layouts,
+ * physics, jacket overlay and textures - not our own approximation. We tick the holder's breast physics
+ * ourselves each client tick because the mod only ticks players/mannequins/armor stands.</p>
  *
  * <p>Everything is reflective (no compile-time dependency, no crash when the mod is absent or on a loader where
- * the render-data setter is unavailable). When the layer cannot be attached, or the owner's gender has no
- * chest, the renderer falls back to its own overlay.</p>
+ * the render-data setter is unavailable). The settings screen hides the feminine switch without the mod.</p>
  */
 public final class FemaleGenderCompat {
     private static Boolean present;
@@ -8172,12 +8243,17 @@ public final class FemaleGenderCompat {
     private static boolean initDone;
     private static int initAttempts;
     private static boolean populateFailureLogged;
-    private static Object playerCache;                  // WildfireClientAPI.players()
-    private static Method cacheGetOrCreate;             // EntityCache.getOrCreate(UUID)
     private static Method holderGender;                 // EntityConfigHolder.gender()
     private static Method valueGet;                     // ConfigValue.get()
     private static Method genderCanHaveBreasts;         // Gender.canHaveBreasts()
     private static Constructor<?> genderRenderStateCtor;// GenderRenderState(holder, entity, state, partialTick)
+    private static Constructor<?> holderCtor;           // new PlayerConfigHolder(UUID) - companion's own config
+    private static Method genderUpdate;                 // ConfigValue.update(value) - force FEMALE on our holder
+    private static Object femaleConst;                  // Gender.FEMALE
+    private static Method breastPhysics;                // EntityConfigHolder.breastPhysics()
+    private static Method physicsTick;                  // BothBreastsPhysics.tick(entity) - we tick it ourselves
+    private static Object companionHolder;              // cached own-holder (created once per companion)
+    private static UUID companionHolderId;
     private static Object stateKey;                     // ClientHelper impl's static STATE ContextKey
     private static Method setRenderData;                // NeoForge: setRenderData(ContextKey, Object); Fabric: setData(RenderStateDataKey, Object)
     private static Method getRenderData;                // read-back check: proves the layer can find our data
@@ -8208,9 +8284,9 @@ public final class FemaleGenderCompat {
             RenderLayerParent<CompanionRenderState, HumanoidModel<CompanionRenderState>> parent) {
         if (!isPresent()) return null;
         init();
-        if (playerCache == null || cacheGetOrCreate == null || genderRenderStateCtor == null
-                || stateKey == null || setRenderData == null) {
-            LOG.warn("Female Gender Mod is installed but its chest layer cannot be attached; using the built-in overlay");
+        if (genderRenderStateCtor == null || stateKey == null || setRenderData == null
+                || holderCtor == null || genderUpdate == null || femaleConst == null) {
+            LOG.warn("Female Gender Mod is installed but its chest layer cannot be attached (see hookup log)");
             return null;
         }
         try {
@@ -8225,20 +8301,16 @@ public final class FemaleGenderCompat {
     }
 
     /**
-     * Fills the render state with a {@code GenderRenderState} built from the owner's Wildfire settings, which is
-     * exactly what the mod's layer expects to find. Called from the companion's {@code extractRenderState}.
+     * Fills the render state with a {@code GenderRenderState} built from the companion's OWN Wildfire config
+     * holder (gender always FEMALE) - exactly what the mod's layer expects. Called from extractRenderState.
      *
-     * <p>Runs only while the companion's own feminine toggle is on: with the mod installed that switch decides
-     * <b>whether</b> the chest renders at all, the mod's data (owner's gender/UVs/physics) decides <b>how</b>.
-     * Without the mod the settings screen hides the switch and this method never gets past the layer check.</p>
-     *
-     * <p>Every distinct outcome logs one line (only when the outcome CHANGES, never per frame), so latest.log
-     * always states exactly why the chest did or did not render.</p>
+     * <p>Runs only while the companion's feminine toggle is on: with the mod installed that switch decides
+     * <b>whether</b> the chest renders; the owner's gender is irrelevant (a male player still gets the chest).
+     * Every distinct outcome logs one line (only when it CHANGES), so latest.log always states why.</p>
      *
      * @return true when the mod's layer will draw the chest
      */
-    public static boolean populateRenderState(HumanoidRenderState state, LivingEntity entity, UUID ownerUuid,
-                                              float partialTick) {
+    public static boolean populateRenderState(HumanoidRenderState state, LivingEntity entity, float partialTick) {
         if (state == null || entity == null) return false;
         if (!(entity instanceof CompanionEntity companion)) return false;
         if (!layerAttached) {
@@ -8246,22 +8318,15 @@ public final class FemaleGenderCompat {
             return false;
         }
         init();
-        if (playerCache == null || cacheGetOrCreate == null || genderRenderStateCtor == null
-                || stateKey == null || setRenderData == null) {
+        if (genderRenderStateCtor == null || stateKey == null || setRenderData == null
+                || holderCtor == null || genderUpdate == null || femaleConst == null) {
             outcome("reflection incomplete (attempt " + initAttempts + "/5)");
             return false;
         }
         if (!companion.isFeminine()) { clearRenderData(state); outcome("feminine toggle OFF"); return false; }
-        if (ownerUuid == null)      { clearRenderData(state); outcome("owner uuid not synced on the entity"); return false; }
         try {
-            Object holder = cacheGetOrCreate.invoke(playerCache, ownerUuid);
-            if (holder == null) { clearRenderData(state); outcome("no Wildfire config for the owner"); return false; }
+            Object holder = ensureHolder(companion.getUUID());
             Object gender = genderOf(holder);
-            if (gender == null || !Boolean.TRUE.equals(genderCanHaveBreasts.invoke(gender))) {
-                clearRenderData(state);
-                outcome("owner gender " + gender + " has no chest - hidden");
-                return false;
-            }
             Object genderState = genderRenderStateCtor.newInstance(holder, entity, state, partialTick);
             setRenderData.invoke(state, stateKey, genderState);
             if (state instanceof CompanionRenderState cs) cs.wgmData = genderState;   // stash for the submit phase
@@ -8278,6 +8343,48 @@ public final class FemaleGenderCompat {
             }
             outcome("exception: " + t);
             return false;
+        }
+    }
+
+    /**
+     * The companion's own config holder: created once per companion UUID, gender forced to FEMALE.
+     * Never calls loadGenderInfo, so no disk read and no cloud fetch can fail or lag it.
+     */
+    private static Object ensureHolder(UUID id) throws Throwable {
+        if (companionHolder == null || !id.equals(companionHolderId)) {
+            companionHolder = holderCtor.newInstance(id);
+            companionHolderId = id;
+            genderUpdate.invoke(holderGender.invoke(companionHolder), femaleConst);
+        }
+        return companionHolder;
+    }
+
+    /**
+     * Once per client tick: the mod only ticks breast physics for players/mannequins/armor stands, so the
+     * companion's holder would stay at size 0 (and the mod's layer refuses to draw below 0.02) without this.
+     */
+    public static void tickPhysics(LivingEntity companion) {
+        if (companionHolder == null || breastPhysics == null || physicsTick == null) return;
+        try { physicsTick.invoke(breastPhysics.invoke(companionHolder), companion); } catch (Throwable ignored) { }
+    }
+
+    /**
+     * WGM's breast-shaped armor layer ({@code GenderArmorLayer}): draws the chestplate over the female chest
+     * so armor actually renders on it. Needs the vanilla EquipmentLayerRenderer the armor layers already use.
+     */
+    @SuppressWarnings("unchecked")
+    public static RenderLayer<CompanionRenderState, HumanoidModel<CompanionRenderState>> createArmorLayer(
+            RenderLayerParent<CompanionRenderState, HumanoidModel<CompanionRenderState>> parent,
+            Object equipmentRenderer) {
+        if (!isPresent() || !layerAttached || equipmentRenderer == null) return null;
+        try {
+            Class<?> cls = Class.forName("com.wildfire.client.render.GenderArmorLayer");
+            Class<?> eq = Class.forName("net.minecraft.client.renderer.entity.layers.EquipmentLayerRenderer");
+            Object layer = cls.getConstructor(RenderLayerParent.class, eq).newInstance(parent, equipmentRenderer);
+            return (RenderLayer<CompanionRenderState, HumanoidModel<CompanionRenderState>>) layer;
+        } catch (Throwable t) {
+            LOG.warn("Female Gender Mod: GenderArmorLayer could not be constructed", t);
+            return null;
         }
     }
 
@@ -8358,15 +8465,18 @@ public final class FemaleGenderCompat {
         initAttempts++;
         StringBuilder problems = new StringBuilder();
         try {
-            Class<?> api = Class.forName("com.wildfire.api.client.WildfireClientAPI");
-            playerCache = api.getMethod("players").invoke(null);
-            cacheGetOrCreate = Class.forName("com.wildfire.api.EntityCache").getMethod("getOrCreate", UUID.class);
             Class<?> holderClass = Class.forName("com.wildfire.common.entities.EntityConfigHolder");
             holderGender = holderClass.getMethod("gender");
             valueGet = Class.forName("com.wildfire.common.config.value.ConfigValue").getMethod("get");
             genderCanHaveBreasts = Class.forName("com.wildfire.api.Gender").getMethod("canHaveBreasts");
             genderRenderStateCtor = Class.forName("com.wildfire.client.render.GenderRenderState")
                     .getConstructor(holderClass, LivingEntity.class, HumanoidRenderState.class, float.class);
+            // companion-owned holder: constructor + force-FEMALE + physics ticking (no loadGenderInfo -> no IO)
+            holderCtor = Class.forName("com.wildfire.common.entities.players.PlayerConfigHolder").getConstructor(UUID.class);
+            genderUpdate = Class.forName("com.wildfire.common.config.value.ConfigValue").getMethod("update", Object.class);
+            femaleConst = Class.forName("com.wildfire.api.Gender").getField("FEMALE").get(null);
+            breastPhysics = holderClass.getMethod("breastPhysics");
+            physicsTick = Class.forName("com.wildfire.client.physics.BothBreastsPhysics").getMethod("tick", LivingEntity.class);
         } catch (Throwable t) {
             problems.append("\n  config/API lookup failed: ").append(t);
         }
@@ -8383,8 +8493,8 @@ public final class FemaleGenderCompat {
         } catch (Throwable t) {
             problems.append("\n  render-state key lookup failed: ").append(t);
         }
-        if (playerCache != null && cacheGetOrCreate != null && genderRenderStateCtor != null
-                && stateKey != null && setRenderData != null) {
+        if (genderRenderStateCtor != null && stateKey != null && setRenderData != null
+                && holderCtor != null && genderUpdate != null && femaleConst != null && breastPhysics != null && physicsTick != null) {
             initDone = true;
             LOG.info("Female Gender Mod hookup ready (render-state setter: {})", setRenderData.getName());
         } else {
