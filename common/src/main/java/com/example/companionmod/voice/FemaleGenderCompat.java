@@ -47,6 +47,7 @@ public final class FemaleGenderCompat {
     private static Constructor<?> genderRenderStateCtor;// GenderRenderState(holder, entity, state, partialTick)
     private static Object stateKey;                     // ClientHelper impl's static STATE ContextKey
     private static Method setRenderData;                // NeoForge: setRenderData(ContextKey, Object); Fabric: setData(RenderStateDataKey, Object)
+    private static Method getRenderData;                // read-back check: proves the layer can find our data
 
     private FemaleGenderCompat() {}
 
@@ -130,7 +131,12 @@ public final class FemaleGenderCompat {
             }
             Object genderState = genderRenderStateCtor.newInstance(holder, entity, state, partialTick);
             setRenderData.invoke(state, stateKey, genderState);
-            outcome("rendering: gender=" + gender + ", bust=" + fmtBust(genderState));
+            if (state instanceof CompanionRenderState cs) cs.wgmData = genderState;   // stash for the submit phase
+            Object readback = getRenderData != null ? getRenderData.invoke(state, stateKey) : null;
+            outcome("rendering: gender=" + gender + ", bust=" + fmtBust(genderState)
+                    + ", readback=" + (readback != null ? "OK" : "MISSING!")
+                    + ", chest=" + state.chestEquipment
+                    + ", invisible=" + state.isInvisibleToPlayer);
             return true;
         } catch (Throwable t) {
             if (!populateFailureLogged) {
@@ -163,6 +169,7 @@ public final class FemaleGenderCompat {
 
     /** Clears stale render data from a previous frame so a gated-off chest can never keep drawing. */
     private static void clearRenderData(HumanoidRenderState state) {
+        if (state instanceof CompanionRenderState cs) cs.wgmData = null;
         if (setRenderData == null || stateKey == null || state == null) return;
         try { setRenderData.invoke(state, stateKey, (Object) null); } catch (Throwable ignored) { }
     }
@@ -170,6 +177,43 @@ public final class FemaleGenderCompat {
     /** Logs {@code s} only when it differs from the previous outcome - one line per real state change. */
     private static void outcome(String s) {
         if (!s.equals(lastOutcome)) { lastOutcome = s; LOG.info("[companionmod] WGM chest: {}", s); }
+    }
+
+    private static boolean layersLogged;
+
+    /** One-time dump of the renderer's layer list - proves whether the mod's GenderLayer is actually attached. */
+    public static void logLayersOnce(Object renderer) {
+        if (layersLogged) return;
+        layersLogged = true;
+        try {
+            java.lang.reflect.Field f = Class.forName("net.minecraft.client.renderer.entity.LivingEntityRenderer")
+                    .getDeclaredField("layers");
+            f.setAccessible(true);
+            LOG.info("[companionmod] WGM chest: layers = {}", f.get(renderer));
+        } catch (Throwable t) {
+            LOG.info("[companionmod] WGM chest: layers unreadable ({})", t.toString());
+        }
+    }
+
+    /**
+     * Submit-phase: re-apply the stashed render data. Something (a NeoForge render-state modifier of another mod)
+     * clears render data between extract and submit - GenderLayer would read null every frame without this.
+     */
+    public static void applyAtSubmit(HumanoidRenderState state) {
+        if (state == null || !(state instanceof CompanionRenderState cs) || cs.wgmData == null) return;
+        if (setRenderData == null || stateKey == null) return;
+        try { setRenderData.invoke(state, stateKey, cs.wgmData); } catch (Throwable ignored) { }
+    }
+
+    /**
+     * Submit-phase probe: the mod's GenderLayer reads the render data during submit, so if it vanished between
+     * extract and submit that is the bug. Only logs on FAILURE (presence is the normal state - no line).
+     */
+    public static void verifyAtSubmit(HumanoidRenderState state) {
+        if (getRenderData == null || stateKey == null) return;
+        try {
+            if (getRenderData.invoke(state, stateKey) == null) outcome("submit: DATA MISSING - cleared between extract and submit!");
+        } catch (Throwable ignored) { }
     }
 
     /**
@@ -199,6 +243,7 @@ public final class FemaleGenderCompat {
             // NeoClientHelper.STATE is a ContextKey, FabricClientHelper.STATE is a Fabric RenderStateDataKey
             stateKey = instance.getClass().getField("STATE").get(null);
             setRenderData = findSetter(stateKey);
+            getRenderData = findGetter(stateKey);
             if (setRenderData == null) {
                 problems.append("\n  no render-state setter accepts a ").append(stateKey.getClass().getName());
             }
@@ -221,6 +266,18 @@ public final class FemaleGenderCompat {
             if (m.getParameterCount() != 2) continue;
             String n = m.getName();
             if (!n.equals("setRenderData") && !n.equals("setData")) continue;
+            if (m.getParameterTypes()[0].isInstance(key)) return m;
+        }
+        return null;
+    }
+
+    /** The matching getter - used only to prove in the log that what we wrote is readable by the mod's layer. */
+    private static Method findGetter(Object key) {
+        if (key == null) return null;
+        for (Method m : HumanoidRenderState.class.getMethods()) {
+            if (m.getParameterCount() != 1) continue;
+            String n = m.getName();
+            if (!n.equals("getRenderData") && !n.equals("getData")) continue;
             if (m.getParameterTypes()[0].isInstance(key)) return m;
         }
         return null;

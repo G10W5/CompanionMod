@@ -19,6 +19,7 @@ public class CompanionRenderState extends HumanoidRenderState {
     public boolean slimSkin;             // auto-detected from the resolved skin (Alex model)
     public Identifier texture = DEFAULT;
     public RenderType renderType;         // null = use the model texture (bundled skin), non-null = live player skin
+    public Object wgmData;               // Wildfire GenderRenderState built at extract; re-applied at submit (something clears render data between the two phases)
 
     /** Current floating line and the local animation clock (milliseconds). */
     public String speech = "";

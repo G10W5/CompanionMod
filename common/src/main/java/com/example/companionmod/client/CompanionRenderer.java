@@ -177,6 +177,9 @@ public class CompanionRenderer extends HumanoidMobRenderer<CompanionEntity, Comp
     @Override
     public void submit(CompanionRenderState state, PoseStack poseStack, SubmitNodeCollector collector, CameraRenderState camera) {
         attachGenderLayer();
+        FemaleGenderCompat.logLayersOnce(this);
+        FemaleGenderCompat.applyAtSubmit(state);
+        FemaleGenderCompat.verifyAtSubmit(state);
         super.submit(state, poseStack, collector, camera);
         if (state.injured) submitInjured(state, poseStack, collector, camera);
         else submitSubtitle(state, poseStack, collector, camera);
