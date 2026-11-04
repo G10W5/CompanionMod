@@ -15,13 +15,13 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.equipment.Equippable;
 
 /**
- * The companion's 26-slot bag: 4 armor slots, 4 tool slots and 18 storage slots, plus the player's
+ * The companion's 35-slot bag: 4 armor slots, 4 tool slots and 27 storage slots, plus the player's
  * inventory. The server menu wraps the companion's live container; the client menu (created from the
  * {@link MenuType} supplier) uses a synced shadow container. Armor/tool row changes are mirrored onto
  * the companion's equipment slots by {@link CompanionEntity#refreshEquipment()}.
  */
 public class CompanionInventoryMenu extends AbstractContainerMenu {
-    public static final int SIZE = CompanionEntity.SIZE;          // 26
+    public static final int SIZE = CompanionEntity.SIZE;          // 35
     private static final int PLAYER_SLOTS = 36;
 
     private final Container storage;
@@ -49,14 +49,14 @@ public class CompanionInventoryMenu extends AbstractContainerMenu {
         for (int i = 0; i < 4; i++) {
             addSlot(new ToolSlot(storage, CompanionEntity.TOOL_START + i, 98 + i * 18, 28));
         }
-        // Rows 2-3 (y 55, 73): main storage [8..25]
-        for (int row = 0; row < 2; row++) {
+        // Rows 2-4 (y 55, 73, 91): main storage [8..34] - the bag grew from 18 to 27 slots (third row)
+        for (int row = 0; row < 3; row++) {
             for (int col = 0; col < 9; col++) {
                 addSlot(new Slot(storage, CompanionEntity.MAIN_START + row * 9 + col, 8 + col * 18, 55 + row * 18));
             }
         }
-        // Player inventory + hotbar
-        addStandardInventorySlots(playerInventory, 8, 112);
+        // Player inventory + hotbar (shifted down 18px for the new storage row)
+        addStandardInventorySlots(playerInventory, 8, 130);
     }
 
     @Override

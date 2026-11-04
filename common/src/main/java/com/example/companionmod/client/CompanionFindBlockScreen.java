@@ -110,7 +110,7 @@ public class CompanionFindBlockScreen extends Screen {
     public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
         int top = chipTop();
         int max = Math.max(0, chipTotalW() - iw);
-        if (max > 0 && mouseY >= top - 2 && mouseY <= top + 22) {
+        if (max > 0 && mouseY >= top - 2 && mouseY <= top + 26) {
             int next = (int) Math.max(0, Math.min(max, chipScroll - scrollY * 24));
             if (next != chipScroll) { chipScroll = next; rebuildWidgets(); }
             return true;
@@ -138,6 +138,8 @@ public class CompanionFindBlockScreen extends Screen {
     public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
         super.extractBackground(g, mouseX, mouseY, partialTick);
         CompanionUi.panel(g, px, py, px + panelW, py + panelH);       // same bevelled panel as Settings
+        // Black empty well behind the suggestion chips (chips render later, in the widget phase).
+        g.fill(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22, 0xFF000000);
     }
 
     @Override
@@ -145,9 +147,18 @@ public class CompanionFindBlockScreen extends Screen {
         super.extractRenderState(g, mouseX, mouseY, partialTick);      // background + widgets
         int cx = this.width / 2;
         g.centeredText(this.font, "Find & Mine", cx, py + 8, CompanionUi.TEXT_DARK);
-        g.centeredText(this.font, "Amount blank = default (16, diamonds 6) - wheel the row for more",
-                cx, py + 18, CompanionUi.TEXT_MUTED);
+        String sub = "Amount blank = default (16, diamonds 6) - wheel the chips";
+        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw), cx, py + 18, CompanionUi.TEXT_DARK);
         g.text(this.font, "Amount", ix + 62, py + HEAD_H + 30, CompanionUi.TEXT_DARK, true);
+        // Visible horizontal scrollbar for the chip row.
+        int max = Math.max(0, chipTotalW() - iw);
+        if (max > 0) {
+            int ty = chipTop() + 23;
+            g.fill(ix, ty, ix + iw, ty + 4, 0xFF000000);
+            int tw = Math.max(24, iw * iw / Math.max(1, chipTotalW()));
+            int tx = ix + (iw - tw) * chipScroll / max;
+            g.fill(tx + 1, ty + 1, tx + tw - 1, ty + 3, 0xFFB0B0B0);
+        }
         if (!status.isBlank()) g.centeredText(this.font, status, cx, py + 126, CompanionUi.TEXT_ERROR);
     }
 }

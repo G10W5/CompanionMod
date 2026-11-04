@@ -1143,7 +1143,7 @@ public class CompanionFindBlockScreen extends Screen {
     public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
         int top = chipTop();
         int max = Math.max(0, chipTotalW() - iw);
-        if (max > 0 && mouseY >= top - 2 && mouseY <= top + 22) {
+        if (max > 0 && mouseY >= top - 2 && mouseY <= top + 26) {
             int next = (int) Math.max(0, Math.min(max, chipScroll - scrollY * 24));
             if (next != chipScroll) { chipScroll = next; rebuildWidgets(); }
             return true;
@@ -1171,6 +1171,8 @@ public class CompanionFindBlockScreen extends Screen {
     public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
         super.extractBackground(g, mouseX, mouseY, partialTick);
         CompanionUi.panel(g, px, py, px + panelW, py + panelH);       // same bevelled panel as Settings
+        // Black empty well behind the suggestion chips (chips render later, in the widget phase).
+        g.fill(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22, 0xFF000000);
     }
 
     @Override
@@ -1178,9 +1180,18 @@ public class CompanionFindBlockScreen extends Screen {
         super.extractRenderState(g, mouseX, mouseY, partialTick);      // background + widgets
         int cx = this.width / 2;
         g.centeredText(this.font, "Find & Mine", cx, py + 8, CompanionUi.TEXT_DARK);
-        g.centeredText(this.font, "Amount blank = default (16, diamonds 6) - wheel the row for more",
-                cx, py + 18, CompanionUi.TEXT_MUTED);
+        String sub = "Amount blank = default (16, diamonds 6) - wheel the chips";
+        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw), cx, py + 18, CompanionUi.TEXT_DARK);
         g.text(this.font, "Amount", ix + 62, py + HEAD_H + 30, CompanionUi.TEXT_DARK, true);
+        // Visible horizontal scrollbar for the chip row.
+        int max = Math.max(0, chipTotalW() - iw);
+        if (max > 0) {
+            int ty = chipTop() + 23;
+            g.fill(ix, ty, ix + iw, ty + 4, 0xFF000000);
+            int tw = Math.max(24, iw * iw / Math.max(1, chipTotalW()));
+            int tx = ix + (iw - tw) * chipScroll / max;
+            g.fill(tx + 1, ty + 1, tx + tw - 1, ty + 3, 0xFFB0B0B0);
+        }
         if (!status.isBlank()) g.centeredText(this.font, status, cx, py + 126, CompanionUi.TEXT_ERROR);
     }
 }
@@ -1191,7 +1202,6 @@ public class CompanionFindBlockScreen extends Screen {
 ```java
 package com.example.companionmod.client;
 
-import com.example.companionmod.voice.VoiceConfig;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
@@ -1202,9 +1212,10 @@ import net.minecraft.network.chat.Component;
 import org.lwjgl.glfw.GLFW;
 
 /**
- * Type any goal in plain words; the AI turns it into a plan. The examples live in ONE horizontally
- * wheel-scrollable chip row (the old 2-column list ran out of space for more than 7 ideas); the row
- * rebuilds its buttons on scroll and the typed text survives that rebuild.
+ * Type any goal in plain words; the AI turns it into a plan. Same grey bevelled panel style as
+ * Companion Settings / Find &amp; Mine (was a full-screen vanilla menu with the chips floating over the
+ * world). Examples live in ONE horizontally wheel-scrollable chip row over a black well with a visible
+ * scrollbar; the row rebuilds its buttons on scroll and the typed text survives that rebuild.
  */
 public class CompanionGoalScreen extends Screen {
     private static final String[] IDEAS = {
@@ -1214,22 +1225,33 @@ public class CompanionGoalScreen extends Screen {
             "Look around nearby", "Continue what you were doing", "Follow me", "Come here",
     };
 
+    private static final int PANEL_W = 340, PAD = 12;
+    private static final int HEAD_H = 44, CONTENT_H = 52, FOOT_H = 56;
+
     private final Screen parent;
     private EditBox field;
     private String fieldValue = "";               // survives the chip-row rebuildWidgets()
     private int chipScroll;                       // horizontal wheel offset in pixels
+
+    private int px, py, panelW, panelH, ix, iw;   // geometry (recomputed in init)
 
     public CompanionGoalScreen(Screen parent) {
         super(Component.literal("Give a Goal"));
         this.parent = parent;
     }
 
-    private int chipTop() { return 88; }
+    private int chipTop() { return py + HEAD_H + 24; }
 
     @Override
     protected void init() {
-        int cx = this.width / 2;
-        field = new EditBox(this.font, cx - 154, 58, 308, 20, Component.literal("Goal"));
+        panelW = Math.min(PANEL_W, this.width - 8);
+        panelH = HEAD_H + CONTENT_H + FOOT_H;
+        px = (this.width - panelW) / 2;
+        py = Math.max(4, (this.height - panelH) / 2);
+        ix = px + PAD;
+        iw = panelW - 2 * PAD;
+
+        field = new EditBox(this.font, ix, py + HEAD_H, iw, 20, Component.literal("Goal"));
         field.setHint(Component.literal("e.g. gather 2 stacks of wood, then come back"));
         field.setMaxLength(160);
         field.setValue(fieldValue);
@@ -1237,20 +1259,22 @@ public class CompanionGoalScreen extends Screen {
         this.addRenderableWidget(field);
         this.setInitialFocus(field);
 
-        int x = cx - 154 - chipScroll;
+        int x = ix - chipScroll;
         for (String idea : IDEAS) {
             int bw = this.font.width(idea) + 14;
-            if (x + bw > cx - 154 && x < cx + 154) {
+            if (x + bw > ix && x < ix + iw) {
                 this.addRenderableWidget(Button.builder(Component.literal(idea), b -> field.setValue(idea))
                         .pos(x, chipTop()).size(bw, 20).build());
             }
             x += bw + 4;
         }
 
+        int bw = (iw - 4) / 2;
+        int fy = py + panelH - 52;
         this.addRenderableWidget(Button.builder(Component.literal("Plan It"), b -> submit())
-                .pos(cx - 154, this.height - 27).size(150, 20).build());
+                .pos(ix, fy).size(bw, 20).build());
         this.addRenderableWidget(Button.builder(CommonComponents.GUI_CANCEL, b -> onClose())
-                .pos(cx + 4, this.height - 27).size(150, 20).build());
+                .pos(ix + bw + 4, fy).size(bw, 20).build());
     }
 
     private int chipTotalW() {
@@ -1262,8 +1286,8 @@ public class CompanionGoalScreen extends Screen {
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
         int top = chipTop();
-        int max = Math.max(0, chipTotalW() - 308);
-        if (max > 0 && mouseY >= top - 2 && mouseY <= top + 22) {
+        int max = Math.max(0, chipTotalW() - iw);
+        if (max > 0 && mouseY >= top - 2 && mouseY <= top + 26) {
             int next = (int) Math.max(0, Math.min(max, chipScroll - scrollY * 24));
             if (next != chipScroll) { chipScroll = next; rebuildWidgets(); }
             return true;
@@ -1289,16 +1313,28 @@ public class CompanionGoalScreen extends Screen {
     }
 
     @Override
+    public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        super.extractBackground(g, mouseX, mouseY, partialTick);
+        CompanionUi.panel(g, px, py, px + panelW, py + panelH);
+        g.fill(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22, 0xFF000000);   // dark well behind the chips
+    }
+
+    @Override
     public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
-        this.extractMenuBackground(g);
-        super.extractRenderState(g, mouseX, mouseY, partialTick);
-        g.centeredText(this.font, this.title, this.width / 2, 12, 0xFFFFFFFF);
-        g.centeredText(this.font, "Describe what you want (amounts in the text work: 'bring me 12 iron').",
-                this.width / 2, 24, 0xFFA0A0A0);
-        g.fill(0, 32, this.width, 33, 0xFF000000);
-        g.fill(0, 33, this.width, 34, 0xFF373737);
-        g.fill(0, this.height - 33, this.width, this.height - 32, 0xFF000000);
-        g.fill(0, this.height - 32, this.width, this.height - 31, 0xFF373737);
+        super.extractRenderState(g, mouseX, mouseY, partialTick);                   // background + widgets
+        int cx = this.width / 2;
+        g.centeredText(this.font, "Give a Goal", cx, py + 8, CompanionUi.TEXT_DARK);
+        String sub = "Amounts in the text work: 'bring me 12 iron'";
+        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw), cx, py + 18, CompanionUi.TEXT_DARK);
+        // Visible horizontal scrollbar for the chip row.
+        int max = Math.max(0, chipTotalW() - iw);
+        if (max > 0) {
+            int ty = chipTop() + 23;
+            g.fill(ix, ty, ix + iw, ty + 4, 0xFF000000);
+            int tw = Math.max(24, iw * iw / Math.max(1, chipTotalW()));
+            int tx = ix + (iw - tw) * chipScroll / max;
+            g.fill(tx + 1, ty + 1, tx + tw - 1, ty + 3, 0xFFB0B0B0);
+        }
     }
 }
 ```
@@ -1411,19 +1447,31 @@ import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.Slot;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 
 /**
- * The companion's bag in the grey panel style of the settings screens: armor row, tool row, 2x9 storage, then the
- * player's own inventory. Slot rendering, tooltips and click handling come from {@link AbstractContainerScreen};
- * this class paints the panel, a sunken well behind every slot, and the section labels.
+ * The companion's bag in the grey panel style of the settings screens: armor row, tool row, 3x9 storage,
+ * then the player's own inventory. Slot rendering, tooltips and click handling come from
+ * {@link AbstractContainerScreen}; this class paints the panel, a sunken well behind every slot, the
+ * section labels, and the vanilla-style GHOST icons in the armor/tool slots (drawn in the background
+ * phase, so real items render on top and cover them).
  */
 public class CompanionInventoryScreen extends AbstractContainerScreen<CompanionInventoryMenu> {
+    // Armor ghosts (left to right) then tool ghosts, matching the menu's first 8 slots.
+    private static final ItemStack[] GHOSTS = {
+            new ItemStack(Items.LEATHER_HELMET), new ItemStack(Items.LEATHER_CHESTPLATE),
+            new ItemStack(Items.LEATHER_LEGGINGS), new ItemStack(Items.LEATHER_BOOTS),
+            new ItemStack(Items.WOODEN_PICKAXE), new ItemStack(Items.WOODEN_AXE),
+            new ItemStack(Items.WOODEN_SHOVEL), new ItemStack(Items.WOODEN_SWORD),
+    };
+
     public CompanionInventoryScreen(CompanionInventoryMenu menu, Inventory playerInventory, Component title) {
-        super(menu, playerInventory, title, 176, 196);
+        super(menu, playerInventory, title, 176, 214);            // +18: the third storage row
         this.titleLabelX = 8;
         this.titleLabelY = 6;
         this.inventoryLabelX = 8;
-        this.inventoryLabelY = 102;
+        this.inventoryLabelY = 120;                               // player inventory shifted down a row
     }
 
     @Override
@@ -1431,6 +1479,12 @@ public class CompanionInventoryScreen extends AbstractContainerScreen<CompanionI
         super.extractBackground(g, mouseX, mouseY, partialTick);   // 26.1-CHECK: vanilla blur/dim; remove if it draws twice
         CompanionUi.panel(g, leftPos, topPos, leftPos + imageWidth, topPos + imageHeight);
         for (Slot s : this.menu.slots) slotWell(g, leftPos + s.x - 1, topPos + s.y - 1);
+        // Ghost icons like the player inventory: helmet/chest/legs/boots and pick/axe/shovel/sword outlines
+        // showing what belongs in each slot. Real slot items are extracted after the background and cover them.
+        for (int i = 0; i < GHOSTS.length && i < this.menu.slots.size(); i++) {
+            Slot s = this.menu.slots.get(i);
+            g.fakeItem(GHOSTS[i], leftPos + s.x, topPos + s.y);
+        }
     }
 
     /** Vanilla-style sunken 18x18 slot: dark top/left edge, light bottom/right edge, mid-grey fill. */
@@ -6741,7 +6795,7 @@ import java.util.UUID;
  * Everything gameplay-related runs server-side; synced data (MoveMode/Stance/Owner/Skin/Feminine/Speech/Injured)
  * is read by the client renderer, HUD and goals.
  *
- * <p>Inventory: 26 slots (4 armor, 4 tools, 18 storage) in one {@link SimpleContainer}. Armor and the first
+ * <p>Inventory: 35 slots (4 armor, 4 tools, 27 storage) in one {@link SimpleContainer}. Armor and the first
  * tool are mirrored onto the equipment slots so they render and actually protect/heal... protect the companion.
  *
  * <p>Downed state: lethal damage converts into an injured crawl (Mojang's swimming pose). The companion cannot
@@ -6788,7 +6842,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     public static final EquipmentSlot[] ARMOR_SLOTS = { EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET };
 
     // Storage layout: 0-3 armor, 4-7 tools, 8-25 main (18 slots).
-    public static final int SIZE = 26, ARMOR_START = 0, TOOL_START = 4, MAIN_START = 8, MAIN_SIZE = 18;
+    public static final int SIZE = 35, ARMOR_START = 0, TOOL_START = 4, MAIN_START = 8, MAIN_SIZE = 27;
 
     private UUID ownerUuid;
     private LivingEntity forcedTarget;
@@ -8749,13 +8803,13 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.equipment.Equippable;
 
 /**
- * The companion's 26-slot bag: 4 armor slots, 4 tool slots and 18 storage slots, plus the player's
+ * The companion's 35-slot bag: 4 armor slots, 4 tool slots and 27 storage slots, plus the player's
  * inventory. The server menu wraps the companion's live container; the client menu (created from the
  * {@link MenuType} supplier) uses a synced shadow container. Armor/tool row changes are mirrored onto
  * the companion's equipment slots by {@link CompanionEntity#refreshEquipment()}.
  */
 public class CompanionInventoryMenu extends AbstractContainerMenu {
-    public static final int SIZE = CompanionEntity.SIZE;          // 26
+    public static final int SIZE = CompanionEntity.SIZE;          // 35
     private static final int PLAYER_SLOTS = 36;
 
     private final Container storage;
@@ -8783,14 +8837,14 @@ public class CompanionInventoryMenu extends AbstractContainerMenu {
         for (int i = 0; i < 4; i++) {
             addSlot(new ToolSlot(storage, CompanionEntity.TOOL_START + i, 98 + i * 18, 28));
         }
-        // Rows 2-3 (y 55, 73): main storage [8..25]
-        for (int row = 0; row < 2; row++) {
+        // Rows 2-4 (y 55, 73, 91): main storage [8..34] - the bag grew from 18 to 27 slots (third row)
+        for (int row = 0; row < 3; row++) {
             for (int col = 0; col < 9; col++) {
                 addSlot(new Slot(storage, CompanionEntity.MAIN_START + row * 9 + col, 8 + col * 18, 55 + row * 18));
             }
         }
-        // Player inventory + hotbar
-        addStandardInventorySlots(playerInventory, 8, 112);
+        // Player inventory + hotbar (shifted down 18px for the new storage row)
+        addStandardInventorySlots(playerInventory, 8, 130);
     }
 
     @Override
@@ -10050,7 +10104,7 @@ public final class OllamaVoiceBackend {
              + "'dig up to the surface'/'to the daylight' -> surface, target empty (never a block id). "
              + "Leave target empty for toggle commands.\n"
              + "Your bag has 4 armor slots (auto-worn so they protect you), 4 tool slots (you automatically hold the best tool for the block you are mining) "
-             + "and 18 storage slots; pickup/store puts items where they belong and you can also be given items via the "
+             + "and 27 storage slots; pickup/store puts items where they belong and you can also be given items via the "
              + "inventory UI. When you are downed the player must hold right click on you for 3 seconds to revive you. "
              + "Current situation: " + context;
     }

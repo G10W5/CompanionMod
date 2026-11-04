@@ -184,7 +184,7 @@ public final class OllamaVoiceBackend {
              + "'dig up to the surface'/'to the daylight' -> surface, target empty (never a block id). "
              + "Leave target empty for toggle commands.\n"
              + "Your bag has 4 armor slots (auto-worn so they protect you), 4 tool slots (you automatically hold the best tool for the block you are mining) "
-             + "and 18 storage slots; pickup/store puts items where they belong and you can also be given items via the "
+             + "and 27 storage slots; pickup/store puts items where they belong and you can also be given items via the "
              + "inventory UI. When you are downed the player must hold right click on you for 3 seconds to revive you. "
              + "Current situation: " + context;
     }

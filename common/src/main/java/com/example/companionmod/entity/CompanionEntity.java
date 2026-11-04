@@ -74,7 +74,7 @@ import java.util.UUID;
  * Everything gameplay-related runs server-side; synced data (MoveMode/Stance/Owner/Skin/Feminine/Speech/Injured)
  * is read by the client renderer, HUD and goals.
  *
- * <p>Inventory: 26 slots (4 armor, 4 tools, 18 storage) in one {@link SimpleContainer}. Armor and the first
+ * <p>Inventory: 35 slots (4 armor, 4 tools, 27 storage) in one {@link SimpleContainer}. Armor and the first
  * tool are mirrored onto the equipment slots so they render and actually protect/heal... protect the companion.
  *
  * <p>Downed state: lethal damage converts into an injured crawl (Mojang's swimming pose). The companion cannot
@@ -121,7 +121,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     public static final EquipmentSlot[] ARMOR_SLOTS = { EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET };
 
     // Storage layout: 0-3 armor, 4-7 tools, 8-25 main (18 slots).
-    public static final int SIZE = 26, ARMOR_START = 0, TOOL_START = 4, MAIN_START = 8, MAIN_SIZE = 18;
+    public static final int SIZE = 35, ARMOR_START = 0, TOOL_START = 4, MAIN_START = 8, MAIN_SIZE = 27;
 
     private UUID ownerUuid;
     private LivingEntity forcedTarget;
