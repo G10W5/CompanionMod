@@ -15,7 +15,9 @@ public record CommandPayload(String action, String say, String target) implement
     public static final StreamCodec<ByteBuf, CommandPayload> CODEC = StreamCodec.composite(
             ByteBufCodecs.stringUtf8(32), CommandPayload::action,
             ByteBufCodecs.stringUtf8(512), CommandPayload::say,
-            ByteBufCodecs.stringUtf8(1024), CommandPayload::target,
+            // 4096: a plan JSON (8 steps + up to 120-char say each) overran the old 1024 cap and the client
+            // clamp silently cut the JSON mid-structure - the server then rejected a corrupted plan.
+            ByteBufCodecs.stringUtf8(4096), CommandPayload::target,
             CommandPayload::new);
 
     public CommandPayload(String action, String say) {

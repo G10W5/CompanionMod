@@ -34,9 +34,6 @@ public final class CommandHandler {
 
     public static void handle(ServerPlayer player, CommandPayload payload) {
         CompanionCommand cmd = CompanionCommand.parse(payload.action());
-        LOG.info("[companionmod] server cmd: action='{}' -> {} target='{}' from {}",
-                payload.action(), cmd, payload.target(), player.getName().getString());
-
         // STOP is an emergency control, not optional background work. Never lose it to the token bucket.
         if (cmd != CompanionCommand.STOP) {
             Bucket bucket = BUCKETS.computeIfAbsent(player.getUUID(), id -> new Bucket());
@@ -44,10 +41,17 @@ public final class CommandHandler {
             synchronized (bucket) {
                 bucket.tokens = Math.min(CAPACITY, bucket.tokens + (now - bucket.lastRefill) / 1000.0 * REFILL_PER_SECOND);
                 bucket.lastRefill = now;
-                if (bucket.tokens < 1.0) return;
+                if (bucket.tokens < 1.0) {
+                    LOG.debug("[companionmod] command dropped by rate limit: action='{}' from {}", payload.action(), player.getName().getString());
+                    return;
+                }
                 bucket.tokens -= 1.0;
             }
         }
+        // Logged AFTER the bucket: a spamming client (the 16-packet revive burst in an old log) must not
+        // flood the INFO log with commands that were dropped anyway.
+        LOG.info("[companionmod] server cmd: action='{}' -> {} target='{}' from {}",
+                payload.action(), cmd, payload.target(), player.getName().getString());
         String say = ReplyParser.clean(payload.say());
         String target = cmd == CompanionCommand.PLAN ? payload.target() : ReplyParser.clean(payload.target());
 

@@ -127,10 +127,11 @@ public final class ClientVoice {
             CompanionAutonomy.onManualOrder();
         }
         // Clamp to the packet field limits so a long model/user string can never break encoding.
+        // target carries full plan JSONs for action=plan: 4096 matches CommandPayload's codec cap.
         sender.accept(new CommandPayload(
                 ReplyParser.truncate(action == null ? "" : action, 32),
                 ReplyParser.truncate(say == null ? "" : say, 500),
-                ReplyParser.truncate(target == null ? "" : target, 1024)));
+                ReplyParser.truncate(target == null ? "" : target, 4096)));
     }
 
     public static void tick(Minecraft mc) {

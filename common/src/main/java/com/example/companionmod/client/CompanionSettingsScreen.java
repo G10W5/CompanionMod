@@ -173,6 +173,13 @@ public class CompanionSettingsScreen extends Screen {
                 v -> config.autonomyIntervalSeconds = Math.round(v)));
     }
 
+    /** Empty host = the built-in localhost Ollama default; anything else leaves this machine (settings warn). */
+    private static boolean isLocalHost(String h) {
+        if (h == null || h.isBlank()) return true;
+        String s = h.toLowerCase(java.util.Locale.ROOT);
+        return s.contains("localhost") || s.contains("127.0.0.1") || s.contains("0.0.0.0") || s.contains("[::1]");
+    }
+
     /** Circle icon: filled pink = on, hollow grey = off. The state is only named in the hover tooltip. */
     private void updateFemButton() {
         if (femButton == null) return;                          // hidden when Wildfire's mod is not installed
@@ -531,6 +538,9 @@ public class CompanionSettingsScreen extends Screen {
                 if (modelsLoading) text(g, "Contacting server...", ix, sy, CompanionUi.TEXT_MUTED);
                 else if (modelsFailed) text(g, "Could not reach the server. Press the refresh button.", ix, sy, CompanionUi.TEXT_ERROR);
                 else text(g, modelNames.size() + " model(s) on the server", ix, sy, CompanionUi.TEXT_MUTED);
+                if (!isLocalHost(config.host)) {
+                    text(g, "Warning: non-local host - mic audio and voice leave this machine", ix, sy + 12, CompanionUi.TEXT_ERROR);
+                }
             }
             case MIC -> {
                 text(g, "Input level - speak to test", ix, cy + 27, CompanionUi.TEXT_DARK);

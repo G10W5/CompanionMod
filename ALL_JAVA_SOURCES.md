@@ -201,10 +201,11 @@ public final class ClientVoice {
             CompanionAutonomy.onManualOrder();
         }
         // Clamp to the packet field limits so a long model/user string can never break encoding.
+        // target carries full plan JSONs for action=plan: 4096 matches CommandPayload's codec cap.
         sender.accept(new CommandPayload(
                 ReplyParser.truncate(action == null ? "" : action, 32),
                 ReplyParser.truncate(say == null ? "" : say, 500),
-                ReplyParser.truncate(target == null ? "" : target, 1024)));
+                ReplyParser.truncate(target == null ? "" : target, 4096)));
     }
 
     public static void tick(Minecraft mc) {
@@ -2550,6 +2551,13 @@ public class CompanionSettingsScreen extends Screen {
                 v -> config.autonomyIntervalSeconds = Math.round(v)));
     }
 
+    /** Empty host = the built-in localhost Ollama default; anything else leaves this machine (settings warn). */
+    private static boolean isLocalHost(String h) {
+        if (h == null || h.isBlank()) return true;
+        String s = h.toLowerCase(java.util.Locale.ROOT);
+        return s.contains("localhost") || s.contains("127.0.0.1") || s.contains("0.0.0.0") || s.contains("[::1]");
+    }
+
     /** Circle icon: filled pink = on, hollow grey = off. The state is only named in the hover tooltip. */
     private void updateFemButton() {
         if (femButton == null) return;                          // hidden when Wildfire's mod is not installed
@@ -2908,6 +2916,9 @@ public class CompanionSettingsScreen extends Screen {
                 if (modelsLoading) text(g, "Contacting server...", ix, sy, CompanionUi.TEXT_MUTED);
                 else if (modelsFailed) text(g, "Could not reach the server. Press the refresh button.", ix, sy, CompanionUi.TEXT_ERROR);
                 else text(g, modelNames.size() + " model(s) on the server", ix, sy, CompanionUi.TEXT_MUTED);
+                if (!isLocalHost(config.host)) {
+                    text(g, "Warning: non-local host - mic audio and voice leave this machine", ix, sy + 12, CompanionUi.TEXT_ERROR);
+                }
             }
             case MIC -> {
                 text(g, "Input level - speak to test", ix, cy + 27, CompanionUi.TEXT_DARK);
@@ -8553,9 +8564,6 @@ public final class CommandHandler {
 
     public static void handle(ServerPlayer player, CommandPayload payload) {
         CompanionCommand cmd = CompanionCommand.parse(payload.action());
-        LOG.info("[companionmod] server cmd: action='{}' -> {} target='{}' from {}",
-                payload.action(), cmd, payload.target(), player.getName().getString());
-
         // STOP is an emergency control, not optional background work. Never lose it to the token bucket.
         if (cmd != CompanionCommand.STOP) {
             Bucket bucket = BUCKETS.computeIfAbsent(player.getUUID(), id -> new Bucket());
@@ -8563,10 +8571,17 @@ public final class CommandHandler {
             synchronized (bucket) {
                 bucket.tokens = Math.min(CAPACITY, bucket.tokens + (now - bucket.lastRefill) / 1000.0 * REFILL_PER_SECOND);
                 bucket.lastRefill = now;
-                if (bucket.tokens < 1.0) return;
+                if (bucket.tokens < 1.0) {
+                    LOG.debug("[companionmod] command dropped by rate limit: action='{}' from {}", payload.action(), player.getName().getString());
+                    return;
+                }
                 bucket.tokens -= 1.0;
             }
         }
+        // Logged AFTER the bucket: a spamming client (the 16-packet revive burst in an old log) must not
+        // flood the INFO log with commands that were dropped anyway.
+        LOG.info("[companionmod] server cmd: action='{}' -> {} target='{}' from {}",
+                payload.action(), cmd, payload.target(), player.getName().getString());
         String say = ReplyParser.clean(payload.say());
         String target = cmd == CompanionCommand.PLAN ? payload.target() : ReplyParser.clean(payload.target());
 
@@ -8608,7 +8623,9 @@ public record CommandPayload(String action, String say, String target) implement
     public static final StreamCodec<ByteBuf, CommandPayload> CODEC = StreamCodec.composite(
             ByteBufCodecs.stringUtf8(32), CommandPayload::action,
             ByteBufCodecs.stringUtf8(512), CommandPayload::say,
-            ByteBufCodecs.stringUtf8(1024), CommandPayload::target,
+            // 4096: a plan JSON (8 steps + up to 120-char say each) overran the old 1024 cap and the client
+            // clamp silently cut the JSON mid-structure - the server then rejected a corrupted plan.
+            ByteBufCodecs.stringUtf8(4096), CommandPayload::target,
             CommandPayload::new);
 
     public CommandPayload(String action, String say) {
@@ -8696,6 +8713,10 @@ public final class ModContent {
             }
             return null;
         }
+        // Registry-less fallback scans EVERY entity in EVERY level - command bursts from a player without a
+        // companion (the 16-packet revive storm) used to pay that scan per packet. 1 s negative cache.
+        long now = System.currentTimeMillis();
+        if (owner.equals(lastMissOwner) && now - lastMissAt < 1000) return null;
         for (ServerLevel level : server.getAllLevels()) {
             for (Entity e : level.getAllEntities()) { // 26.1-CHECK: ServerLevel.getAllEntities()
                 if (e instanceof CompanionEntity c && c.isAlive() && owner.equals(c.getOwnerUuid())) {
@@ -8704,8 +8725,13 @@ public final class ModContent {
                 }
             }
         }
+        lastMissOwner = owner;
+        lastMissAt = now;
         return null;
     }
+
+    private static UUID lastMissOwner;
+    private static long lastMissAt;
 }
 ```
 
@@ -9637,10 +9663,10 @@ public final class OllamaVoiceBackend {
              + "pickup (walk to a dropped item ON THE GROUND and store it; put the item name in target, e.g. bone, diamond, rotten_flesh - only for items already lying around), "
              + "seek_block (walk to the named block and mine it; target = a block id - vanilla or from ANY mod, with or without namespace: oak_log or log for wood/trees, stone, cobblestone, dirt, coal_ore, iron_ore, zanite_ore, aether:zanite_ore; 'wood', 'logs' and 'planks' mean the whole family), "
              + "drop, heal, patrol, wander, explore, build (target = schematic name, e.g. house; places it block by block from the bag), "
-             + "farm (harvest ripe crops nearby and replant), plant (target = sapling name e.g. birch_sapling; plants saplings from your bag on nearby soil), equip (target = tool name, e.g. pickaxe), trade, craft, smelt, brew, enchant, "
-             + "fish (fish at nearby water), cook, open, close, dance, jump, sneak, sleep, wake, remember, forget, set_name (rename; new name in target), "
+             + "farm (harvest ripe crops nearby and replant), plant (target = sapling name e.g. birch_sapling; plants saplings from your bag on nearby soil), equip (target = tool name, e.g. pickaxe), "
+             + "fish (fish at nearby water), remember, forget, set_name (rename; new name in target), "
              + "set_skin (target = Minecraft player name), feminine, masculine, "
-             + "track, hunt (attack the named or nearest hostile), fight, flee, hide, retreat, defend, none (just chatting).\n"
+             + "hunt (attack the named or nearest hostile), fight, flee, retreat, defend, none (just chatting).\n"
              + "Gathering a material (wood, stone, coal, iron, diamonds...) is ALWAYS seek_block with the block id, even when the player says 'collect', 'get' or 'bring'. "
              + "If a request needs several steps ('get some wood and bring it back'), reply action none with a short 'On it!' and the planning system takes over. "
              + "target rules: "
@@ -11043,7 +11069,16 @@ public final class ShrinePlacer {
         MinecraftServer server = level.getServer();
         Path file = marker(server);
         if (Files.exists(file)) return;
-        BlockPos core = place(level, player.blockPosition().offset(3, 0, 2));
+        // The REAL world spawn, not the first joiner's position: on an existing/multiplayer world the first
+        // player can join thousands of blocks from spawn, and the chat message claims "near spawn".
+        // 26.x mapping: ServerLevel.getSharedSpawnPos() is gone - world spawn lives in LevelData.getRespawnData()
+        // (dimension + pos). If the respawn anchor sits in another dimension (bed set in the nether), fall back
+        // to the original beside-the-first-joiner behaviour rather than using foreign coordinates.
+        var respawn = level.getLevelData().getRespawnData();
+        BlockPos origin = respawn.dimension() == Level.OVERWORLD
+                ? respawn.pos()
+                : player.blockPosition().offset(3, 0, 2);
+        BlockPos core = place(level, origin);
         try {
             Files.writeString(file, "{\"x\":" + core.getX() + ",\"y\":" + core.getY() + ",\"z\":" + core.getZ() + "}");
         } catch (IOException ignored) { }
@@ -11122,7 +11157,7 @@ public final class ShrineSummoner {
         level.addFreshEntity(c);
         player.sendSystemMessage(Component.literal(existing != null
                 ? "Your companion steps out of the light, carrying everything it had."
-                : "A companion steps out of the light. Hold V to talk to it."));
+                : "A companion steps out of the light. Press your talk key to speak with it."));
         effects(level, spot);
     }
 

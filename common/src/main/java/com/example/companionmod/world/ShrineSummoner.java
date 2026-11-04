@@ -52,7 +52,7 @@ public final class ShrineSummoner {
         level.addFreshEntity(c);
         player.sendSystemMessage(Component.literal(existing != null
                 ? "Your companion steps out of the light, carrying everything it had."
-                : "A companion steps out of the light. Hold V to talk to it."));
+                : "A companion steps out of the light. Press your talk key to speak with it."));
         effects(level, spot);
     }
 

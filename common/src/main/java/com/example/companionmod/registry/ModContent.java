@@ -71,6 +71,10 @@ public final class ModContent {
             }
             return null;
         }
+        // Registry-less fallback scans EVERY entity in EVERY level - command bursts from a player without a
+        // companion (the 16-packet revive storm) used to pay that scan per packet. 1 s negative cache.
+        long now = System.currentTimeMillis();
+        if (owner.equals(lastMissOwner) && now - lastMissAt < 1000) return null;
         for (ServerLevel level : server.getAllLevels()) {
             for (Entity e : level.getAllEntities()) { // 26.1-CHECK: ServerLevel.getAllEntities()
                 if (e instanceof CompanionEntity c && c.isAlive() && owner.equals(c.getOwnerUuid())) {
@@ -79,6 +83,11 @@ public final class ModContent {
                 }
             }
         }
+        lastMissOwner = owner;
+        lastMissAt = now;
         return null;
     }
+
+    private static UUID lastMissOwner;
+    private static long lastMissAt;
 }

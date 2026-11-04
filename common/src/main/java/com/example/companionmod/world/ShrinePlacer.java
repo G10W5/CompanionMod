@@ -32,7 +32,16 @@ public final class ShrinePlacer {
         MinecraftServer server = level.getServer();
         Path file = marker(server);
         if (Files.exists(file)) return;
-        BlockPos core = place(level, player.blockPosition().offset(3, 0, 2));
+        // The REAL world spawn, not the first joiner's position: on an existing/multiplayer world the first
+        // player can join thousands of blocks from spawn, and the chat message claims "near spawn".
+        // 26.x mapping: ServerLevel.getSharedSpawnPos() is gone - world spawn lives in LevelData.getRespawnData()
+        // (dimension + pos). If the respawn anchor sits in another dimension (bed set in the nether), fall back
+        // to the original beside-the-first-joiner behaviour rather than using foreign coordinates.
+        var respawn = level.getLevelData().getRespawnData();
+        BlockPos origin = respawn.dimension() == Level.OVERWORLD
+                ? respawn.pos()
+                : player.blockPosition().offset(3, 0, 2);
+        BlockPos core = place(level, origin);
         try {
             Files.writeString(file, "{\"x\":" + core.getX() + ",\"y\":" + core.getY() + ",\"z\":" + core.getZ() + "}");
         } catch (IOException ignored) { }
