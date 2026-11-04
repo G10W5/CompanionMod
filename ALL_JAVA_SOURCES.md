@@ -5092,6 +5092,20 @@ public class CompanionSeekBlockGoal extends Goal {
             if (level.getMaxLocalRawBrightness(mob.blockPosition()) < 8) mob.placeTorch();
         }
         if (breaking != null) { keepBreaking(level, t, now); return; }
+        // BURIED self-clear (was the 18:47-18:51 pocket: minutes of "pathfinder refuses the step" with no
+        // danger visible): gravel/sand packed into OUR feet or head cell makes every path request fail from
+        // an invalid START node and the direct-walk push is useless against a solid head - the mob looks
+        // perfectly safe yet cannot move 1 block. Dig ourselves out before anything else.
+        BlockPos meNow = mob.blockPosition();
+        BlockPos buried = !level.getBlockState(meNow).getCollisionShape(level, meNow).isEmpty() ? meNow
+                : !level.getBlockState(meNow.above()).getCollisionShape(level, meNow.above()).isEmpty() ? meNow.above() : null;
+        if (buried != null && safeToBreak(level, buried)) {
+            diag("buried: clearing " + buried + " around my own cell");
+            walkTo = null;
+            mob.getNavigation().stop();
+            pending.addFirst(buried);           // mined next tick (falling-cover guard still applies above it)
+            return;
+        }
         if (walkTo != null) { walk(level, now); return; }
         if (!pending.isEmpty()) {
             // Falling-block cover: if gravel/sand sits ANYWHERE above the queued cell (fell while we dug
@@ -5249,7 +5263,7 @@ public class CompanionSeekBlockGoal extends Goal {
         if (planStep(level, t, d, 0, false)) {
             t.legLen++;
             branchBoxed = 0;
-            if (t.legLen % 3 == 0) probeSides(level, t, d);   // strip-mine probes: peek left/right every 3rd block
+            if (t.legLen % 3 == 0) digTrays(level, t);        // strip mining: reach 4 trays left+right every 3rd block
             return;
         }
         // Blocked ahead (lava pocket, bedrock bump): mine at a slight angle or step over it before ending the leg.
@@ -5290,14 +5304,31 @@ public class CompanionSeekBlockGoal extends Goal {
      * 2 deep, body and head level): a matching block hiding behind stone is added to the vein deque, and
      * approach()/firstBlocker then digs the wall stone out to reach it - like a player peeking into the wall.
      */
-    private void probeSides(ServerLevel level, MineTask t, Direction d) {
-        probe(level, t, java.util.List.of(d.getClockWise(), d.getCounterClockWise()));
+    private void digTrays(ServerLevel level, MineTask t) {
+        if (pending.size() > 12) return;                    // don't bury the walk-ahead steps under tray work
+        Direction cat = Direction.from2DDataValue(t.dirData);
+        BlockPos me = mob.blockPosition();
+        for (Direction side : new Direction[]{ cat.getClockWise(), cat.getCounterClockWise() }) {
+            for (int depth = 1; depth <= 4; depth++) {
+                boolean open = true;
+                for (int h = 0; h <= 1; h++) {
+                    BlockPos c = me.relative(side, depth).above(h);
+                    if (pending.contains(c) || vein.contains(c)) continue;
+                    if (matches(t, level.getBlockState(c))) { vein.add(c); continue; }   // ore: chased via the vein queue
+                    if (!safeToBreak(level, c)) { open = false; break; }                // liquid edge: that tray stops here
+                    pending.add(c);
+                }
+                if (!open) break;
+            }
+        }
+        diag("branch: digging side trays (3rd block, reach 4) at " + me);
     }
 
     /**
      * Ambient probes: same peek-through-walls as the tunnel probes, but in ALL 4 horizontal directions and
      * running the whole time the seek task is active (every 2 s), not just while branch mining - the user
-     * asked for the peek mechanic to always work during any task. Cargo-culted from probeSides: hidden ore
+     * asked for the peek mechanic to always work during any task (branch legs dig full reach trays since
+     * then). Hidden ore found near wherever we happen to stand joins the vein deque, approach()/firstBlocker
      * found near wherever we happen to stand joins the vein deque, approach()/firstBlocker digs through.
      */
     private void probeAround(ServerLevel level, MineTask t) {
