@@ -1039,16 +1039,17 @@ import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.network.chat.Component;
 
 import java.nio.file.Path;
 
 /**
- * "Go and find/mine this block" chooser in the mod's grey bevelled settings look (was a dark full-screen
- * panel whose suggestion grid overflowed under the buttons). The amount field carries an explicit count
- * (blank = default: 16, diamonds 6) which rides the target as "iron_ore:12"; the server splits the suffix
- * (digits only after the last ':' - namespaced ids like aether:zanite_ore stay untouched). Suggestions sit
- * in ONE horizontally wheel-scrollable chip row that rebuilds its buttons on scroll.
+ * "Go and find/mine this block" chooser in the mod's grey bevelled settings look. Amount field carries an
+ * explicit count (blank = default: 16, diamonds 6) sent as "iron_ore:12". The suggestion chips sit in a
+ * BLACK well and are drawn manually INSIDE A SCISSOR: chips that do not fit are CUT OFF at the well edge
+ * (not hidden), clicking a chip hit-tests against the same math, and the wheel scrolls them with a visible
+ * scrollbar underneath.
  */
 public class CompanionFindBlockScreen extends Screen {
     private static final String[][] QUICK = {
@@ -1069,7 +1070,6 @@ public class CompanionFindBlockScreen extends Screen {
     private EditBox blockField, amountField;
     private String status = "";
 
-    // Values survive the chip-row rebuildWidgets() (scrolling re-runs init()).
     private String blockValue = "", amountValue = "";
     private int chipScroll;                       // horizontal wheel offset in pixels
 
@@ -1106,26 +1106,10 @@ public class CompanionFindBlockScreen extends Screen {
         // No setFilter on the common mapping set: strip anything that is not a digit in the responder.
         amountField.setResponder(v -> {
             String d = v.replaceAll("[^0-9]", "");
-            if (!d.equals(v)) { amountField.setValue(d); return; }   // re-entrant once, then stable
+            if (!d.equals(v)) { amountField.setValue(d); return; }
             amountValue = d;
         });
         this.addRenderableWidget(amountField);
-
-        // Only chips that fit FULLY inside the well become buttons - partial chips used to render over the
-        // panel edge, outside the well ("buttons clipping out of the background").
-        int cur = ix - chipScroll;
-        for (String[] e : QUICK) {
-            int bw = this.font.width(e[0]) + 14;
-            if (cur >= ix && cur + bw <= ix + iw) {
-                final String id = e[1];
-                this.addRenderableWidget(Button.builder(Component.literal(e[0]), b -> {
-                    blockValue = id;
-                    blockField.setValue(id);
-                    status = "";
-                }).pos(cur, chipTop()).size(bw, 20).build());
-            }
-            cur += bw + 4;
-        }
 
         this.addRenderableWidget(Button.builder(Component.literal("Find & Mine"), b -> find())
                 .pos(ix, py + panelH - 52).size(iw, 20).build());
@@ -1145,11 +1129,30 @@ public class CompanionFindBlockScreen extends Screen {
         int top = chipTop();
         int max = Math.max(0, chipTotalW() - iw);
         if (max > 0 && mouseY >= top - 2 && mouseY <= top + 26) {
-            int next = (int) Math.max(0, Math.min(max, chipScroll - scrollY * 24));
-            if (next != chipScroll) { chipScroll = next; rebuildWidgets(); }
-            return true;
+            chipScroll = (int) Math.max(0, Math.min(max, chipScroll - scrollY * 24));
+            return true;                            // repaint only - no widget rebuild needed
         }
         return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+    }
+
+    @Override
+    public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+        if (event.button() == 0 && event.x() >= ix - 2 && event.x() < ix + iw + 2
+                && event.y() >= chipTop() - 2 && event.y() < chipTop() + 22) {
+            int x = ix - chipScroll;
+            for (String[] e : QUICK) {
+                int bw = this.font.width(e[0]) + 14;
+                if (event.x() >= x && event.x() < x + bw) {
+                    blockValue = e[1];
+                    blockField.setValue(e[1]);
+                    status = "";
+                    return true;
+                }
+                x += bw + 4;
+            }
+            return true;                            // inside the well: swallow the click
+        }
+        return super.mouseClicked(event, doubleClick);
     }
 
     private void find() {
@@ -1171,12 +1174,8 @@ public class CompanionFindBlockScreen extends Screen {
     @Override
     public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
         super.extractBackground(g, mouseX, mouseY, partialTick);
-        CompanionUi.panel(g, px, py, px + panelW, py + panelH);       // same bevelled panel as Settings
-        // Sunken lighter-grey well behind the chips - the slot-well look from the settings/inventory style
-        // (pure black clashed on the light panel). Chips render later, on top of it.
-        g.fill(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22, 0xFF373737);
-        g.fill(ix - 1, chipTop() - 1, ix + iw + 1, chipTop() + 21, 0xFFFFFFFF);
-        g.fill(ix, chipTop(), ix + iw, chipTop() + 20, 0xFF8B8B8B);
+        CompanionUi.panel(g, px, py, px + panelW, py + panelH);
+        g.fill(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22, 0xFF000000);   // BLACK well behind the chips
     }
 
     @Override
@@ -1184,19 +1183,35 @@ public class CompanionFindBlockScreen extends Screen {
         super.extractRenderState(g, mouseX, mouseY, partialTick);      // background + widgets
         int cx = this.width / 2;
         g.centeredText(this.font, "Find & Mine", cx, py + 8, CompanionUi.TEXT_DARK);
-        String sub = "Blank amount = default (16, diamonds 6)";   // fits the panel width outright
-        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw - 8), cx, py + 18, CompanionUi.TEXT_DARK);
-        g.text(this.font, "Amount", ix + 62, py + HEAD_H + 30, CompanionUi.TEXT_DARK, true);
-        // Visible horizontal scrollbar for the chip row, sunken lighter-grey like the well.
+        String sub = "Blank amount = default (16, diamonds 6)";
+        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw - 8), cx, py + 18, CompanionUi.TEXT_MUTED);
+        g.text(this.font, "Amount", ix + 62, py + HEAD_H + 30, CompanionUi.TEXT_MUTED, true);
+
+        // Chips inside a scissor: ones that do not fit are CUT OFF at the well edge, never hidden.
+        g.enableScissor(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22);
+        int x = ix - chipScroll;
+        for (String[] e : QUICK) {
+            int bw = this.font.width(e[0]) + 14;
+            if (x + bw > ix - 2 && x < ix + iw + 2) {
+                boolean hot = mouseX >= x && mouseX < x + bw && mouseY >= chipTop() && mouseY < chipTop() + 20;
+                g.fill(x, chipTop(), x + bw, chipTop() + 20, 0xFF000000);
+                g.fill(x + 1, chipTop() + 1, x + bw - 1, chipTop() + 19, hot ? 0xFF8C8C8C : 0xFF6C6C6C);
+                g.fill(x + 1, chipTop() + 1, x + bw - 1, chipTop() + 2, hot ? 0xFFA2A2A2 : 0xFF8E8E8E);
+                g.fill(x + 1, chipTop() + 18, x + bw - 1, chipTop() + 19, 0xFF3B3B3B);
+                g.text(this.font, e[0], x + 7, chipTop() + 6, 0xFFFFFFFF, true);
+            }
+            x += bw + 4;
+        }
+        g.disableScissor();
+
+        // Visible horizontal scrollbar for the chip row.
         int max = Math.max(0, chipTotalW() - iw);
         if (max > 0) {
             int ty = chipTop() + 23;
-            g.fill(ix, ty, ix + iw, ty + 4, 0xFF373737);
-            g.fill(ix + 1, ty + 1, ix + iw - 1, ty + 3, 0xFF8B8B8B);
+            g.fill(ix, ty, ix + iw, ty + 4, 0xFF000000);
             int tw = Math.max(24, iw * iw / Math.max(1, chipTotalW()));
             int tx = ix + (iw - tw) * chipScroll / max;
-            g.fill(tx - 1, ty - 1, tx + tw + 1, ty + 5, 0xFF000000);
-            g.fill(tx, ty, tx + tw, ty + 4, 0xFFC6C6C6);
+            g.fill(tx + 1, ty, tx + tw - 1, ty + 4, 0xFFB0B0B0);
         }
         if (!status.isBlank()) g.centeredText(this.font, status, cx, py + 126, CompanionUi.TEXT_ERROR);
     }
@@ -1213,15 +1228,16 @@ import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
+import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
 import org.lwjgl.glfw.GLFW;
 
 /**
- * Type any goal in plain words; the AI turns it into a plan. Same grey bevelled panel style as
- * Companion Settings / Find &amp; Mine (was a full-screen vanilla menu with the chips floating over the
- * world). Examples live in ONE horizontally wheel-scrollable chip row over a black well with a visible
- * scrollbar; the row rebuilds its buttons on scroll and the typed text survives that rebuild.
+ * Type any goal in plain words; the AI turns it into a plan. Same grey bevelled panel style as Settings /
+ * Find &amp; Mine. The example chips sit in a BLACK well and are drawn manually INSIDE A SCISSOR: chips
+ * that do not fit are CUT OFF at the well edge, clicks hit-test the same math, and the wheel scrolls them
+ * with a visible scrollbar underneath.
  */
 public class CompanionGoalScreen extends Screen {
     private static final String[] IDEAS = {
@@ -1236,7 +1252,7 @@ public class CompanionGoalScreen extends Screen {
 
     private final Screen parent;
     private EditBox field;
-    private String fieldValue = "";               // survives the chip-row rebuildWidgets()
+    private String fieldValue = "";
     private int chipScroll;                       // horizontal wheel offset in pixels
 
     private int px, py, panelW, panelH, ix, iw;   // geometry (recomputed in init)
@@ -1265,17 +1281,6 @@ public class CompanionGoalScreen extends Screen {
         this.addRenderableWidget(field);
         this.setInitialFocus(field);
 
-        int x = ix - chipScroll;
-        for (String idea : IDEAS) {
-            int bw = this.font.width(idea) + 14;
-            // Only chips that fit FULLY inside the well: partial chips rendered over the panel edge.
-            if (x >= ix && x + bw <= ix + iw) {
-                this.addRenderableWidget(Button.builder(Component.literal(idea), b -> field.setValue(idea))
-                        .pos(x, chipTop()).size(bw, 20).build());
-            }
-            x += bw + 4;
-        }
-
         int bw = (iw - 4) / 2;
         int fy = py + panelH - 52;
         this.addRenderableWidget(Button.builder(Component.literal("Plan It"), b -> submit())
@@ -1295,11 +1300,28 @@ public class CompanionGoalScreen extends Screen {
         int top = chipTop();
         int max = Math.max(0, chipTotalW() - iw);
         if (max > 0 && mouseY >= top - 2 && mouseY <= top + 26) {
-            int next = (int) Math.max(0, Math.min(max, chipScroll - scrollY * 24));
-            if (next != chipScroll) { chipScroll = next; rebuildWidgets(); }
-            return true;
+            chipScroll = (int) Math.max(0, Math.min(max, chipScroll - scrollY * 24));
+            return true;                            // repaint only - no widget rebuild needed
         }
         return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+    }
+
+    @Override
+    public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+        if (event.button() == 0 && event.x() >= ix - 2 && event.x() < ix + iw + 2
+                && event.y() >= chipTop() - 2 && event.y() < chipTop() + 22) {
+            int x = ix - chipScroll;
+            for (String idea : IDEAS) {
+                int bw = this.font.width(idea) + 14;
+                if (event.x() >= x && event.x() < x + bw) {
+                    field.setValue(idea);
+                    return true;
+                }
+                x += bw + 4;
+            }
+            return true;                            // inside the well: swallow the click
+        }
+        return super.mouseClicked(event, doubleClick);
     }
 
     private void submit() {
@@ -1323,10 +1345,7 @@ public class CompanionGoalScreen extends Screen {
     public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
         super.extractBackground(g, mouseX, mouseY, partialTick);
         CompanionUi.panel(g, px, py, px + panelW, py + panelH);
-        // Sunken lighter-grey well behind the chips (slot-well style, not harsh black).
-        g.fill(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22, 0xFF373737);
-        g.fill(ix - 1, chipTop() - 1, ix + iw + 1, chipTop() + 21, 0xFFFFFFFF);
-        g.fill(ix, chipTop(), ix + iw, chipTop() + 20, 0xFF8B8B8B);
+        g.fill(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22, 0xFF000000);   // BLACK well behind the chips
     }
 
     @Override
@@ -1335,17 +1354,33 @@ public class CompanionGoalScreen extends Screen {
         int cx = this.width / 2;
         g.centeredText(this.font, "Give a Goal", cx, py + 8, CompanionUi.TEXT_DARK);
         String sub = "Amounts in the text work: 'bring me 12 iron'";
-        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw - 8), cx, py + 18, CompanionUi.TEXT_DARK);
-        // Visible horizontal scrollbar for the chip row, sunken lighter-grey like the well.
+        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw - 8), cx, py + 18, CompanionUi.TEXT_MUTED);
+
+        // Chips inside a scissor: ones that do not fit are CUT OFF at the well edge, never hidden.
+        g.enableScissor(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22);
+        int x = ix - chipScroll;
+        for (String idea : IDEAS) {
+            int bw = this.font.width(idea) + 14;
+            if (x + bw > ix - 2 && x < ix + iw + 2) {
+                boolean hot = mouseX >= x && mouseX < x + bw && mouseY >= chipTop() && mouseY < chipTop() + 20;
+                g.fill(x, chipTop(), x + bw, chipTop() + 20, 0xFF000000);
+                g.fill(x + 1, chipTop() + 1, x + bw - 1, chipTop() + 19, hot ? 0xFF8C8C8C : 0xFF6C6C6C);
+                g.fill(x + 1, chipTop() + 1, x + bw - 1, chipTop() + 2, hot ? 0xFFA2A2A2 : 0xFF8E8E8E);
+                g.fill(x + 1, chipTop() + 18, x + bw - 1, chipTop() + 19, 0xFF3B3B3B);
+                g.text(this.font, idea, x + 7, chipTop() + 6, 0xFFFFFFFF, true);
+            }
+            x += bw + 4;
+        }
+        g.disableScissor();
+
+        // Visible horizontal scrollbar for the chip row.
         int max = Math.max(0, chipTotalW() - iw);
         if (max > 0) {
             int ty = chipTop() + 23;
-            g.fill(ix, ty, ix + iw, ty + 4, 0xFF373737);
-            g.fill(ix + 1, ty + 1, ix + iw - 1, ty + 3, 0xFF8B8B8B);
+            g.fill(ix, ty, ix + iw, ty + 4, 0xFF000000);
             int tw = Math.max(24, iw * iw / Math.max(1, chipTotalW()));
             int tx = ix + (iw - tw) * chipScroll / max;
-            g.fill(tx - 1, ty - 1, tx + tw + 1, ty + 5, 0xFF000000);
-            g.fill(tx, ty, tx + tw, ty + 4, 0xFFC6C6C6);
+            g.fill(tx + 1, ty, tx + tw - 1, ty + 4, 0xFFB0B0B0);
         }
     }
 }
@@ -1493,11 +1528,11 @@ public class CompanionInventoryScreen extends AbstractContainerScreen<CompanionI
         for (Slot s : this.menu.slots) slotWell(g, leftPos + s.x - 1, topPos + s.y - 1);
         // Ghost icons like the player inventory: helmet/chest/legs/boots and pick/axe/shovel/sword outlines
         // showing what belongs in each slot. Real slot items are extracted after the background and cover them.
-        // Faded to ~5% with a 95%-alpha wash of the slot fill (a solid ghost competed with the real items).
+        // Faded to 20% visibility (user-chosen): a 95%... -> D0 alpha wash of the slot fill over the ghost.
         for (int i = 0; i < GHOSTS.length && i < this.menu.slots.size(); i++) {
             Slot s = this.menu.slots.get(i);
             g.fakeItem(GHOSTS[i], leftPos + s.x, topPos + s.y);
-            g.fill(leftPos + s.x, topPos + s.y, leftPos + s.x + 16, topPos + s.y + 16, 0xF28B8B8B);
+            g.fill(leftPos + s.x, topPos + s.y, leftPos + s.x + 16, topPos + s.y + 16, 0xD08B8B8B);
         }
     }
 

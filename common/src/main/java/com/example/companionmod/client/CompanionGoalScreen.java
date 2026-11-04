@@ -5,15 +5,16 @@ import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
+import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
 import org.lwjgl.glfw.GLFW;
 
 /**
- * Type any goal in plain words; the AI turns it into a plan. Same grey bevelled panel style as
- * Companion Settings / Find &amp; Mine (was a full-screen vanilla menu with the chips floating over the
- * world). Examples live in ONE horizontally wheel-scrollable chip row over a black well with a visible
- * scrollbar; the row rebuilds its buttons on scroll and the typed text survives that rebuild.
+ * Type any goal in plain words; the AI turns it into a plan. Same grey bevelled panel style as Settings /
+ * Find &amp; Mine. The example chips sit in a BLACK well and are drawn manually INSIDE A SCISSOR: chips
+ * that do not fit are CUT OFF at the well edge, clicks hit-test the same math, and the wheel scrolls them
+ * with a visible scrollbar underneath.
  */
 public class CompanionGoalScreen extends Screen {
     private static final String[] IDEAS = {
@@ -28,7 +29,7 @@ public class CompanionGoalScreen extends Screen {
 
     private final Screen parent;
     private EditBox field;
-    private String fieldValue = "";               // survives the chip-row rebuildWidgets()
+    private String fieldValue = "";
     private int chipScroll;                       // horizontal wheel offset in pixels
 
     private int px, py, panelW, panelH, ix, iw;   // geometry (recomputed in init)
@@ -57,17 +58,6 @@ public class CompanionGoalScreen extends Screen {
         this.addRenderableWidget(field);
         this.setInitialFocus(field);
 
-        int x = ix - chipScroll;
-        for (String idea : IDEAS) {
-            int bw = this.font.width(idea) + 14;
-            // Only chips that fit FULLY inside the well: partial chips rendered over the panel edge.
-            if (x >= ix && x + bw <= ix + iw) {
-                this.addRenderableWidget(Button.builder(Component.literal(idea), b -> field.setValue(idea))
-                        .pos(x, chipTop()).size(bw, 20).build());
-            }
-            x += bw + 4;
-        }
-
         int bw = (iw - 4) / 2;
         int fy = py + panelH - 52;
         this.addRenderableWidget(Button.builder(Component.literal("Plan It"), b -> submit())
@@ -87,11 +77,28 @@ public class CompanionGoalScreen extends Screen {
         int top = chipTop();
         int max = Math.max(0, chipTotalW() - iw);
         if (max > 0 && mouseY >= top - 2 && mouseY <= top + 26) {
-            int next = (int) Math.max(0, Math.min(max, chipScroll - scrollY * 24));
-            if (next != chipScroll) { chipScroll = next; rebuildWidgets(); }
-            return true;
+            chipScroll = (int) Math.max(0, Math.min(max, chipScroll - scrollY * 24));
+            return true;                            // repaint only - no widget rebuild needed
         }
         return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+    }
+
+    @Override
+    public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+        if (event.button() == 0 && event.x() >= ix - 2 && event.x() < ix + iw + 2
+                && event.y() >= chipTop() - 2 && event.y() < chipTop() + 22) {
+            int x = ix - chipScroll;
+            for (String idea : IDEAS) {
+                int bw = this.font.width(idea) + 14;
+                if (event.x() >= x && event.x() < x + bw) {
+                    field.setValue(idea);
+                    return true;
+                }
+                x += bw + 4;
+            }
+            return true;                            // inside the well: swallow the click
+        }
+        return super.mouseClicked(event, doubleClick);
     }
 
     private void submit() {
@@ -115,10 +122,7 @@ public class CompanionGoalScreen extends Screen {
     public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
         super.extractBackground(g, mouseX, mouseY, partialTick);
         CompanionUi.panel(g, px, py, px + panelW, py + panelH);
-        // Sunken lighter-grey well behind the chips (slot-well style, not harsh black).
-        g.fill(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22, 0xFF373737);
-        g.fill(ix - 1, chipTop() - 1, ix + iw + 1, chipTop() + 21, 0xFFFFFFFF);
-        g.fill(ix, chipTop(), ix + iw, chipTop() + 20, 0xFF8B8B8B);
+        g.fill(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22, 0xFF000000);   // BLACK well behind the chips
     }
 
     @Override
@@ -127,17 +131,33 @@ public class CompanionGoalScreen extends Screen {
         int cx = this.width / 2;
         g.centeredText(this.font, "Give a Goal", cx, py + 8, CompanionUi.TEXT_DARK);
         String sub = "Amounts in the text work: 'bring me 12 iron'";
-        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw - 8), cx, py + 18, CompanionUi.TEXT_DARK);
-        // Visible horizontal scrollbar for the chip row, sunken lighter-grey like the well.
+        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw - 8), cx, py + 18, CompanionUi.TEXT_MUTED);
+
+        // Chips inside a scissor: ones that do not fit are CUT OFF at the well edge, never hidden.
+        g.enableScissor(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22);
+        int x = ix - chipScroll;
+        for (String idea : IDEAS) {
+            int bw = this.font.width(idea) + 14;
+            if (x + bw > ix - 2 && x < ix + iw + 2) {
+                boolean hot = mouseX >= x && mouseX < x + bw && mouseY >= chipTop() && mouseY < chipTop() + 20;
+                g.fill(x, chipTop(), x + bw, chipTop() + 20, 0xFF000000);
+                g.fill(x + 1, chipTop() + 1, x + bw - 1, chipTop() + 19, hot ? 0xFF8C8C8C : 0xFF6C6C6C);
+                g.fill(x + 1, chipTop() + 1, x + bw - 1, chipTop() + 2, hot ? 0xFFA2A2A2 : 0xFF8E8E8E);
+                g.fill(x + 1, chipTop() + 18, x + bw - 1, chipTop() + 19, 0xFF3B3B3B);
+                g.text(this.font, idea, x + 7, chipTop() + 6, 0xFFFFFFFF, true);
+            }
+            x += bw + 4;
+        }
+        g.disableScissor();
+
+        // Visible horizontal scrollbar for the chip row.
         int max = Math.max(0, chipTotalW() - iw);
         if (max > 0) {
             int ty = chipTop() + 23;
-            g.fill(ix, ty, ix + iw, ty + 4, 0xFF373737);
-            g.fill(ix + 1, ty + 1, ix + iw - 1, ty + 3, 0xFF8B8B8B);
+            g.fill(ix, ty, ix + iw, ty + 4, 0xFF000000);
             int tw = Math.max(24, iw * iw / Math.max(1, chipTotalW()));
             int tx = ix + (iw - tw) * chipScroll / max;
-            g.fill(tx - 1, ty - 1, tx + tw + 1, ty + 5, 0xFF000000);
-            g.fill(tx, ty, tx + tw, ty + 4, 0xFFC6C6C6);
+            g.fill(tx + 1, ty, tx + tw - 1, ty + 4, 0xFFB0B0B0);
         }
     }
 }

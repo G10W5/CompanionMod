@@ -40,11 +40,11 @@ public class CompanionInventoryScreen extends AbstractContainerScreen<CompanionI
         for (Slot s : this.menu.slots) slotWell(g, leftPos + s.x - 1, topPos + s.y - 1);
         // Ghost icons like the player inventory: helmet/chest/legs/boots and pick/axe/shovel/sword outlines
         // showing what belongs in each slot. Real slot items are extracted after the background and cover them.
-        // Faded to ~5% with a 95%-alpha wash of the slot fill (a solid ghost competed with the real items).
+        // Faded to 20% visibility (user-chosen): a 95%... -> D0 alpha wash of the slot fill over the ghost.
         for (int i = 0; i < GHOSTS.length && i < this.menu.slots.size(); i++) {
             Slot s = this.menu.slots.get(i);
             g.fakeItem(GHOSTS[i], leftPos + s.x, topPos + s.y);
-            g.fill(leftPos + s.x, topPos + s.y, leftPos + s.x + 16, topPos + s.y + 16, 0xF28B8B8B);
+            g.fill(leftPos + s.x, topPos + s.y, leftPos + s.x + 16, topPos + s.y + 16, 0xD08B8B8B);
         }
     }
 
