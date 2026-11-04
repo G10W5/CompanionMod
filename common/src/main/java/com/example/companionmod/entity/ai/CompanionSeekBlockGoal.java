@@ -320,9 +320,12 @@ public class CompanionSeekBlockGoal extends Goal {
             t.leg++;
             t.legLen = 0;
             if (t.leg >= MAX_LEGS) {
+                // Used to PAUSE for a spoken "I've covered this level" here - but a PAUSED task stops every
+                // plan deadline extension, so an AI goal cut dead after 30 s while the companion stood
+                // doing nothing. Deep jobs now simply turn around and branch on, until the order is done.
                 t.leg = 0;
-                t.pause();
-                say(level, "I've covered this level. Say 'continue' to keep looking.", true);
+                t.legLen = 0;
+                t.dirData = d.getOpposite().get2DDataValue();
                 return;
             }
             t.dirData = d.getClockWise().get2DDataValue();
@@ -941,8 +944,11 @@ public class CompanionSeekBlockGoal extends Goal {
             standLast = mob.position();
             if (adjacent && standStall > 5) {
                 if (standStall == 6) diag("stand: pathfinder refuses the step, direct walk onto " + w);
-                mob.getLookControl().setLookAt(w.getX() + 0.5, w.getY() + 1.0, w.getZ() + 0.5);
-                if (sdy > 0.3 && sdy <= 1.6 && mob.onGround()) mob.getJumpControl().jump();
+                // No jump when the head is under a block: a blocked overhead makes the hop a head-thud loop.
+                if (sdy > 0.3 && sdy <= 1.6 && mob.onGround()
+                        && passable(level, mob.blockPosition().above(2)) && passable(level, mob.blockPosition().above(3))) {
+                    mob.getJumpControl().jump();
+                }
                 mob.getMoveControl().setWantedPosition(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.15);
             } else if (nav.isDone() && walkTicks % 10 == 0) {
                 nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.15);   // re-request the clean path twice a second
@@ -959,7 +965,8 @@ public class CompanionSeekBlockGoal extends Goal {
             if (++walkRetries > 4) { failWalk(); return; }
             // Ledge hop: the pathfinder marks a 1-block step as reachable but the body just stands against
             // it ("stuck on slopes, can't jump"). One hop on the first retry, then normal re-pathing.
-            if (walkRetries == 1) {
+            // No jumping when the head is under a block: that hop is a head-thud, another plan must come.
+            if (walkRetries == 1 && passable(level, mob.blockPosition().above(2)) && passable(level, mob.blockPosition().above(3))) {
                 double dx = w.getX() + 0.5 - mob.getX(), dz = w.getZ() + 0.5 - mob.getZ();
                 double dy = w.getY() - mob.getY();
                 if (dx * dx + dz * dz < 3.0 && dy > 0.3 && dy <= 1.6) {
