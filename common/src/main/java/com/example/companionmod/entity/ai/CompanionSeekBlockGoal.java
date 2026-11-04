@@ -88,6 +88,9 @@ public class CompanionSeekBlockGoal extends Goal {
     private boolean selected;        // goal selector has us running (see selected())
     private int lastDescendY = Integer.MIN_VALUE;   // DESCEND: only trust slope-walks while height is actually lost
     private long lastDescendDrop;
+    private int watchMined;                         // no-silent-stall watchdog sample (30 s outcome window)
+    private long watchAt;
+    private Vec3 watchPos;
     private String lastDiag = "";    // change-gated diagnostic lines (one per real state change, never per frame)
 
     public CompanionSeekBlockGoal(CompanionEntity mob) {
@@ -133,6 +136,7 @@ public class CompanionSeekBlockGoal extends Goal {
         approachTries.clear();
         approachTarget = pillarTarget = jumpCell = bridgeCell = null;
         pillarAir = 0;
+        watchAt = 0;                            // the no-silent-stall watchdog re-arms after any state reset
         branchBoxed = 0;
         lastDescendY = Integer.MIN_VALUE;
         lastDiag = "";
@@ -191,6 +195,28 @@ public class CompanionSeekBlockGoal extends Goal {
             return;
         }
         if (now - lastUnreachableClear >= 600) { lastUnreachableClear = now; unreachable.clear(); }   // "unreachable" marks are retried every 30 s: never a permanent blacklist
+        // Independent no-silent-stall watchdog: the idle timers above trust lastProgress, and loops that keep
+        // "succeeding" without real outcome (arrived flicker on jitter, heartbeat from being nudged by falling
+        // gravel, phantom break targets) can refresh lastProgress forever. Real case: gravel buried the
+        // companion 14:30:46-14:38:26 in latest.log - 8 MINUTES with no watchdog line and no speech. This one
+        // measures the GOAL's actual outcome: nothing mined AND no significant movement over 30 s while not
+        // paused -> speak up and pause, instead of silently rotting in place.
+        if (now - watchAt >= 600) {
+            if (watchAt != 0 && !t.paused && t.mined == watchMined
+                    && mob.position().distanceToSqr(watchPos) < 4.0) {
+                watchAt = now;                          // re-arm BEFORE pausing: 'continue' starts a fresh sample
+                t.pause();
+                say(level, "I'm stuck, something's blocking me. Say 'continue' when I'm free.", true);
+                cancelBreak(level);
+                pending.clear();
+                stepStand = walkTo = oreTarget = null;
+                mob.getNavigation().stop();
+                return;
+            }
+            watchAt = now;
+            watchMined = t.mined;
+            watchPos = mob.position();
+        }
         // Underground it gets dark: drop a torch from the bag every so often so the tunnels stay lit.
         if (t.phase != MineTask.Phase.SEARCH && --torchCooldown <= 0) {
             torchCooldown = 60;

@@ -1,6 +1,7 @@
 package com.example.companionmod.client;
 
 import com.example.companionmod.CompanionMod;
+import com.example.companionmod.entity.CompanionEntity;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.resources.sounds.AbstractSoundInstance;
 import net.minecraft.client.resources.sounds.Sound;
@@ -74,13 +75,23 @@ public class PcmStreamSound extends AbstractSoundInstance {
         this.listen = listen;
         this.volume = Math.max(0.01f, Math.min(1f, volume));   // engine multiplies instance volume; keep Sound at 1.0
         this.pitch = 1.0f;
-        this.relative = true;                                  // voice follows the listener; always audible
-        this.attenuation = SoundInstance.Attenuation.NONE;
-        Minecraft mc = Minecraft.getInstance();
-        if (mc.player != null) {                               // anchor at the player so SPR hears an in-room source
-            this.x = mc.player.getX();
-            this.y = mc.player.getY();
-            this.z = mc.player.getZ();
+        // REAL 3D source: the voice comes straight out of the companion entity. The old anchor was
+        // relative=true with the player's ABSOLUTE world coordinates written into x/y/z - those are
+        // interpreted as offsets from the LISTENER, so the source sat ~1880 blocks away along +X and
+        // the voice always sounded "from the right side and somewhere behind" (user report 14:2x).
+        // Linear attenuation keeps it positional (reverb via SPR keeps working either way).
+        this.relative = false;
+        this.attenuation = SoundInstance.Attenuation.LINEAR;
+        CompanionEntity src = ClientVoice.findCompanion(Minecraft.getInstance());
+        if (src != null) {                     // anchor at the companion so SPR hears a source in the right spot
+            this.x = src.getX();
+            this.y = src.getY() + 1.4;         // head height, like a speaking player
+            this.z = src.getZ();
+        } else if (Minecraft.getInstance().player != null) {   // no companion loaded: player's own head
+            var p = Minecraft.getInstance().player;
+            this.x = p.getX();
+            this.y = p.getY();
+            this.z = p.getZ();
         }
         this.sound = new Sound(EVENT_ID, ConstantFloat.of(1.0f), ConstantFloat.of(1.0f), 1,
                 Sound.Type.FILE, true /* stream */, false /* preload */, 16);
