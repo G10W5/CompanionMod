@@ -130,6 +130,10 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     // when the player is far away. Server-side state; released on toggle-off, task stop and entity removal.
     private boolean forceChunks;
     private final java.util.Set<Long> forcedChunks = new java.util.HashSet<>();
+    // Autonomous roadblock recovery (see tick()): pause -> 5 s -> try another way, capped and budget-resetting.
+    private int autoResumeAtTick = -1;
+    private int autoResumeCount;
+    private int lastMinedSeen = -1;
     private String lastSpokenText = "";
     private long lastSpokenTime = 0;
     private int lastSpokenTick = -10000;
@@ -337,6 +341,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         } else {
             boolean nether = level().dimension() == net.minecraft.world.level.Level.NETHER;
             mineTask.begin(blockId, nether, getDirection().get2DDataValue());
+            autoResumeCount = 0;                         // a brand-new job starts with a fresh autonomy budget
         }
     }
     public void clearSeekBlock() { mineTask.finish(); }
@@ -365,6 +370,9 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     }
 
     public void applyCommand(CompanionCommand cmd, ServerPlayer from, String target) {
+        // An EXPLICIT player order re-funds the autonomous roadblock budget (plan steps keep it: they are
+        // the companion's own initiative, not confirmation).
+        if (from != null && !applyingPlanStep) autoResumeCount = 0;
         if (!applyingPlanStep && cmd.interruptsPlanning()) {
             // One explicit intent at a time: a manual order pauses the AI plan (STOP forgets it entirely).
             planner.notePlayerOrder(tickCount);
@@ -884,6 +892,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     @Override public void planSay(String text) { speak(text); }
     @Override public boolean planSeekActive() { return !seekBlock().isBlank(); }
+    /** Explicit amount from the goal text ("bring me 12 iron ore"): overrides the default 16 (diamonds 6). */
+    @Override public void planSeekCount(int count) { if (count > 0) mineTask.want = Math.min(64, count); }
     @Override public boolean planPlantActive() { return plantUntil > level().getGameTime(); }
     @Override public boolean planPickupActive() { return isPickupRequested() || isPickupEnabled(); }
     @Override public boolean planFighting() { LivingEntity t = getTarget(); return t != null && t.isAlive(); }
@@ -1351,6 +1361,30 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         }
         if (tickCount % 20 == 0) refreshEquipment();
         if (tickCount % 20 == 0) aggroMonsters();   // hostile mobs should see the companion as a target
+        // AUTONOMOUS ROADBLOCK RECOVERY (user: "what's the point of autonomy if he always needs continue?").
+        // A paused task used to wait for 'continue' forever - unattended (force-loaded chunks) he stopped the
+        // moment anything was impassable. 5 s after a pause with no player reaction: keep the SAME job
+        // (phase/want/mined preserved), rotate the heading, bump serial so the goal drops stale walks/breaks/
+        // attempt counters, and try another way - up to 6 attempts, then say so ONCE and stay put. Real
+        // progress (mined count changes) resets the attempt budget; explicit player orders reset it too.
+        if (mineTask.mined != lastMinedSeen) { lastMinedSeen = mineTask.mined; autoResumeCount = 0; }
+        if (mineTask.paused && !isInjured() && !isSitting()) {
+            if (autoResumeAtTick < 0 && autoResumeCount < 8) autoResumeAtTick = tickCount + 100;
+            else if (autoResumeAtTick >= 0 && tickCount >= autoResumeAtTick && mineTask.exists()) {
+                autoResumeAtTick = -1;
+                autoResumeCount++;
+                if (autoResumeCount > 6) {
+                    if (autoResumeCount == 7) speak("I truly can't get through. Say 'continue' once the way is clear.");
+                } else {
+                    mineTask.resume();
+                    mineTask.serial++;                                          // goal resets its stale transient state
+                    mineTask.dirData = Direction.from2DDataValue(mineTask.dirData).getClockWise().get2DDataValue();
+                    speak(autoResumeCount == 1 ? "I'm stuck here. Trying another way." : "Trying another way again.");
+                }
+            }
+        } else if (!mineTask.paused) {
+            autoResumeAtTick = -1;
+        }
         if (tickCount % 100 == 0) updateForcedChunks();   // force-load toggle: keep his 3x3 chunk area alive
         // Drop an automatic target we cannot reach (so mining etc. resumes); player-forced targets persist.
         LivingEntity tgt = getTarget();

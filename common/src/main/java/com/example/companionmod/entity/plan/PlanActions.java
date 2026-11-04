@@ -11,6 +11,8 @@ public interface PlanActions {
     void planSay(String text);
     boolean planSeekActive();
     boolean planPickupActive();
+    /** Explicit amount from the goal text ("bring me 12 iron ore"): overrides the seek task's default want. */
+    default void planSeekCount(int count) { }
     default boolean planPlantActive() { return false; }
     boolean planFighting();
     /** Freeze the plan while true (e.g. injured and recovering). */

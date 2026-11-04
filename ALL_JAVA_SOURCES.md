@@ -4530,6 +4530,21 @@ public class CompanionMeleeGoal extends MeleeAttackGoal {
         super(mob, speed, followingTarget);
     }
 
+    /**
+     * Fight at ~3.5 blocks like a player instead of nose-to-nose. Two pieces in 26.x (verified by bytecode -
+     * getAttackReachSqr no longer exists): (1) canPerformAttack uses OUR distance instead of the bounding-box
+     * gap, (2) after the vanilla tick the navigation is halted once inside reach - vanilla paths TO the target
+     * cell, which is what walked him INTO the enemy's face before swinging (user report).
+     */
+    private static final double REACH_SQ = 3.5 * 3.5;
+
+    @Override
+    protected boolean canPerformAttack(LivingEntity target) {
+        return isTimeToAttack()
+                && mob.distanceToSqr(target) <= REACH_SQ
+                && mob.getSensing().hasLineOfSight(target);
+    }
+
     @Override
     public void tick() {
         LivingEntity target = this.mob.getTarget();
@@ -4543,6 +4558,11 @@ public class CompanionMeleeGoal extends MeleeAttackGoal {
             return;                               // never walk into a lit fuse
         }
         super.tick();
+        // Halt at reach: the vanilla path aims at the target CELL, so without this he keeps closing to
+        // nose distance no matter what canPerformAttack allows.
+        if (target != null && target.isAlive() && this.mob.distanceToSqr(target) <= REACH_SQ) {
+            this.mob.getNavigation().stop();
+        }
     }
 }
 ```
@@ -4980,6 +5000,10 @@ public class CompanionSeekBlockGoal extends Goal {
     private boolean descendResume;                  // next DESCEND decide tries walking down the EXISTING staircase first
     private String waitingFor;                      // non-null: an entity physically stands in our 1-block walk corridor
     private long lastWaitLog;
+    private double walkBestD = Double.MAX_VALUE;    // best distance reached toward the current walk target (progress heartbeat)
+    private long walkBestTick;
+    private long caveSearchUntil;                   // DESCEND->BRANCH: caves first, strip mining only as the last resort
+    private long nextCaveAt;
     private String lastDiag = "";    // change-gated diagnostic lines (one per real state change, never per frame)
 
     public CompanionSeekBlockGoal(CompanionEntity mob) {
@@ -5026,6 +5050,8 @@ public class CompanionSeekBlockGoal extends Goal {
         approachTarget = pillarTarget = jumpCell = bridgeCell = null;
         pillarAir = 0;
         watchAt = 0;                            // the no-silent-stall watchdog re-arms after any state reset
+        caveSearchUntil = 0;
+        nextCaveAt = 0;
         branchBoxed = 0;
         lastDescendY = Integer.MIN_VALUE;
         lastDiag = "";
@@ -5234,11 +5260,22 @@ public class CompanionSeekBlockGoal extends Goal {
                     t.leg = 0;
                     t.legLen = 0;
                     lastDescendY = Integer.MIN_VALUE;
-                    say(level, "This depth looks right. Branch mining.", true);
+                    caveSearchUntil = now + 1800;      // 90 s of cave exploration first; strip mining = last resort
+                    nextCaveAt = 0;
+                    say(level, "This depth looks right. Checking the caves first.", true);
                 } else {
                     if (lastDescendY == Integer.MIN_VALUE || y < lastDescendY) {
                         lastDescendY = y;
                         lastDescendDrop = now;                          // height lost recently -> walkable slopes are fine
+                    }
+                    // Cave detection DURING the descent (the user's idea, refined): DESCEND used to skip ALL
+                    // scanning for speed, so he walked right past caves on the way down. Every second, count
+                    // air beside the stairwell - 2+ connected air cells with a floor = a cave. A reachable
+                    // cave is explored (its own scan scoops exposed iron/lapis), then the descent resumes;
+                    // a cave behind thin rock gets a short tunnel - detected air justifies digging.
+                    if (now >= nextCaveAt) {
+                        nextCaveAt = now + 20;
+                        if (caveDetour(level, t)) return;
                     }
                     // Slope-walks are only trusted while they actually lose height. A path that walks
                     // without descending used to refresh the progress heartbeat forever - the old
@@ -5262,7 +5299,13 @@ public class CompanionSeekBlockGoal extends Goal {
                     }
                 }
             }
-            case BRANCH -> branch(level, t);
+            case BRANCH -> {
+                // Caves first, strip mining as the LAST RESORT (user request): until the window expires the
+                // companion walks between nearby cave pockets at this level (each explore walk's scan sees
+                // exposed ore); only when no cave is reachable/existing does the branch dig start.
+                if (now < caveSearchUntil && caveExplore(level, t, now)) return;
+                branch(level, t);
+            }
             case ASCEND -> ascend(level, t);
         }
     }
@@ -5413,6 +5456,86 @@ public class CompanionSeekBlockGoal extends Goal {
                 }
             }
         }
+    }
+
+    /**
+     * DESCEND probe: detect a CAVE beside the stairwell by counting air blocks (user suggestion, refined -
+     * a single air cell is noise; 2+ connected air cells with a floor = cave). Reachable cave: explore it
+     * (the explore walk scans for exposed ore on the way), then the descent resumes toward ty. Cave behind
+     * thin rock: dig a short tunnel into it - detected air justifies the dig; on failure giveUp() marks it
+     * unreachable so the same spot is never dug for twice. Own stairwell cells (lane axis, 3 blocks) skipped.
+     */
+    private boolean caveDetour(ServerLevel level, MineTask t) {
+        BlockPos me = mob.blockPosition();
+        Direction lane = Direction.from2DDataValue(t.dirData);
+        for (int dist = 2; dist <= 8; dist++) {
+            for (Direction d : Direction.Plane.HORIZONTAL) {
+                BlockPos c = me.relative(d, dist).immutable();
+                if ((d == lane || d == lane.getOpposite()) && dist <= 3) continue;   // his own tunnel, not a cave
+                if (explored.contains(c) || unreachable.contains(c)) continue;
+                if (!level.hasChunk(c.getX() >> 4, c.getZ() >> 4)) continue;
+                if (!isCaveCell(level, c)) continue;
+                Path p = mob.getNavigation().createPath(c, 2);
+                if (p != null && p.canReach()) {
+                    remember(c);
+                    diag("cave found on the way down at " + c + " - exploring before descending");
+                    startExplore(c, p);
+                    return true;
+                }
+                diag("cave behind the wall at " + c + " - digging in before descending");
+                tunnelToward(level, t, c);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** An actual cave cell: air at body+head, a solid floor, and 2+ connected air neighbours (or tall space). */
+    private boolean isCaveCell(ServerLevel level, BlockPos c) {
+        if (!passable(level, c) || !passable(level, c.above())) return false;
+        if (level.getBlockState(c.below()).getCollisionShape(level, c.below()).isEmpty()) return false;
+        int air = 0;
+        for (Direction d : Direction.Plane.HORIZONTAL) if (passable(level, c.relative(d))) air++;
+        return air >= 2 || passable(level, c.above(2));
+    }
+
+    /**
+     * BRANCH-phase cave window: hop between nearby cave pockets at ty (reachable paths only) while the
+     * 90 s window is open; the explore walk's own scan finds exposed ore. Returns false when no cave is
+     * reachable this probe or the window expired - strip mining starts as the last resort.
+     */
+    private boolean caveExplore(ServerLevel level, MineTask t, long now) {
+        if (walkTo != null || breaking != null || !pending.isEmpty()) return true;   // a cave leg is in progress
+        if (now >= caveSearchUntil) { diag("branch: cave search window over - strip mining as the last resort"); return false; }
+        if (now < nextCaveAt) return true;
+        nextCaveAt = now + 40;
+        BlockPos me = mob.blockPosition();
+        for (int i = 0; i < 10; i++) {
+            double ang = mob.getRandom().nextDouble() * Math.PI * 2;
+            double dist = 14 + mob.getRandom().nextDouble() * 30;
+            int x = me.getX() + (int) (Math.cos(ang) * dist), z = me.getZ() + (int) (Math.sin(ang) * dist);
+            if (!level.hasChunk(x >> 4, z >> 4)) continue;
+            BlockPos spot = findCaveSpot(level, new BlockPos(x, t.ty, z));
+            if (spot == null || explored.contains(spot)) continue;
+            Path p = mob.getNavigation().createPath(spot, 2);
+            if (p == null || !p.canReach()) continue;
+            remember(spot);
+            diag("branch: exploring a cave at " + spot + " before strip mining");
+            startExplore(spot, p);
+            return true;
+        }
+        diag("branch: no reachable cave near " + me + " - strip mining");
+        return false;
+    }
+
+    /** A standable air cell somewhere around (around.x, ty, around.z): cave floor, not solid rock. */
+    private BlockPos findCaveSpot(ServerLevel level, BlockPos around) {
+        for (int dy = -5; dy <= 8; dy++) {
+            BlockPos c = around.above(dy);
+            if (passable(level, c) && passable(level, c.above())
+                    && !level.getBlockState(c.below()).getCollisionShape(level, c.below()).isEmpty()) return c;
+        }
+        return null;
     }
 
     /** Surface search: first look far with the heightmap (trees show up as log columns), else explore somewhere new. */
@@ -5576,6 +5699,9 @@ public class CompanionSeekBlockGoal extends Goal {
                 walkTo = beside;
                 walkMode = WALK_FREE;
                 walkTicks = 0;
+                // Beside-walk failures count DOUBLE: this walk used to loop forever without touching the
+                // attempt cap - plan -> walk 8 s -> fail -> plan (the cactus-ledge back-and-forth cycle).
+                approachTries.merge(target.immutable(), 2, Integer::sum);
                 mob.getNavigation().moveTo(besidePath, 1.1);
                 diag("walking beside target " + target + " -> " + beside);
                 return;
@@ -5980,13 +6106,26 @@ public class CompanionSeekBlockGoal extends Goal {
 
     private void walk(ServerLevel level, long now) {
         walkTicks++;
-        if (walkTicks == 1) { walkRetries = 0; waitingFor = null; }   // new corridor: the blocker decision starts fresh
-        // Progress heartbeat, but only for REAL movement: a mob pushing a wall in place (jam) must not keep
-        // refreshing the idle timers, or the watchdogs can never fire and a step-loop stalls silently forever.
-        if (walkTicks % 40 == 0 && mob.position().distanceToSqr(lastHeartbeatPos) > 0.25) {
+        if (walkTicks == 1) {                       // new corridor: blocker decision + progress baseline start fresh
+            walkRetries = 0;
+            waitingFor = null;
+            walkBestD = Double.MAX_VALUE;
+            walkBestTick = now;
+        }
+        // PROGRESS heartbeat, measured as distance to the walk TARGET: the old positional check accepted any
+        // movement as progress, so a mob pacing between 2 cells on a ledge (cactus test 21:17-21:18) refreshed
+        // the idle timers forever - every watchdog stayed silent while going nowhere. Only a NEW BEST distance
+        // (>= 0.4 blocks) refreshes progress; oscillation never does.
+        double dNow = mob.position().distanceToSqr(Vec3.atCenterOf(walkTo));
+        if (dNow < walkBestD - 0.4) {
+            walkBestD = dNow;
+            walkBestTick = now;
             lastProgress = now;
             stuck = 0;
-            lastHeartbeatPos = mob.position();
+            // Walking toward the goal IS working: extends the plan deadline like a mined block. Without this
+            // a slow/stalling descent never extended the 90 s seek step, the plan expired SILENTLY and the
+            // companion just gave up mid-descent with no word (user report: iron run, "have to click continue").
+            mob.noteMiningProgress();
         }
         BlockPos w = walkTo;
         boolean arrived = switch (walkMode) {
@@ -6003,11 +6142,13 @@ public class CompanionSeekBlockGoal extends Goal {
         };
         if (arrived) { walkTo = null; nextScanAt = 0; lastProgress = now; mob.getNavigation().stop(); return; }
         PathNavigation nav = mob.getNavigation();
-        // Slope/step stalls: the path finished (or keeps ending) while the body stands still against a ledge.
-        // One log per distinct stall state so latest.log shows exactly where and why it stopped moving.
-        if (walkTicks > 60 && walkTicks % 40 == 0 && mob.position().distanceToSqr(lastHeartbeatPos) <= 0.25) {
+        // Progress-based stall report: fires when the TARGET distance stopped improving for 5 s - which now
+        // also catches physically-moving oscillation (paced between two cells, every move looked like progress
+        // to the old check). Full state line pins the geometry of the stall.
+        if (walkTicks > 60 && walkTicks % 40 == 0 && now - walkBestTick > 100) {
             diag("STUCK walking mode=" + walkMode + " retries=" + walkRetries + " navDone=" + nav.isDone()
                     + " ground=" + mob.onGround() + " dy=" + (w.getY() - mob.getY())
+                    + " bestD=" + Math.sqrt(walkBestD)
                     + " target=" + w + " at=" + mob.blockPosition());
         }
         if (walkMode == WALK_EXPLORE) {
@@ -6543,6 +6684,10 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     // when the player is far away. Server-side state; released on toggle-off, task stop and entity removal.
     private boolean forceChunks;
     private final java.util.Set<Long> forcedChunks = new java.util.HashSet<>();
+    // Autonomous roadblock recovery (see tick()): pause -> 5 s -> try another way, capped and budget-resetting.
+    private int autoResumeAtTick = -1;
+    private int autoResumeCount;
+    private int lastMinedSeen = -1;
     private String lastSpokenText = "";
     private long lastSpokenTime = 0;
     private int lastSpokenTick = -10000;
@@ -6750,6 +6895,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         } else {
             boolean nether = level().dimension() == net.minecraft.world.level.Level.NETHER;
             mineTask.begin(blockId, nether, getDirection().get2DDataValue());
+            autoResumeCount = 0;                         // a brand-new job starts with a fresh autonomy budget
         }
     }
     public void clearSeekBlock() { mineTask.finish(); }
@@ -6778,6 +6924,9 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     }
 
     public void applyCommand(CompanionCommand cmd, ServerPlayer from, String target) {
+        // An EXPLICIT player order re-funds the autonomous roadblock budget (plan steps keep it: they are
+        // the companion's own initiative, not confirmation).
+        if (from != null && !applyingPlanStep) autoResumeCount = 0;
         if (!applyingPlanStep && cmd.interruptsPlanning()) {
             // One explicit intent at a time: a manual order pauses the AI plan (STOP forgets it entirely).
             planner.notePlayerOrder(tickCount);
@@ -7297,6 +7446,8 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     @Override public void planSay(String text) { speak(text); }
     @Override public boolean planSeekActive() { return !seekBlock().isBlank(); }
+    /** Explicit amount from the goal text ("bring me 12 iron ore"): overrides the default 16 (diamonds 6). */
+    @Override public void planSeekCount(int count) { if (count > 0) mineTask.want = Math.min(64, count); }
     @Override public boolean planPlantActive() { return plantUntil > level().getGameTime(); }
     @Override public boolean planPickupActive() { return isPickupRequested() || isPickupEnabled(); }
     @Override public boolean planFighting() { LivingEntity t = getTarget(); return t != null && t.isAlive(); }
@@ -7764,6 +7915,30 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         }
         if (tickCount % 20 == 0) refreshEquipment();
         if (tickCount % 20 == 0) aggroMonsters();   // hostile mobs should see the companion as a target
+        // AUTONOMOUS ROADBLOCK RECOVERY (user: "what's the point of autonomy if he always needs continue?").
+        // A paused task used to wait for 'continue' forever - unattended (force-loaded chunks) he stopped the
+        // moment anything was impassable. 5 s after a pause with no player reaction: keep the SAME job
+        // (phase/want/mined preserved), rotate the heading, bump serial so the goal drops stale walks/breaks/
+        // attempt counters, and try another way - up to 6 attempts, then say so ONCE and stay put. Real
+        // progress (mined count changes) resets the attempt budget; explicit player orders reset it too.
+        if (mineTask.mined != lastMinedSeen) { lastMinedSeen = mineTask.mined; autoResumeCount = 0; }
+        if (mineTask.paused && !isInjured() && !isSitting()) {
+            if (autoResumeAtTick < 0 && autoResumeCount < 8) autoResumeAtTick = tickCount + 100;
+            else if (autoResumeAtTick >= 0 && tickCount >= autoResumeAtTick && mineTask.exists()) {
+                autoResumeAtTick = -1;
+                autoResumeCount++;
+                if (autoResumeCount > 6) {
+                    if (autoResumeCount == 7) speak("I truly can't get through. Say 'continue' once the way is clear.");
+                } else {
+                    mineTask.resume();
+                    mineTask.serial++;                                          // goal resets its stale transient state
+                    mineTask.dirData = Direction.from2DDataValue(mineTask.dirData).getClockWise().get2DDataValue();
+                    speak(autoResumeCount == 1 ? "I'm stuck here. Trying another way." : "Trying another way again.");
+                }
+            }
+        } else if (!mineTask.paused) {
+            autoResumeAtTick = -1;
+        }
         if (tickCount % 100 == 0) updateForcedChunks();   // force-load toggle: keep his 3x3 chunk area alive
         // Drop an automatic target we cannot reach (so mining etc. resumes); player-forced targets persist.
         LivingEntity tgt = getTarget();
@@ -8170,7 +8345,13 @@ public final class CompanionPlanner {
                     // so branch-mine the diamond level (targetY does the descent), not a random model pick.
                     id = "diamond_ore";
                 }
-                if (id.isBlank()) endTick = tick; else host.planCommand(CompanionCommand.SEEK_BLOCK, id);
+                if (id.isBlank()) endTick = tick;
+                else {
+                    host.planCommand(CompanionCommand.SEEK_BLOCK, id);
+                    // Explicit amount in the goal text ("bring me 12 iron ore") beats the default 16/6.
+                    int n = goalCount(goal);
+                    if (n > 0) host.planSeekCount(n);
+                }
             }
             case "pickup" -> host.planCommand(CompanionCommand.PICKUP, current.arg());
             default -> host.planCommand(CompanionCommand.parse(current.op()), current.arg());
@@ -8215,6 +8396,18 @@ public final class CompanionPlanner {
         return words(g, "dig down", "dig deeper", "mine down", "go down", "dig a hole");
     }
 
+    /** Explicit amount in the goal text ("bring me 12 iron ore" -> 12). 1..64; 0 when none (defaults apply). */
+    private static int goalCount(String goal) {
+        if (goal == null || goal.isBlank()) return 0;
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(?<!\\d)(\\d{1,2})(?!\\d)").matcher(goal);
+        if (m.find()) {
+            int n = Integer.parseInt(m.group(1));
+            return n >= 1 && n <= 64 ? n : 0;
+        }
+        return 0;
+    }
+
     private static boolean words(String g, String... phrases) {
         for (String p : phrases) {
             if (java.util.regex.Pattern.compile("(?<![a-z])" + java.util.regex.Pattern.quote(p) + "(?![a-z])").matcher(g).find()) return true;
@@ -8240,6 +8433,8 @@ public interface PlanActions {
     void planSay(String text);
     boolean planSeekActive();
     boolean planPickupActive();
+    /** Explicit amount from the goal text ("bring me 12 iron ore"): overrides the seek task's default want. */
+    default void planSeekCount(int count) { }
     default boolean planPlantActive() { return false; }
     boolean planFighting();
     /** Freeze the plan while true (e.g. injured and recovering). */

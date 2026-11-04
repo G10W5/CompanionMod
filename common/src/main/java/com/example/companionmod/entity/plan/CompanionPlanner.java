@@ -109,7 +109,13 @@ public final class CompanionPlanner {
                     // so branch-mine the diamond level (targetY does the descent), not a random model pick.
                     id = "diamond_ore";
                 }
-                if (id.isBlank()) endTick = tick; else host.planCommand(CompanionCommand.SEEK_BLOCK, id);
+                if (id.isBlank()) endTick = tick;
+                else {
+                    host.planCommand(CompanionCommand.SEEK_BLOCK, id);
+                    // Explicit amount in the goal text ("bring me 12 iron ore") beats the default 16/6.
+                    int n = goalCount(goal);
+                    if (n > 0) host.planSeekCount(n);
+                }
             }
             case "pickup" -> host.planCommand(CompanionCommand.PICKUP, current.arg());
             default -> host.planCommand(CompanionCommand.parse(current.op()), current.arg());
@@ -152,6 +158,18 @@ public final class CompanionPlanner {
     private static boolean asksDigDown(String goal) {
         String g = goal == null ? "" : goal.toLowerCase(java.util.Locale.ROOT);
         return words(g, "dig down", "dig deeper", "mine down", "go down", "dig a hole");
+    }
+
+    /** Explicit amount in the goal text ("bring me 12 iron ore" -> 12). 1..64; 0 when none (defaults apply). */
+    private static int goalCount(String goal) {
+        if (goal == null || goal.isBlank()) return 0;
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(?<!\\d)(\\d{1,2})(?!\\d)").matcher(goal);
+        if (m.find()) {
+            int n = Integer.parseInt(m.group(1));
+            return n >= 1 && n <= 64 ? n : 0;
+        }
+        return 0;
     }
 
     private static boolean words(String g, String... phrases) {

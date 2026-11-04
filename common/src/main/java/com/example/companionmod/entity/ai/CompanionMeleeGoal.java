@@ -18,6 +18,21 @@ public class CompanionMeleeGoal extends MeleeAttackGoal {
         super(mob, speed, followingTarget);
     }
 
+    /**
+     * Fight at ~3.5 blocks like a player instead of nose-to-nose. Two pieces in 26.x (verified by bytecode -
+     * getAttackReachSqr no longer exists): (1) canPerformAttack uses OUR distance instead of the bounding-box
+     * gap, (2) after the vanilla tick the navigation is halted once inside reach - vanilla paths TO the target
+     * cell, which is what walked him INTO the enemy's face before swinging (user report).
+     */
+    private static final double REACH_SQ = 3.5 * 3.5;
+
+    @Override
+    protected boolean canPerformAttack(LivingEntity target) {
+        return isTimeToAttack()
+                && mob.distanceToSqr(target) <= REACH_SQ
+                && mob.getSensing().hasLineOfSight(target);
+    }
+
     @Override
     public void tick() {
         LivingEntity target = this.mob.getTarget();
@@ -31,5 +46,10 @@ public class CompanionMeleeGoal extends MeleeAttackGoal {
             return;                               // never walk into a lit fuse
         }
         super.tick();
+        // Halt at reach: the vanilla path aims at the target CELL, so without this he keeps closing to
+        // nose distance no matter what canPerformAttack allows.
+        if (target != null && target.isAlive() && this.mob.distanceToSqr(target) <= REACH_SQ) {
+            this.mob.getNavigation().stop();
+        }
     }
 }

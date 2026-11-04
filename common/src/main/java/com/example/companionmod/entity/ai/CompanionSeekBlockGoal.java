@@ -97,6 +97,10 @@ public class CompanionSeekBlockGoal extends Goal {
     private boolean descendResume;                  // next DESCEND decide tries walking down the EXISTING staircase first
     private String waitingFor;                      // non-null: an entity physically stands in our 1-block walk corridor
     private long lastWaitLog;
+    private double walkBestD = Double.MAX_VALUE;    // best distance reached toward the current walk target (progress heartbeat)
+    private long walkBestTick;
+    private long caveSearchUntil;                   // DESCEND->BRANCH: caves first, strip mining only as the last resort
+    private long nextCaveAt;
     private String lastDiag = "";    // change-gated diagnostic lines (one per real state change, never per frame)
 
     public CompanionSeekBlockGoal(CompanionEntity mob) {
@@ -143,6 +147,8 @@ public class CompanionSeekBlockGoal extends Goal {
         approachTarget = pillarTarget = jumpCell = bridgeCell = null;
         pillarAir = 0;
         watchAt = 0;                            // the no-silent-stall watchdog re-arms after any state reset
+        caveSearchUntil = 0;
+        nextCaveAt = 0;
         branchBoxed = 0;
         lastDescendY = Integer.MIN_VALUE;
         lastDiag = "";
@@ -351,11 +357,22 @@ public class CompanionSeekBlockGoal extends Goal {
                     t.leg = 0;
                     t.legLen = 0;
                     lastDescendY = Integer.MIN_VALUE;
-                    say(level, "This depth looks right. Branch mining.", true);
+                    caveSearchUntil = now + 1800;      // 90 s of cave exploration first; strip mining = last resort
+                    nextCaveAt = 0;
+                    say(level, "This depth looks right. Checking the caves first.", true);
                 } else {
                     if (lastDescendY == Integer.MIN_VALUE || y < lastDescendY) {
                         lastDescendY = y;
                         lastDescendDrop = now;                          // height lost recently -> walkable slopes are fine
+                    }
+                    // Cave detection DURING the descent (the user's idea, refined): DESCEND used to skip ALL
+                    // scanning for speed, so he walked right past caves on the way down. Every second, count
+                    // air beside the stairwell - 2+ connected air cells with a floor = a cave. A reachable
+                    // cave is explored (its own scan scoops exposed iron/lapis), then the descent resumes;
+                    // a cave behind thin rock gets a short tunnel - detected air justifies digging.
+                    if (now >= nextCaveAt) {
+                        nextCaveAt = now + 20;
+                        if (caveDetour(level, t)) return;
                     }
                     // Slope-walks are only trusted while they actually lose height. A path that walks
                     // without descending used to refresh the progress heartbeat forever - the old
@@ -379,7 +396,13 @@ public class CompanionSeekBlockGoal extends Goal {
                     }
                 }
             }
-            case BRANCH -> branch(level, t);
+            case BRANCH -> {
+                // Caves first, strip mining as the LAST RESORT (user request): until the window expires the
+                // companion walks between nearby cave pockets at this level (each explore walk's scan sees
+                // exposed ore); only when no cave is reachable/existing does the branch dig start.
+                if (now < caveSearchUntil && caveExplore(level, t, now)) return;
+                branch(level, t);
+            }
             case ASCEND -> ascend(level, t);
         }
     }
@@ -530,6 +553,86 @@ public class CompanionSeekBlockGoal extends Goal {
                 }
             }
         }
+    }
+
+    /**
+     * DESCEND probe: detect a CAVE beside the stairwell by counting air blocks (user suggestion, refined -
+     * a single air cell is noise; 2+ connected air cells with a floor = cave). Reachable cave: explore it
+     * (the explore walk scans for exposed ore on the way), then the descent resumes toward ty. Cave behind
+     * thin rock: dig a short tunnel into it - detected air justifies the dig; on failure giveUp() marks it
+     * unreachable so the same spot is never dug for twice. Own stairwell cells (lane axis, 3 blocks) skipped.
+     */
+    private boolean caveDetour(ServerLevel level, MineTask t) {
+        BlockPos me = mob.blockPosition();
+        Direction lane = Direction.from2DDataValue(t.dirData);
+        for (int dist = 2; dist <= 8; dist++) {
+            for (Direction d : Direction.Plane.HORIZONTAL) {
+                BlockPos c = me.relative(d, dist).immutable();
+                if ((d == lane || d == lane.getOpposite()) && dist <= 3) continue;   // his own tunnel, not a cave
+                if (explored.contains(c) || unreachable.contains(c)) continue;
+                if (!level.hasChunk(c.getX() >> 4, c.getZ() >> 4)) continue;
+                if (!isCaveCell(level, c)) continue;
+                Path p = mob.getNavigation().createPath(c, 2);
+                if (p != null && p.canReach()) {
+                    remember(c);
+                    diag("cave found on the way down at " + c + " - exploring before descending");
+                    startExplore(c, p);
+                    return true;
+                }
+                diag("cave behind the wall at " + c + " - digging in before descending");
+                tunnelToward(level, t, c);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** An actual cave cell: air at body+head, a solid floor, and 2+ connected air neighbours (or tall space). */
+    private boolean isCaveCell(ServerLevel level, BlockPos c) {
+        if (!passable(level, c) || !passable(level, c.above())) return false;
+        if (level.getBlockState(c.below()).getCollisionShape(level, c.below()).isEmpty()) return false;
+        int air = 0;
+        for (Direction d : Direction.Plane.HORIZONTAL) if (passable(level, c.relative(d))) air++;
+        return air >= 2 || passable(level, c.above(2));
+    }
+
+    /**
+     * BRANCH-phase cave window: hop between nearby cave pockets at ty (reachable paths only) while the
+     * 90 s window is open; the explore walk's own scan finds exposed ore. Returns false when no cave is
+     * reachable this probe or the window expired - strip mining starts as the last resort.
+     */
+    private boolean caveExplore(ServerLevel level, MineTask t, long now) {
+        if (walkTo != null || breaking != null || !pending.isEmpty()) return true;   // a cave leg is in progress
+        if (now >= caveSearchUntil) { diag("branch: cave search window over - strip mining as the last resort"); return false; }
+        if (now < nextCaveAt) return true;
+        nextCaveAt = now + 40;
+        BlockPos me = mob.blockPosition();
+        for (int i = 0; i < 10; i++) {
+            double ang = mob.getRandom().nextDouble() * Math.PI * 2;
+            double dist = 14 + mob.getRandom().nextDouble() * 30;
+            int x = me.getX() + (int) (Math.cos(ang) * dist), z = me.getZ() + (int) (Math.sin(ang) * dist);
+            if (!level.hasChunk(x >> 4, z >> 4)) continue;
+            BlockPos spot = findCaveSpot(level, new BlockPos(x, t.ty, z));
+            if (spot == null || explored.contains(spot)) continue;
+            Path p = mob.getNavigation().createPath(spot, 2);
+            if (p == null || !p.canReach()) continue;
+            remember(spot);
+            diag("branch: exploring a cave at " + spot + " before strip mining");
+            startExplore(spot, p);
+            return true;
+        }
+        diag("branch: no reachable cave near " + me + " - strip mining");
+        return false;
+    }
+
+    /** A standable air cell somewhere around (around.x, ty, around.z): cave floor, not solid rock. */
+    private BlockPos findCaveSpot(ServerLevel level, BlockPos around) {
+        for (int dy = -5; dy <= 8; dy++) {
+            BlockPos c = around.above(dy);
+            if (passable(level, c) && passable(level, c.above())
+                    && !level.getBlockState(c.below()).getCollisionShape(level, c.below()).isEmpty()) return c;
+        }
+        return null;
     }
 
     /** Surface search: first look far with the heightmap (trees show up as log columns), else explore somewhere new. */
@@ -693,6 +796,9 @@ public class CompanionSeekBlockGoal extends Goal {
                 walkTo = beside;
                 walkMode = WALK_FREE;
                 walkTicks = 0;
+                // Beside-walk failures count DOUBLE: this walk used to loop forever without touching the
+                // attempt cap - plan -> walk 8 s -> fail -> plan (the cactus-ledge back-and-forth cycle).
+                approachTries.merge(target.immutable(), 2, Integer::sum);
                 mob.getNavigation().moveTo(besidePath, 1.1);
                 diag("walking beside target " + target + " -> " + beside);
                 return;
@@ -1097,13 +1203,26 @@ public class CompanionSeekBlockGoal extends Goal {
 
     private void walk(ServerLevel level, long now) {
         walkTicks++;
-        if (walkTicks == 1) { walkRetries = 0; waitingFor = null; }   // new corridor: the blocker decision starts fresh
-        // Progress heartbeat, but only for REAL movement: a mob pushing a wall in place (jam) must not keep
-        // refreshing the idle timers, or the watchdogs can never fire and a step-loop stalls silently forever.
-        if (walkTicks % 40 == 0 && mob.position().distanceToSqr(lastHeartbeatPos) > 0.25) {
+        if (walkTicks == 1) {                       // new corridor: blocker decision + progress baseline start fresh
+            walkRetries = 0;
+            waitingFor = null;
+            walkBestD = Double.MAX_VALUE;
+            walkBestTick = now;
+        }
+        // PROGRESS heartbeat, measured as distance to the walk TARGET: the old positional check accepted any
+        // movement as progress, so a mob pacing between 2 cells on a ledge (cactus test 21:17-21:18) refreshed
+        // the idle timers forever - every watchdog stayed silent while going nowhere. Only a NEW BEST distance
+        // (>= 0.4 blocks) refreshes progress; oscillation never does.
+        double dNow = mob.position().distanceToSqr(Vec3.atCenterOf(walkTo));
+        if (dNow < walkBestD - 0.4) {
+            walkBestD = dNow;
+            walkBestTick = now;
             lastProgress = now;
             stuck = 0;
-            lastHeartbeatPos = mob.position();
+            // Walking toward the goal IS working: extends the plan deadline like a mined block. Without this
+            // a slow/stalling descent never extended the 90 s seek step, the plan expired SILENTLY and the
+            // companion just gave up mid-descent with no word (user report: iron run, "have to click continue").
+            mob.noteMiningProgress();
         }
         BlockPos w = walkTo;
         boolean arrived = switch (walkMode) {
@@ -1120,11 +1239,13 @@ public class CompanionSeekBlockGoal extends Goal {
         };
         if (arrived) { walkTo = null; nextScanAt = 0; lastProgress = now; mob.getNavigation().stop(); return; }
         PathNavigation nav = mob.getNavigation();
-        // Slope/step stalls: the path finished (or keeps ending) while the body stands still against a ledge.
-        // One log per distinct stall state so latest.log shows exactly where and why it stopped moving.
-        if (walkTicks > 60 && walkTicks % 40 == 0 && mob.position().distanceToSqr(lastHeartbeatPos) <= 0.25) {
+        // Progress-based stall report: fires when the TARGET distance stopped improving for 5 s - which now
+        // also catches physically-moving oscillation (paced between two cells, every move looked like progress
+        // to the old check). Full state line pins the geometry of the stall.
+        if (walkTicks > 60 && walkTicks % 40 == 0 && now - walkBestTick > 100) {
             diag("STUCK walking mode=" + walkMode + " retries=" + walkRetries + " navDone=" + nav.isDone()
                     + " ground=" + mob.onGround() + " dy=" + (w.getY() - mob.getY())
+                    + " bestD=" + Math.sqrt(walkBestD)
                     + " target=" + w + " at=" + mob.blockPosition());
         }
         if (walkMode == WALK_EXPLORE) {
