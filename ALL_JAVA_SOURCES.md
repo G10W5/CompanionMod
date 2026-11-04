@@ -5356,6 +5356,7 @@ public class CompanionSeekBlockGoal extends Goal {
     }
 
     private void giveUp(BlockPos target) {
+        diag("approach: giving up on " + target);
         unreachable.add(target.immutable());
         vein.remove(target);
         if (target.equals(oreTarget)) oreTarget = null;
@@ -5460,13 +5461,14 @@ public class CompanionSeekBlockGoal extends Goal {
     /** Jump, and while the feet are above the cell we left, put a block into it; repeat until the target is in reach. */
     private void pillarStep(ServerLevel level, MineTask t, long now) {
         BlockPos target = pillarTarget;
-        if (!matches(t, level.getBlockState(target)) || unreachable.contains(target)) { endPillar(); return; }
-        if (inReach(Vec3.atCenterOf(target))) { endPillar(); return; }   // in reach: normal mining (clears leaves in the way)
-        if (target.getY() <= mob.blockPosition().getY() + 1) { endPillar(); return; }          // no longer above us
+        if (!matches(t, level.getBlockState(target)) || unreachable.contains(target)) { diag("pillar end: target gone"); endPillar(); return; }
+        if (inReach(Vec3.atCenterOf(target))) { diag("pillar done: target in reach"); endPillar(); return; }   // in reach: normal mining (clears leaves in the way)
+        if (target.getY() <= mob.blockPosition().getY() + 1) { diag("pillar end: target no longer above us"); endPillar(); return; }
         mob.getNavigation().stop();
         if (jumpCell == null) {
             if (!mob.onGround()) return;                                  // wait until we have landed
             if (scaffold.size() >= MAX_SCAFFOLD || pillarPlaced >= MAX_SCAFFOLD) {
+                diag("pillar end: scaffold limit " + pillarPlaced);
                 say(level, "That's too high to build up to.", true);
                 giveUp(target);
                 return;
@@ -5475,11 +5477,12 @@ public class CompanionSeekBlockGoal extends Goal {
             for (int up = 2; up <= 3; up++) {                             // headroom for the jump: leaves, branches...
                 BlockPos h = feet.above(up);
                 if (passable(level, h)) continue;
-                if (safeToBreak(level, h)) pending.add(h); else giveUp(target);
+                if (safeToBreak(level, h)) pending.add(h); else { diag("pillar end: unbreakable headroom at " + h); giveUp(target); }
                 return;
             }
             if (!hasScaffoldBlock(t)) {
                 say(level, "I need dirt or cobblestone to climb up there.", true);
+                diag("pillar end: no scaffold block in bag");
                 giveUp(target);
                 return;
             }
@@ -5491,17 +5494,28 @@ public class CompanionSeekBlockGoal extends Goal {
             return;
         }
         pillarAir++;
-        if (mob.getY() >= jumpCell.getY() + 1.05) {                       // feet are above the cell we left
+        if (mob.getY() >= jumpCell.getY() + 0.9) {                        // feet above the cell we left: place now (apex ~+1.25)
             if (passable(level, jumpCell)) {
-                if (!CompanionProtection.canModify(level, mob, jumpCell)) { giveUp(target); return; }
+                if (!CompanionProtection.canModify(level, mob, jumpCell)) {
+                    diag("pillar FAILED: placement refused (protected cell)");
+                    giveUp(target);
+                    return;
+                }
                 ItemStack taken = takeScaffoldBlock(t);
-                if (taken.isEmpty()) { giveUp(target); return; }
+                if (taken.isEmpty()) {
+                    diag("pillar FAILED: bag ran out of scaffold blocks mid-climb");
+                    giveUp(target);
+                    return;
+                }
                 level.setBlock(jumpCell, ((BlockItem) taken.getItem()).getBlock().defaultBlockState(), 3);
                 pillarPlaced++;
                 if (!t.deep()) scaffold.addLast(jumpCell);        // surface jobs (trees...): temporary, taken back afterwards. Mining: the blocks stay.
                 mob.swing(InteractionHand.MAIN_HAND, true);
                 lastProgress = now;
                 mob.noteMiningProgress();
+                diag("pillar: placed block #" + pillarPlaced + " into " + jumpCell);
+            } else {
+                diag("pillar: cell occupied while airborne (" + jumpCell + ")");
             }
             jumpCell = null;
         } else if (pillarAir > 25) {
