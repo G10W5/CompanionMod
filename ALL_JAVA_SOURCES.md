@@ -503,6 +503,14 @@ public final class ClientVoice {
 
     /** Push config-driven appearance/identity settings to the server once per entity. */
     private static void syncEntitySettings(Minecraft mc, CompanionEntity companion) {
+        // Force-load toggle: config persists across restarts but the server-side flag does not - re-send it
+        // whenever it disagrees (once per world join or when the user flips the setting). Throttled so a
+        // dropped/rate-limited packet cannot turn into a per-tick resend storm.
+        if (cfg != null && cfg.forceLoadChunks != companion.forceChunks()
+                && System.currentTimeMillis() - lastChunkSync > 2000) {
+            lastChunkSync = System.currentTimeMillis();
+            send("chunks", "", cfg.forceLoadChunks ? "on" : "off");
+        }
         String wanted = cfg == null ? "" : cfg.companionSkin;   // "owner" stays symbolic: the renderer resolves it synchronously
         boolean feminine = cfg != null && cfg.feminineModel;
         String name = cfg == null || cfg.companionName == null || cfg.companionName.isBlank() ? "" : cfg.companionName;
@@ -518,6 +526,7 @@ public final class ClientVoice {
     }
 
     private static long lastReviveSend;
+    private static long lastChunkSync;
 
     /** Holding right click (interact, like doors) on a downed companion sends revive pulses to the server. */
     private static void handleReviveInput(Minecraft mc, CompanionEntity companion) {
@@ -2521,6 +2530,12 @@ public class CompanionSettingsScreen extends Screen {
         toggle(lx, y, iw, "Memory", config.memoryEnabled, v -> config.memoryEnabled = v);
         y += ROW;
 
+        toggle(lx, y, iw, "Load Chunks", config.forceLoadChunks, v -> {
+            config.forceLoadChunks = v;
+            ClientVoice.send("chunks", "", v ? "on" : "off");       // server keeps his 3x3 chunk area force-loaded
+        });
+        y += ROW;
+
         // 26.1-CHECK: CycleButton.builder signature (copied unchanged from the old screen)
         this.addRenderableWidget(CycleButton.<String>builder(CompanionSettingsScreen::bodyName, config.companionBody == null ? "auto" : config.companionBody)
                 .withValues("auto", "slim", "classic")
@@ -3804,13 +3819,14 @@ public enum CompanionCommand {
     GIVE, TAKE, DROP, PICKUP, OPEN, CLOSE, CRAFT, SMELT, BREW, ENCHANT,
     FISH, COOK, FIGHT, FLEE, HIDE, SEEK, FIND, SEARCH, TRACK, HUNT,
     SEEK_BLOCK, SET_NAME, REVIVE, PLAN,
-    REMEMBER, FORGET, SET_SKIN, FEMININE, MASCULINE, PLANT, SURFACE;
+    REMEMBER, FORGET, SET_SKIN, FEMININE, MASCULINE, PLANT, SURFACE,
+    CHUNKS;   // settings toggle: force-load the chunks around the companion (not a gameplay intent)
 
     /** False for appearance/UI/memory/revive packets: they are not a new gameplay intent and must not pause or cancel a plan. */
     public boolean interruptsPlanning() {
         return switch (this) {
             case NONE, PLAN, CONTINUE, INVENTORY, SET_NAME, SET_SKIN, FEMININE, MASCULINE,
-                    REMEMBER, FORGET, REVIVE -> false;
+                    REMEMBER, FORGET, REVIVE, CHUNKS -> false;
             default -> true;
         };
     }
@@ -3883,6 +3899,7 @@ public enum CompanionCommand {
             case "masculine": case "male": case "masculine_model": return MASCULINE;
             case "revive": case "revive_me": case "rescue": case "help_me": return REVIVE;
             case "plan": case "goal": case "autonomy": return PLAN;
+            case "chunks": case "chunk": case "force_chunks": case "force_load_chunks": case "keep_chunks_loaded": return CHUNKS;
             default: return NONE;
         }
     }
@@ -5262,6 +5279,15 @@ public class CompanionSeekBlockGoal extends Goal {
     }
 
     private void branch(ServerLevel level, MineTask t) {
+        // Chasing ore dropped us BELOW the lane (-59/-60 next to bedrock): mining must stay on ty. The lane
+        // code never brought him back up, so a single diamond-pocket fall stranded the whole strip job at
+        // bedrock level. Climb back FIRST - headroom cells are cleared upward by planStep (+1).
+        if (mob.blockPosition().getY() < t.ty) {
+            if (planStep(level, t, Direction.from2DDataValue(t.dirData), 1, true)) {
+                diag("branch: climbing back to lane y=" + t.ty + " (was y=" + mob.blockPosition().getY() + ")");
+                return;
+            }
+        }
         Direction d = Direction.from2DDataValue(t.dirData);
         int len = (t.leg % 2 == 0) ? LEG_LEN : SIDE_LEN;
         if (t.legLen >= len) {                                          // finished a tunnel leg: shift sideways, come back parallel
@@ -6500,6 +6526,10 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     private UUID ownerUuid;
     private LivingEntity forcedTarget;
     private int forcedTargetUntil;
+    // Force-load toggle (settings): keeps the 3x3 chunk area around the companion loaded so he keeps working
+    // when the player is far away. Server-side state; released on toggle-off, task stop and entity removal.
+    private boolean forceChunks;
+    private final java.util.Set<Long> forcedChunks = new java.util.HashSet<>();
     private String lastSpokenText = "";
     private long lastSpokenTime = 0;
     private int lastSpokenTick = -10000;
@@ -6783,6 +6813,14 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
                 if (from != null) teleportNear(from);
             }
             case STOP -> { hardStop(); speak("Stopped."); }
+            case CHUNKS -> {
+                // Settings toggle (also voicable): force-load the chunks around the companion.
+                String f = target == null ? "" : target.trim().toLowerCase(java.util.Locale.ROOT);
+                if (f.equals("off") || f.equals("false") || f.equals("0") || f.equals("disable")) forceChunks = false;
+                else if (f.equals("on") || f.equals("true") || f.equals("1") || f.equals("enable")) forceChunks = true;
+                else forceChunks = !forceChunks;
+                if (!forceChunks) releaseForcedChunks();
+            }
             case INVENTORY -> { if (from != null) openInventory(from); }
             case HEAL -> {
                 heal(6.0f);
@@ -7404,16 +7442,68 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             LivingEntity cur = m.getTarget();
             boolean claim;
             if (cur == null) {
-                claim = m.getSensing().hasLineOfSight(this);
+                // LOS-gated claims missed the point-blank corner case (zombie standing beside the companion
+                // around a tunnel corner, caching a FALSE line of sight, standing there 'chilling' - user
+                // screenshot). Within 4 blocks a monster doesn't need line of sight to aggro; it will path.
+                claim = distanceToSqr(m) < 16 || m.getSensing().hasLineOfSight(this);
+            } else if (cur == this) {
+                claim = false;
             } else if (guard && owner != null && cur == owner) {
                 claim = distanceToSqr(m) < owner.distanceToSqr(m);
             } else {
-                claim = false;
+                // Stale far target: the monster keeps 'attacking' something 30 blocks away it can never reach
+                // and just stands there. Pull it back when it is closer to US than to that old target - but
+                // never steal a fight from the OWNER (guard stance keeps its own owner-steal rule above).
+                claim = cur != owner && distanceToSqr(m) < cur.distanceToSqr(m) && distanceToSqr(m) <= 16 * 16;
             }
             if (!claim) continue;
             m.setTarget(this);
             if (++claimed >= 6) break;            // never pull a whole cave onto the companion in one pass
         }
+    }
+
+    /** Settings state (client syncs the config value through the CHUNKS command). */
+    public boolean forceChunks() { return forceChunks; }
+
+    /**
+     * Force-loads the 3x3 chunk area around the companion while the toggle is on, and releases chunks he has
+     * moved away from. Vanilla's setChunkForced keeps chunks ticking (AI, mobs, block updates) exactly like
+     * a player standing there - without it the companion freezes the moment the player walks out of range.
+     */
+    private void updateForcedChunks() {
+        if (!(level() instanceof ServerLevel level)) return;
+        if (!forceChunks) {
+            releaseForcedChunks();
+            return;
+        }
+        int cx = blockPosition().getX() >> 4, cz = blockPosition().getZ() >> 4;
+        java.util.Set<Long> wanted = new java.util.HashSet<>();
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) wanted.add(chunkKey(cx + dx, cz + dz));
+        }
+        for (java.util.Iterator<Long> it = forcedChunks.iterator(); it.hasNext(); ) {
+            long key = it.next();
+            if (!wanted.contains(key)) { level.setChunkForced((int) (key >> 32), (int) key, false); it.remove(); }
+        }
+        for (long key : wanted) {
+            if (forcedChunks.add(key)) level.setChunkForced((int) (key >> 32), (int) key, true);
+        }
+    }
+
+    private void releaseForcedChunks() {
+        if (forcedChunks.isEmpty()) return;
+        if (level() instanceof ServerLevel level) {
+            for (long key : forcedChunks) level.setChunkForced((int) (key >> 32), (int) key, false);
+        }
+        forcedChunks.clear();
+    }
+
+    private static long chunkKey(int cx, int cz) { return ((long) cx << 32) | (cz & 0xFFFFFFFFL); }
+
+    @Override
+    public void remove(net.minecraft.world.entity.Entity.RemovalReason reason) {
+        releaseForcedChunks();                    // never leave chunks force-loaded after the companion is gone
+        super.remove(reason);
     }
 
     /** Uses block tags plus actual destroy speed, then immediately syncs the held stack. */
@@ -7661,6 +7751,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         }
         if (tickCount % 20 == 0) refreshEquipment();
         if (tickCount % 20 == 0) aggroMonsters();   // hostile mobs should see the companion as a target
+        if (tickCount % 100 == 0) updateForcedChunks();   // force-load toggle: keep his 3x3 chunk area alive
         // Drop an automatic target we cannot reach (so mining etc. resumes); player-forced targets persist.
         LivingEntity tgt = getTarget();
         if (tgt != null && tgt != forcedTarget && tgt.isAlive() && tickCount - targetSinceTick > 200
@@ -10545,6 +10636,8 @@ public final class VoiceConfig {
     public boolean dynamicGoals = false;
     /** When true, the companion decides on its own to do small safe things every few minutes. Off by default. */
     public boolean autonomyEnabled = false;
+    /** Keep the chunks around the companion force-loaded, so he keeps mining/working when the player walks away. Off by default. */
+    public boolean forceLoadChunks = false;
     /** Rough seconds between two autonomous thoughts. */
     public int autonomyIntervalSeconds = 30;
     /** Bumped whenever defaults change meaningfully; migrates older config files. */

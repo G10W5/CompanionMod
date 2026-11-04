@@ -49,6 +49,8 @@ public final class VoiceConfig {
     public boolean dynamicGoals = false;
     /** When true, the companion decides on its own to do small safe things every few minutes. Off by default. */
     public boolean autonomyEnabled = false;
+    /** Keep the chunks around the companion force-loaded, so he keeps mining/working when the player walks away. Off by default. */
+    public boolean forceLoadChunks = false;
     /** Rough seconds between two autonomous thoughts. */
     public int autonomyIntervalSeconds = 30;
     /** Bumped whenever defaults change meaningfully; migrates older config files. */

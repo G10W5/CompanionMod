@@ -429,6 +429,14 @@ public final class ClientVoice {
 
     /** Push config-driven appearance/identity settings to the server once per entity. */
     private static void syncEntitySettings(Minecraft mc, CompanionEntity companion) {
+        // Force-load toggle: config persists across restarts but the server-side flag does not - re-send it
+        // whenever it disagrees (once per world join or when the user flips the setting). Throttled so a
+        // dropped/rate-limited packet cannot turn into a per-tick resend storm.
+        if (cfg != null && cfg.forceLoadChunks != companion.forceChunks()
+                && System.currentTimeMillis() - lastChunkSync > 2000) {
+            lastChunkSync = System.currentTimeMillis();
+            send("chunks", "", cfg.forceLoadChunks ? "on" : "off");
+        }
         String wanted = cfg == null ? "" : cfg.companionSkin;   // "owner" stays symbolic: the renderer resolves it synchronously
         boolean feminine = cfg != null && cfg.feminineModel;
         String name = cfg == null || cfg.companionName == null || cfg.companionName.isBlank() ? "" : cfg.companionName;
@@ -444,6 +452,7 @@ public final class ClientVoice {
     }
 
     private static long lastReviveSend;
+    private static long lastChunkSync;
 
     /** Holding right click (interact, like doors) on a downed companion sends revive pulses to the server. */
     private static void handleReviveInput(Minecraft mc, CompanionEntity companion) {

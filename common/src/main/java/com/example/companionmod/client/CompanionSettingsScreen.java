@@ -153,6 +153,12 @@ public class CompanionSettingsScreen extends Screen {
         toggle(lx, y, iw, "Memory", config.memoryEnabled, v -> config.memoryEnabled = v);
         y += ROW;
 
+        toggle(lx, y, iw, "Load Chunks", config.forceLoadChunks, v -> {
+            config.forceLoadChunks = v;
+            ClientVoice.send("chunks", "", v ? "on" : "off");       // server keeps his 3x3 chunk area force-loaded
+        });
+        y += ROW;
+
         // 26.1-CHECK: CycleButton.builder signature (copied unchanged from the old screen)
         this.addRenderableWidget(CycleButton.<String>builder(CompanionSettingsScreen::bodyName, config.companionBody == null ? "auto" : config.companionBody)
                 .withValues("auto", "slim", "classic")

@@ -10,13 +10,14 @@ public enum CompanionCommand {
     GIVE, TAKE, DROP, PICKUP, OPEN, CLOSE, CRAFT, SMELT, BREW, ENCHANT,
     FISH, COOK, FIGHT, FLEE, HIDE, SEEK, FIND, SEARCH, TRACK, HUNT,
     SEEK_BLOCK, SET_NAME, REVIVE, PLAN,
-    REMEMBER, FORGET, SET_SKIN, FEMININE, MASCULINE, PLANT, SURFACE;
+    REMEMBER, FORGET, SET_SKIN, FEMININE, MASCULINE, PLANT, SURFACE,
+    CHUNKS;   // settings toggle: force-load the chunks around the companion (not a gameplay intent)
 
     /** False for appearance/UI/memory/revive packets: they are not a new gameplay intent and must not pause or cancel a plan. */
     public boolean interruptsPlanning() {
         return switch (this) {
             case NONE, PLAN, CONTINUE, INVENTORY, SET_NAME, SET_SKIN, FEMININE, MASCULINE,
-                    REMEMBER, FORGET, REVIVE -> false;
+                    REMEMBER, FORGET, REVIVE, CHUNKS -> false;
             default -> true;
         };
     }
@@ -89,6 +90,7 @@ public enum CompanionCommand {
             case "masculine": case "male": case "masculine_model": return MASCULINE;
             case "revive": case "revive_me": case "rescue": case "help_me": return REVIVE;
             case "plan": case "goal": case "autonomy": return PLAN;
+            case "chunks": case "chunk": case "force_chunks": case "force_load_chunks": case "keep_chunks_loaded": return CHUNKS;
             default: return NONE;
         }
     }

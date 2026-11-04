@@ -406,6 +406,15 @@ public class CompanionSeekBlockGoal extends Goal {
     }
 
     private void branch(ServerLevel level, MineTask t) {
+        // Chasing ore dropped us BELOW the lane (-59/-60 next to bedrock): mining must stay on ty. The lane
+        // code never brought him back up, so a single diamond-pocket fall stranded the whole strip job at
+        // bedrock level. Climb back FIRST - headroom cells are cleared upward by planStep (+1).
+        if (mob.blockPosition().getY() < t.ty) {
+            if (planStep(level, t, Direction.from2DDataValue(t.dirData), 1, true)) {
+                diag("branch: climbing back to lane y=" + t.ty + " (was y=" + mob.blockPosition().getY() + ")");
+                return;
+            }
+        }
         Direction d = Direction.from2DDataValue(t.dirData);
         int len = (t.leg % 2 == 0) ? LEG_LEN : SIDE_LEN;
         if (t.legLen >= len) {                                          // finished a tunnel leg: shift sideways, come back parallel
