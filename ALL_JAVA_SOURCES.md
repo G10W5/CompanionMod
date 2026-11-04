@@ -5132,6 +5132,13 @@ public class CompanionSeekBlockGoal extends Goal {
                 startBreak(level, up);
                 return;
             }
+            // Stale queued cell left behind (walked away, lane turned): mining out-of-reach cells looks like
+            // 'swinging at empty space across the room' - drop it; the lane plan re-queues work where we stand.
+            if (mob.getEyePosition().distanceToSqr(Vec3.atCenterOf(head)) > REACH_SQ + 8) {
+                diag("pending: dropping out-of-reach cell " + head);
+                pending.poll();
+                return;
+            }
             startBreak(level, pending.poll());
             return;
         }
@@ -5280,9 +5287,15 @@ public class CompanionSeekBlockGoal extends Goal {
         }
         // Blocked ahead (lava pocket, bedrock bump): mine at a slight angle or step over it before ending the leg.
         // Without this one blocked cell ended the leg instantly, all 8 legs burned in seconds and the task paused.
+        // LANE MEMORY: planStep() writes the direction it actually succeeded in into t.dirData - so a single
+        // cw/ccw detour step used to PERMANENTLY rotate the lane 90 degrees. Crossing her own tray room (open
+        // floor => straight planStep refuses) turned her into the already-mined area and she zigzagged back
+        // over old lanes ("mines where he already was going back" + the screenshot). The STAND may wander one
+        // block sideways on a detour, but the LANE direction is restored afterwards.
         if (planStep(level, t, d.getClockWise(), 0, false)
                 || planStep(level, t, d.getCounterClockWise(), 0, false)
                 || planStep(level, t, d, -1, false) || planStep(level, t, d, 1, false)) {
+            t.dirData = d.get2DDataValue();                        // keep the leg's heading despite detours
             t.legLen++;
             branchBoxed = 0;
             return;
