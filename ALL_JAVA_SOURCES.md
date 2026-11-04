@@ -5333,26 +5333,32 @@ public class CompanionSeekBlockGoal extends Goal {
         // tree top has no standable node) - that failure used to fall into tunnel mode and dig the infamous
         // one-block trench. Walk to the nearest STANDABLE cell BESIDE the target instead; mining then
         // starts by reach, exactly like a player would do it.
-        BlockPos base = target.getY() > mob.blockPosition().getY() ? groundBelow(level, t, target).above() : target;
-        BlockPos beside = null;
-        Path besidePath = null;
-        for (int dy = 0; dy >= -1 && besidePath == null; dy--) {
-            for (Direction dir : Direction.Plane.HORIZONTAL) {
-                BlockPos c = base.above(dy).relative(dir);
-                if (level.getBlockState(c.below()).isAir()) continue;               // nothing to stand on
-                if (!passable(level, c) || !passable(level, c.above())) continue;   // no headroom
-                if (matches(t, level.getBlockState(c))) continue;                   // never stand IN the material itself
-                Path fp = mob.getNavigation().createPath(c, 1);
-                if (fp != null && fp.canReach()) { beside = c.immutable(); besidePath = fp; break; }
+        // Already standing beside the target's column? Skip the walk-around entirely - it used to
+        // alternate forever between the two beside cells (13:19:26-30 in latest.log) without ever climbing.
+        double dxT = target.getX() + 0.5 - mob.getX(), dzT = target.getZ() + 0.5 - mob.getZ();
+        boolean hugging = dxT * dxT + dzT * dzT <= 2.9;
+        if (!hugging) {
+            BlockPos base = target.getY() > mob.blockPosition().getY() ? groundBelow(level, t, target).above() : target;
+            BlockPos beside = null;
+            Path besidePath = null;
+            for (int dy = 0; dy >= -1 && besidePath == null; dy--) {
+                for (Direction dir : Direction.Plane.HORIZONTAL) {
+                    BlockPos c = base.above(dy).relative(dir);
+                    if (level.getBlockState(c.below()).isAir()) continue;               // nothing to stand on
+                    if (!passable(level, c) || !passable(level, c.above())) continue;   // no headroom
+                    if (matches(t, level.getBlockState(c))) continue;                   // never stand IN the material itself
+                    Path fp = mob.getNavigation().createPath(c, 1);
+                    if (fp != null && fp.canReach()) { beside = c.immutable(); besidePath = fp; break; }
+                }
             }
-        }
-        if (besidePath != null) {
-            walkTo = beside;
-            walkMode = WALK_FREE;
-            walkTicks = 0;
-            mob.getNavigation().moveTo(besidePath, 1.1);
-            diag("walking beside target " + target + " -> " + beside);
-            return;
+            if (besidePath != null) {
+                walkTo = beside;
+                walkMode = WALK_FREE;
+                walkTicks = 0;
+                mob.getNavigation().moveTo(besidePath, 1.1);
+                diag("walking beside target " + target + " -> " + beside);
+                return;
+            }
         }
         tunnelToward(level, t, target);
     }
@@ -5428,9 +5434,11 @@ public class CompanionSeekBlockGoal extends Goal {
         if (target.getY() - me.getY() < 2) return false;
         if (!hasScaffoldBlock(t)) {
             say(level, "I can't reach that high. Give me some dirt or cobblestone to climb with.", false);
+            diag("scaffold: no climbable blocks in bag for " + target);
             return false;
         }
-        if (approachTries.merge(target.immutable(), 1, Integer::sum) > 8) return false;
+        int tries = approachTries.merge(target.immutable(), 1, Integer::sum);
+        if (tries > 8) { diag("scaffold: gave up after " + tries + " tries on " + target); return false; }
         int h = Math.max(Math.abs(target.getX() - me.getX()), Math.abs(target.getZ() - me.getZ()));
         if (h <= 2) {
             if (pillarTarget == null) pillarPlaced = 0;
@@ -5464,7 +5472,12 @@ public class CompanionSeekBlockGoal extends Goal {
     private void pillarStep(ServerLevel level, MineTask t, long now) {
         BlockPos target = pillarTarget;
         if (!matches(t, level.getBlockState(target)) || unreachable.contains(target)) { diag("pillar end: target gone"); endPillar(); return; }
-        if (inReach(Vec3.atCenterOf(target))) { diag("pillar done: target in reach"); endPillar(); return; }   // in reach: normal mining (clears leaves in the way)
+        // The reach test MUST use our GROUNDED eye height: mid-jump the eye swings ~1.3 blocks closer, a high
+        // target briefly enters reach and pillarStep used to end ("target in reach") every jump BEFORE
+        // placing a block - the endless jump-never-places loop (13:18:31-36 in latest.log).
+        double feetY = mob.onGround() || jumpCell == null ? mob.getY() : jumpCell.getY();
+        Vec3 standEye = new Vec3(mob.getX(), feetY + 1.62, mob.getZ());
+        if (standEye.distanceToSqr(Vec3.atCenterOf(target)) <= REACH_SQ) { diag("pillar done: target in standing reach"); endPillar(); return; }
         if (target.getY() <= mob.blockPosition().getY() + 1) { diag("pillar end: target no longer above us"); endPillar(); return; }
         mob.getNavigation().stop();
         if (jumpCell == null) {
