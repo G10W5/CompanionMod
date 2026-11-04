@@ -1111,11 +1111,12 @@ public class CompanionFindBlockScreen extends Screen {
         });
         this.addRenderableWidget(amountField);
 
-        // One horizontally wheel-scrollable chip row: only the visible slice becomes buttons.
+        // Only chips that fit FULLY inside the well become buttons - partial chips used to render over the
+        // panel edge, outside the well ("buttons clipping out of the background").
         int cur = ix - chipScroll;
         for (String[] e : QUICK) {
             int bw = this.font.width(e[0]) + 14;
-            if (cur + bw > ix && cur < ix + iw) {
+            if (cur >= ix && cur + bw <= ix + iw) {
                 final String id = e[1];
                 this.addRenderableWidget(Button.builder(Component.literal(e[0]), b -> {
                     blockValue = id;
@@ -1171,8 +1172,11 @@ public class CompanionFindBlockScreen extends Screen {
     public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
         super.extractBackground(g, mouseX, mouseY, partialTick);
         CompanionUi.panel(g, px, py, px + panelW, py + panelH);       // same bevelled panel as Settings
-        // Black empty well behind the suggestion chips (chips render later, in the widget phase).
-        g.fill(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22, 0xFF000000);
+        // Sunken lighter-grey well behind the chips - the slot-well look from the settings/inventory style
+        // (pure black clashed on the light panel). Chips render later, on top of it.
+        g.fill(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22, 0xFF373737);
+        g.fill(ix - 1, chipTop() - 1, ix + iw + 1, chipTop() + 21, 0xFFFFFFFF);
+        g.fill(ix, chipTop(), ix + iw, chipTop() + 20, 0xFF8B8B8B);
     }
 
     @Override
@@ -1180,17 +1184,19 @@ public class CompanionFindBlockScreen extends Screen {
         super.extractRenderState(g, mouseX, mouseY, partialTick);      // background + widgets
         int cx = this.width / 2;
         g.centeredText(this.font, "Find & Mine", cx, py + 8, CompanionUi.TEXT_DARK);
-        String sub = "Amount blank = default (16, diamonds 6) - wheel the chips";
-        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw), cx, py + 18, CompanionUi.TEXT_DARK);
+        String sub = "Blank amount = default (16, diamonds 6)";   // fits the panel width outright
+        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw - 8), cx, py + 18, CompanionUi.TEXT_DARK);
         g.text(this.font, "Amount", ix + 62, py + HEAD_H + 30, CompanionUi.TEXT_DARK, true);
-        // Visible horizontal scrollbar for the chip row.
+        // Visible horizontal scrollbar for the chip row, sunken lighter-grey like the well.
         int max = Math.max(0, chipTotalW() - iw);
         if (max > 0) {
             int ty = chipTop() + 23;
-            g.fill(ix, ty, ix + iw, ty + 4, 0xFF000000);
+            g.fill(ix, ty, ix + iw, ty + 4, 0xFF373737);
+            g.fill(ix + 1, ty + 1, ix + iw - 1, ty + 3, 0xFF8B8B8B);
             int tw = Math.max(24, iw * iw / Math.max(1, chipTotalW()));
             int tx = ix + (iw - tw) * chipScroll / max;
-            g.fill(tx + 1, ty + 1, tx + tw - 1, ty + 3, 0xFFB0B0B0);
+            g.fill(tx - 1, ty - 1, tx + tw + 1, ty + 5, 0xFF000000);
+            g.fill(tx, ty, tx + tw, ty + 4, 0xFFC6C6C6);
         }
         if (!status.isBlank()) g.centeredText(this.font, status, cx, py + 126, CompanionUi.TEXT_ERROR);
     }
@@ -1262,7 +1268,8 @@ public class CompanionGoalScreen extends Screen {
         int x = ix - chipScroll;
         for (String idea : IDEAS) {
             int bw = this.font.width(idea) + 14;
-            if (x + bw > ix && x < ix + iw) {
+            // Only chips that fit FULLY inside the well: partial chips rendered over the panel edge.
+            if (x >= ix && x + bw <= ix + iw) {
                 this.addRenderableWidget(Button.builder(Component.literal(idea), b -> field.setValue(idea))
                         .pos(x, chipTop()).size(bw, 20).build());
             }
@@ -1316,7 +1323,10 @@ public class CompanionGoalScreen extends Screen {
     public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
         super.extractBackground(g, mouseX, mouseY, partialTick);
         CompanionUi.panel(g, px, py, px + panelW, py + panelH);
-        g.fill(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22, 0xFF000000);   // dark well behind the chips
+        // Sunken lighter-grey well behind the chips (slot-well style, not harsh black).
+        g.fill(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22, 0xFF373737);
+        g.fill(ix - 1, chipTop() - 1, ix + iw + 1, chipTop() + 21, 0xFFFFFFFF);
+        g.fill(ix, chipTop(), ix + iw, chipTop() + 20, 0xFF8B8B8B);
     }
 
     @Override
@@ -1325,15 +1335,17 @@ public class CompanionGoalScreen extends Screen {
         int cx = this.width / 2;
         g.centeredText(this.font, "Give a Goal", cx, py + 8, CompanionUi.TEXT_DARK);
         String sub = "Amounts in the text work: 'bring me 12 iron'";
-        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw), cx, py + 18, CompanionUi.TEXT_DARK);
-        // Visible horizontal scrollbar for the chip row.
+        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw - 8), cx, py + 18, CompanionUi.TEXT_DARK);
+        // Visible horizontal scrollbar for the chip row, sunken lighter-grey like the well.
         int max = Math.max(0, chipTotalW() - iw);
         if (max > 0) {
             int ty = chipTop() + 23;
-            g.fill(ix, ty, ix + iw, ty + 4, 0xFF000000);
+            g.fill(ix, ty, ix + iw, ty + 4, 0xFF373737);
+            g.fill(ix + 1, ty + 1, ix + iw - 1, ty + 3, 0xFF8B8B8B);
             int tw = Math.max(24, iw * iw / Math.max(1, chipTotalW()));
             int tx = ix + (iw - tw) * chipScroll / max;
-            g.fill(tx + 1, ty + 1, tx + tw - 1, ty + 3, 0xFFB0B0B0);
+            g.fill(tx - 1, ty - 1, tx + tw + 1, ty + 5, 0xFF000000);
+            g.fill(tx, ty, tx + tw, ty + 4, 0xFFC6C6C6);
         }
     }
 }
@@ -1481,9 +1493,11 @@ public class CompanionInventoryScreen extends AbstractContainerScreen<CompanionI
         for (Slot s : this.menu.slots) slotWell(g, leftPos + s.x - 1, topPos + s.y - 1);
         // Ghost icons like the player inventory: helmet/chest/legs/boots and pick/axe/shovel/sword outlines
         // showing what belongs in each slot. Real slot items are extracted after the background and cover them.
+        // Faded to ~5% with a 95%-alpha wash of the slot fill (a solid ghost competed with the real items).
         for (int i = 0; i < GHOSTS.length && i < this.menu.slots.size(); i++) {
             Slot s = this.menu.slots.get(i);
             g.fakeItem(GHOSTS[i], leftPos + s.x, topPos + s.y);
+            g.fill(leftPos + s.x, topPos + s.y, leftPos + s.x + 16, topPos + s.y + 16, 0xF28B8B8B);
         }
     }
 

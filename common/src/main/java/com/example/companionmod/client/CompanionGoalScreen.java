@@ -60,7 +60,8 @@ public class CompanionGoalScreen extends Screen {
         int x = ix - chipScroll;
         for (String idea : IDEAS) {
             int bw = this.font.width(idea) + 14;
-            if (x + bw > ix && x < ix + iw) {
+            // Only chips that fit FULLY inside the well: partial chips rendered over the panel edge.
+            if (x >= ix && x + bw <= ix + iw) {
                 this.addRenderableWidget(Button.builder(Component.literal(idea), b -> field.setValue(idea))
                         .pos(x, chipTop()).size(bw, 20).build());
             }
@@ -114,7 +115,10 @@ public class CompanionGoalScreen extends Screen {
     public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
         super.extractBackground(g, mouseX, mouseY, partialTick);
         CompanionUi.panel(g, px, py, px + panelW, py + panelH);
-        g.fill(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22, 0xFF000000);   // dark well behind the chips
+        // Sunken lighter-grey well behind the chips (slot-well style, not harsh black).
+        g.fill(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22, 0xFF373737);
+        g.fill(ix - 1, chipTop() - 1, ix + iw + 1, chipTop() + 21, 0xFFFFFFFF);
+        g.fill(ix, chipTop(), ix + iw, chipTop() + 20, 0xFF8B8B8B);
     }
 
     @Override
@@ -123,15 +127,17 @@ public class CompanionGoalScreen extends Screen {
         int cx = this.width / 2;
         g.centeredText(this.font, "Give a Goal", cx, py + 8, CompanionUi.TEXT_DARK);
         String sub = "Amounts in the text work: 'bring me 12 iron'";
-        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw), cx, py + 18, CompanionUi.TEXT_DARK);
-        // Visible horizontal scrollbar for the chip row.
+        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw - 8), cx, py + 18, CompanionUi.TEXT_DARK);
+        // Visible horizontal scrollbar for the chip row, sunken lighter-grey like the well.
         int max = Math.max(0, chipTotalW() - iw);
         if (max > 0) {
             int ty = chipTop() + 23;
-            g.fill(ix, ty, ix + iw, ty + 4, 0xFF000000);
+            g.fill(ix, ty, ix + iw, ty + 4, 0xFF373737);
+            g.fill(ix + 1, ty + 1, ix + iw - 1, ty + 3, 0xFF8B8B8B);
             int tw = Math.max(24, iw * iw / Math.max(1, chipTotalW()));
             int tx = ix + (iw - tw) * chipScroll / max;
-            g.fill(tx + 1, ty + 1, tx + tw - 1, ty + 3, 0xFFB0B0B0);
+            g.fill(tx - 1, ty - 1, tx + tw + 1, ty + 5, 0xFF000000);
+            g.fill(tx, ty, tx + tw, ty + 4, 0xFFC6C6C6);
         }
     }
 }
