@@ -5248,6 +5248,7 @@ public class CompanionSeekBlockGoal extends Goal {
     private final Set<BlockPos> unreachable = new HashSet<>();
     private BlockPos breaking, walkTo, oreTarget, stepStand;
     private int walkMode, breakProgress, breakNeed, walkTicks, stuck, wanderTries, torchCooldown;
+    private boolean torchWarned;                        // said "I'm out of torches" once for this task
     private long lastProgress, lastSpeak;
 
     // --- surface search: time-based rescans, long-range heightmap "sight", exploration memory
@@ -5336,6 +5337,7 @@ public class CompanionSeekBlockGoal extends Goal {
         watchAt = 0;                            // the no-silent-stall watchdog re-arms after any state reset
         caveSearchUntil = 0;
         nextCaveAt = 0;
+        torchWarned = false;                    // a new job may have been given torches again
         branchBoxed = 0;
         lastDescendY = Integer.MIN_VALUE;
         lastDiag = "";
@@ -5438,7 +5440,15 @@ public class CompanionSeekBlockGoal extends Goal {
         // Underground it gets dark: drop a torch from the bag every so often so the tunnels stay lit.
         if (t.phase != MineTask.Phase.SEARCH && --torchCooldown <= 0) {
             torchCooldown = 60;
-            if (level.getMaxLocalRawBrightness(mob.blockPosition()) < 8) mob.placeTorch();
+            if (level.getMaxLocalRawBrightness(mob.blockPosition()) < 8) {
+                boolean placed = mob.placeTorch();
+                if (!placed && !torchWarned && !mob.hasTorches()) {
+                    // The usual reason no torch appears: the bag is EMPTY (the companion never crafts them) -
+                    // it used to fail silently every 3 s ("sometimes he doesn't place torches"). Say it once.
+                    torchWarned = true;
+                    say(level, "I'm out of torches. It's getting dark down here.", true);
+                }
+            }
         }
         if (breaking != null) { keepBreaking(level, t, now); return; }
         // BURIED self-clear (was the 18:47-18:51 pocket: minutes of "pathfinder refuses the step" with no
@@ -7929,7 +7939,11 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             } else if (cur == this) {
                 claim = false;
             } else if (guard && owner != null && cur == owner) {
-                claim = distanceToSqr(m) < owner.distanceToSqr(m);
+                // GUARD = INTERCEPT: the old "only when closer than the owner" rule failed whenever the owner
+                // stood near their guarding companion (the usual case!) - mobs kept chasing the owner and
+                // 'refused to attack the companion' (user report). GUARD now always takes over the owner's
+                // attackers; DEFENSIVE keeps the distance rule (joins only when closer).
+                claim = stance() == Stance.GUARD || distanceToSqr(m) < owner.distanceToSqr(m);
             } else {
                 // Stale far target: the monster keeps 'attacking' something 30 blocks away it can never reach
                 // and just stands there. Pull it back when it is closer to US than to that old target - but
@@ -8022,6 +8036,14 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             return;
         }
         selectTool(bestSlot);
+    }
+
+    /** Whether the bag still holds at least one torch (drives the "out of torches" line while mining). */
+    public boolean hasTorches() {
+        for (int i = MAIN_START; i < MAIN_START + MAIN_SIZE; i++) {
+            if (storage.getItem(i).getItem() == net.minecraft.world.item.Items.TORCH) return true;
+        }
+        return false;
     }
 
     /** Places a torch from the bag at a free adjacent floor cell when it is too dark. */

@@ -1082,7 +1082,11 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             } else if (cur == this) {
                 claim = false;
             } else if (guard && owner != null && cur == owner) {
-                claim = distanceToSqr(m) < owner.distanceToSqr(m);
+                // GUARD = INTERCEPT: the old "only when closer than the owner" rule failed whenever the owner
+                // stood near their guarding companion (the usual case!) - mobs kept chasing the owner and
+                // 'refused to attack the companion' (user report). GUARD now always takes over the owner's
+                // attackers; DEFENSIVE keeps the distance rule (joins only when closer).
+                claim = stance() == Stance.GUARD || distanceToSqr(m) < owner.distanceToSqr(m);
             } else {
                 // Stale far target: the monster keeps 'attacking' something 30 blocks away it can never reach
                 // and just stands there. Pull it back when it is closer to US than to that old target - but
@@ -1175,6 +1179,14 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             return;
         }
         selectTool(bestSlot);
+    }
+
+    /** Whether the bag still holds at least one torch (drives the "out of torches" line while mining). */
+    public boolean hasTorches() {
+        for (int i = MAIN_START; i < MAIN_START + MAIN_SIZE; i++) {
+            if (storage.getItem(i).getItem() == net.minecraft.world.item.Items.TORCH) return true;
+        }
+        return false;
     }
 
     /** Places a torch from the bag at a free adjacent floor cell when it is too dark. */

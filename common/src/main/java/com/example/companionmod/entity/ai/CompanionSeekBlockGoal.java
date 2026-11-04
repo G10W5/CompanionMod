@@ -61,6 +61,7 @@ public class CompanionSeekBlockGoal extends Goal {
     private final Set<BlockPos> unreachable = new HashSet<>();
     private BlockPos breaking, walkTo, oreTarget, stepStand;
     private int walkMode, breakProgress, breakNeed, walkTicks, stuck, wanderTries, torchCooldown;
+    private boolean torchWarned;                        // said "I'm out of torches" once for this task
     private long lastProgress, lastSpeak;
 
     // --- surface search: time-based rescans, long-range heightmap "sight", exploration memory
@@ -149,6 +150,7 @@ public class CompanionSeekBlockGoal extends Goal {
         watchAt = 0;                            // the no-silent-stall watchdog re-arms after any state reset
         caveSearchUntil = 0;
         nextCaveAt = 0;
+        torchWarned = false;                    // a new job may have been given torches again
         branchBoxed = 0;
         lastDescendY = Integer.MIN_VALUE;
         lastDiag = "";
@@ -251,7 +253,15 @@ public class CompanionSeekBlockGoal extends Goal {
         // Underground it gets dark: drop a torch from the bag every so often so the tunnels stay lit.
         if (t.phase != MineTask.Phase.SEARCH && --torchCooldown <= 0) {
             torchCooldown = 60;
-            if (level.getMaxLocalRawBrightness(mob.blockPosition()) < 8) mob.placeTorch();
+            if (level.getMaxLocalRawBrightness(mob.blockPosition()) < 8) {
+                boolean placed = mob.placeTorch();
+                if (!placed && !torchWarned && !mob.hasTorches()) {
+                    // The usual reason no torch appears: the bag is EMPTY (the companion never crafts them) -
+                    // it used to fail silently every 3 s ("sometimes he doesn't place torches"). Say it once.
+                    torchWarned = true;
+                    say(level, "I'm out of torches. It's getting dark down here.", true);
+                }
+            }
         }
         if (breaking != null) { keepBreaking(level, t, now); return; }
         // BURIED self-clear (was the 18:47-18:51 pocket: minutes of "pathfinder refuses the step" with no
