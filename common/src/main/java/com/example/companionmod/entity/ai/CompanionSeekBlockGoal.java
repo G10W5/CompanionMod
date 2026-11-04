@@ -348,7 +348,13 @@ public class CompanionSeekBlockGoal extends Goal {
                     t.phase = MineTask.Phase.DESCEND;
                     say(level, "Nothing on the surface. Heading down to y=" + t.ty + ".", true);
                 } else if (t.deep()) {
+                    // Already at/below ty when the order arrived (issued from inside a cave): this path used
+                    // to skip the cave window entirely - he stood in a cave full of iron and started branch
+                    // mining anyway (user report). Same 90 s caves-first window as the DESCEND arrival.
                     t.phase = MineTask.Phase.BRANCH;
+                    caveSearchUntil = now + 1800;
+                    nextCaveAt = 0;
+                    say(level, "This depth looks right. Checking the caves first.", true);
                 } else searchSurface(level, t);
             }
             case DESCEND -> {
@@ -1427,7 +1433,10 @@ public class CompanionSeekBlockGoal extends Goal {
      * high-up blocks from stealing the target. Columns outside loaded chunks are skipped, never force-loaded.
      */
     private BlockPos scan(ServerLevel level, MineTask t) {
-        int r = t.phase == MineTask.Phase.SEARCH ? 22 : 10;
+        // Underground radius 14 (was 10): standing IN a cave, iron 11-14 blocks along the cave passage was
+        // invisible to the scan, so he ignored clearly visible ore and branched instead (user report).
+        // Exposed blocks count to the full radius; buried ones only when very close (unchanged).
+        int r = t.phase == MineTask.Phase.SEARCH ? 22 : 14;
         int down = Math.min(r, 12), up = Math.min(r, 8);
         BlockPos o = mob.blockPosition();
         BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();

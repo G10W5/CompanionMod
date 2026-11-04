@@ -5251,7 +5251,13 @@ public class CompanionSeekBlockGoal extends Goal {
                     t.phase = MineTask.Phase.DESCEND;
                     say(level, "Nothing on the surface. Heading down to y=" + t.ty + ".", true);
                 } else if (t.deep()) {
+                    // Already at/below ty when the order arrived (issued from inside a cave): this path used
+                    // to skip the cave window entirely - he stood in a cave full of iron and started branch
+                    // mining anyway (user report). Same 90 s caves-first window as the DESCEND arrival.
                     t.phase = MineTask.Phase.BRANCH;
+                    caveSearchUntil = now + 1800;
+                    nextCaveAt = 0;
+                    say(level, "This depth looks right. Checking the caves first.", true);
                 } else searchSurface(level, t);
             }
             case DESCEND -> {
@@ -6330,7 +6336,10 @@ public class CompanionSeekBlockGoal extends Goal {
      * high-up blocks from stealing the target. Columns outside loaded chunks are skipped, never force-loaded.
      */
     private BlockPos scan(ServerLevel level, MineTask t) {
-        int r = t.phase == MineTask.Phase.SEARCH ? 22 : 10;
+        // Underground radius 14 (was 10): standing IN a cave, iron 11-14 blocks along the cave passage was
+        // invisible to the scan, so he ignored clearly visible ore and branched instead (user report).
+        // Exposed blocks count to the full radius; buried ones only when very close (unchanged).
+        int r = t.phase == MineTask.Phase.SEARCH ? 22 : 14;
         int down = Math.min(r, 12), up = Math.min(r, 8);
         BlockPos o = mob.blockPosition();
         BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
@@ -6688,6 +6697,13 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     private int autoResumeAtTick = -1;
     private int autoResumeCount;
     private int lastMinedSeen = -1;
+    // Backtrack strategy: while still paused the companion walks to his farthest RECENT position (last ~50 s
+    // every 50t) before re-opening the job - the pathfinder regenerates the same unwalkable target from the
+    // same spot, so attempt 2/4 = physical backtracking, attempt 1/3/5 = rotated heading (user: "he could
+    // easily backtrack and yet he doesn't").
+    private final java.util.Deque<BlockPos> recentTrail = new java.util.ArrayDeque<>();
+    private MoveMode backtrackPrevMode;
+    private int backtrackWalkUntil = -1;
     private String lastSpokenText = "";
     private long lastSpokenTime = 0;
     private int lastSpokenTick = -10000;
@@ -7662,6 +7678,25 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         forcedChunks.clear();
     }
 
+    /** Farthest recent trail position at least 5 blocks away: the 'backtrack' destination, or null. */
+    private BlockPos farthestTrailBack() {
+        BlockPos best = null;
+        double bestD = 25.0;
+        for (BlockPos p : recentTrail) {
+            double d = distanceToSqr(Vec3.atCenterOf(p));
+            if (d >= bestD) { bestD = d; best = p; }
+        }
+        return best;
+    }
+
+    /** Autonomous recovery: re-open the paused job with fresh transient state and a rotated heading. */
+    private void autoResumeOtherWay(String line) {
+        mineTask.resume();
+        mineTask.serial++;                                              // goal drops stale walks/breaks/counters
+        mineTask.dirData = Direction.from2DDataValue(mineTask.dirData).getClockWise().get2DDataValue();
+        speak(line);
+    }
+
     private static long chunkKey(int cx, int cz) { return ((long) cx << 32) | (cz & 0xFFFFFFFFL); }
 
     @Override
@@ -7922,22 +7957,43 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         // attempt counters, and try another way - up to 6 attempts, then say so ONCE and stay put. Real
         // progress (mined count changes) resets the attempt budget; explicit player orders reset it too.
         if (mineTask.mined != lastMinedSeen) { lastMinedSeen = mineTask.mined; autoResumeCount = 0; }
+        // Physical trail for the backtrack strategy (paused states excluded: those are the stuck spots).
+        if (!mineTask.paused && tickCount % 50 == 0 && !isSitting() && getTarget() == null) {
+            recentTrail.addLast(blockPosition().immutable());
+            while (recentTrail.size() > 20) recentTrail.removeFirst();
+        }
         if (mineTask.paused && !isInjured() && !isSitting()) {
-            if (autoResumeAtTick < 0 && autoResumeCount < 8) autoResumeAtTick = tickCount + 100;
-            else if (autoResumeAtTick >= 0 && tickCount >= autoResumeAtTick && mineTask.exists()) {
+            if (backtrackWalkUntil >= 0) {
+                if (tickCount >= backtrackWalkUntil) {                 // 7 s of walking back (or timeout): re-open
+                    if (backtrackPrevMode != null) { setMoveMode(backtrackPrevMode); backtrackPrevMode = null; }
+                    backtrackWalkUntil = -1;
+                    autoResumeOtherWay("Back here. Trying again.");
+                }
+            } else if (autoResumeAtTick < 0 && autoResumeCount < 8) {
+                autoResumeAtTick = tickCount + 100;
+            } else if (autoResumeAtTick >= 0 && tickCount >= autoResumeAtTick && mineTask.exists()) {
                 autoResumeAtTick = -1;
                 autoResumeCount++;
                 if (autoResumeCount > 6) {
                     if (autoResumeCount == 7) speak("I truly can't get through. Say 'continue' once the way is clear.");
+                } else if (autoResumeCount % 2 == 0 && farthestTrailBack() != null) {
+                    // BACKTRACK (attempt 2 and 4): walk back to the farthest recent position WHILE STILL PAUSED -
+                    // the goal is off so nothing fights the movement (STAY pins off the follow goal), and the
+                    // next resume re-plans from a fresh vantage instead of the same poison geometry.
+                    backtrackPrevMode = moveMode();
+                    setMoveMode(MoveMode.STAY);
+                    BlockPos back = farthestTrailBack();
+                    getNavigation().moveTo(back.getX() + 0.5, back.getY(), back.getZ() + 0.5, 1.2);
+                    backtrackWalkUntil = tickCount + 140;
+                    speak("Backing up for another try.");
                 } else {
-                    mineTask.resume();
-                    mineTask.serial++;                                          // goal resets its stale transient state
-                    mineTask.dirData = Direction.from2DDataValue(mineTask.dirData).getClockWise().get2DDataValue();
-                    speak(autoResumeCount == 1 ? "I'm stuck here. Trying another way." : "Trying another way again.");
+                    autoResumeOtherWay(autoResumeCount == 1 ? "I'm stuck here. Trying another way." : "Trying another way again.");
                 }
             }
         } else if (!mineTask.paused) {
             autoResumeAtTick = -1;
+            if (backtrackWalkUntil >= 0) backtrackWalkUntil = -1;       // resumed externally mid-backtrack
+            if (backtrackPrevMode != null) { setMoveMode(backtrackPrevMode); backtrackPrevMode = null; }
         }
         if (tickCount % 100 == 0) updateForcedChunks();   // force-load toggle: keep his 3x3 chunk area alive
         // Drop an automatic target we cannot reach (so mining etc. resumes); player-forced targets persist.
