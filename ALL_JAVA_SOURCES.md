@@ -1072,6 +1072,7 @@ public class CompanionFindBlockScreen extends Screen {
 
     private String blockValue = "", amountValue = "";
     private int chipScroll;                       // horizontal wheel offset in pixels
+    private boolean barDrag;                      // dragging the scrollbar thumb/track
 
     private int px, py, panelW, panelH, ix, iw;   // geometry (recomputed in init)
 
@@ -1124,12 +1125,28 @@ public class CompanionFindBlockScreen extends Screen {
         return Math.max(0, w);
     }
 
+    private int chipMax() { return Math.max(0, chipTotalW() - iw); }
+
+    private int thumbW() { return Math.max(24, iw * iw / Math.max(1, chipTotalW())); }
+
+    private boolean inBar(double mx, double my) {
+        int ty = chipTop() + 23;
+        return mx >= ix && mx < ix + iw && my >= ty - 2 && my < ty + 6;
+    }
+
+    /** Map an x position on the track to a scroll offset (click-to-jump and thumb dragging share this). */
+    private void barTo(int mouseX) {
+        int max = chipMax(), travel = iw - thumbW();
+        if (max <= 0 || travel <= 0) { chipScroll = 0; return; }
+        int rel = Math.max(0, Math.min(travel, mouseX - ix - thumbW() / 2));
+        chipScroll = rel * max / travel;
+    }
+
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
         int top = chipTop();
-        int max = Math.max(0, chipTotalW() - iw);
-        if (max > 0 && mouseY >= top - 2 && mouseY <= top + 26) {
-            chipScroll = (int) Math.max(0, Math.min(max, chipScroll - scrollY * 24));
+        if (chipMax() > 0 && mouseY >= top - 2 && mouseY <= top + 26) {
+            chipScroll = (int) Math.max(0, Math.min(chipMax(), chipScroll - scrollY * 24));
             return true;                            // repaint only - no widget rebuild needed
         }
         return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
@@ -1137,6 +1154,12 @@ public class CompanionFindBlockScreen extends Screen {
 
     @Override
     public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+        // Interactable scrollbar: press anywhere on the bar = jump the thumb there and start dragging.
+        if (event.button() == 0 && inBar(event.x(), event.y()) && chipMax() > 0) {
+            barTo((int) event.x());
+            barDrag = true;
+            return true;
+        }
         if (event.button() == 0 && event.x() >= ix - 2 && event.x() < ix + iw + 2
                 && event.y() >= chipTop() - 2 && event.y() < chipTop() + 22) {
             int x = ix - chipScroll;
@@ -1153,6 +1176,18 @@ public class CompanionFindBlockScreen extends Screen {
             return true;                            // inside the well: swallow the click
         }
         return super.mouseClicked(event, doubleClick);
+    }
+
+    @Override
+    public boolean mouseDragged(MouseButtonEvent event, double dragX, double dragY) {
+        if (barDrag) { barTo((int) event.x()); return true; }
+        return super.mouseDragged(event, dragX, dragY);
+    }
+
+    @Override
+    public boolean mouseReleased(MouseButtonEvent event) {
+        barDrag = false;
+        return super.mouseReleased(event);
     }
 
     private void find() {
@@ -1182,10 +1217,11 @@ public class CompanionFindBlockScreen extends Screen {
     public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
         super.extractRenderState(g, mouseX, mouseY, partialTick);      // background + widgets
         int cx = this.width / 2;
-        g.centeredText(this.font, "Find & Mine", cx, py + 8, CompanionUi.TEXT_DARK);
-        String sub = "Blank amount = default (16, diamonds 6)";
-        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw - 8), cx, py + 18, CompanionUi.TEXT_MUTED);
-        g.text(this.font, "Amount", ix + 62, py + HEAD_H + 30, CompanionUi.TEXT_MUTED, true);
+        // Shadowless 'clean' text like Appearance & Skins (g.centeredText draws a shadow = the bold mush),
+        // title in the lighter grey, and the hint line removed entirely (clutter - user asked twice).
+        String title = "Find & Mine";
+        g.text(this.font, title, cx - this.font.width(title) / 2, py + 8, CompanionUi.TEXT_MUTED, false);
+        g.text(this.font, "Amount", ix + 62, py + HEAD_H + 30, CompanionUi.TEXT_DARK, false);
 
         // Chips inside a scissor: ones that do not fit are CUT OFF at the well edge, never hidden.
         g.enableScissor(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22);
@@ -1213,7 +1249,9 @@ public class CompanionFindBlockScreen extends Screen {
             int tx = ix + (iw - tw) * chipScroll / max;
             g.fill(tx + 1, ty, tx + tw - 1, ty + 4, 0xFFB0B0B0);
         }
-        if (!status.isBlank()) g.centeredText(this.font, status, cx, py + 126, CompanionUi.TEXT_ERROR);
+        if (!status.isBlank()) {
+            g.text(this.font, status, cx - this.font.width(status) / 2, py + 126, CompanionUi.TEXT_ERROR, false);
+        }
     }
 }
 ```
@@ -1254,6 +1292,7 @@ public class CompanionGoalScreen extends Screen {
     private EditBox field;
     private String fieldValue = "";
     private int chipScroll;                       // horizontal wheel offset in pixels
+    private boolean barDrag;                      // dragging the scrollbar thumb/track
 
     private int px, py, panelW, panelH, ix, iw;   // geometry (recomputed in init)
 
@@ -1295,12 +1334,28 @@ public class CompanionGoalScreen extends Screen {
         return Math.max(0, w);
     }
 
+    private int chipMax() { return Math.max(0, chipTotalW() - iw); }
+
+    private int thumbW() { return Math.max(24, iw * iw / Math.max(1, chipTotalW())); }
+
+    private boolean inBar(double mx, double my) {
+        int ty = chipTop() + 23;
+        return mx >= ix && mx < ix + iw && my >= ty - 2 && my < ty + 6;
+    }
+
+    /** Map an x position on the track to a scroll offset (click-to-jump and thumb dragging share this). */
+    private void barTo(int mouseX) {
+        int max = chipMax(), travel = iw - thumbW();
+        if (max <= 0 || travel <= 0) { chipScroll = 0; return; }
+        int rel = Math.max(0, Math.min(travel, mouseX - ix - thumbW() / 2));
+        chipScroll = rel * max / travel;
+    }
+
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
         int top = chipTop();
-        int max = Math.max(0, chipTotalW() - iw);
-        if (max > 0 && mouseY >= top - 2 && mouseY <= top + 26) {
-            chipScroll = (int) Math.max(0, Math.min(max, chipScroll - scrollY * 24));
+        if (chipMax() > 0 && mouseY >= top - 2 && mouseY <= top + 26) {
+            chipScroll = (int) Math.max(0, Math.min(chipMax(), chipScroll - scrollY * 24));
             return true;                            // repaint only - no widget rebuild needed
         }
         return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
@@ -1308,6 +1363,12 @@ public class CompanionGoalScreen extends Screen {
 
     @Override
     public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+        // Interactable scrollbar: press anywhere on the bar = jump the thumb there and start dragging.
+        if (event.button() == 0 && inBar(event.x(), event.y()) && chipMax() > 0) {
+            barTo((int) event.x());
+            barDrag = true;
+            return true;
+        }
         if (event.button() == 0 && event.x() >= ix - 2 && event.x() < ix + iw + 2
                 && event.y() >= chipTop() - 2 && event.y() < chipTop() + 22) {
             int x = ix - chipScroll;
@@ -1322,6 +1383,18 @@ public class CompanionGoalScreen extends Screen {
             return true;                            // inside the well: swallow the click
         }
         return super.mouseClicked(event, doubleClick);
+    }
+
+    @Override
+    public boolean mouseDragged(MouseButtonEvent event, double dragX, double dragY) {
+        if (barDrag) { barTo((int) event.x()); return true; }
+        return super.mouseDragged(event, dragX, dragY);
+    }
+
+    @Override
+    public boolean mouseReleased(MouseButtonEvent event) {
+        barDrag = false;
+        return super.mouseReleased(event);
     }
 
     private void submit() {
@@ -1352,9 +1425,9 @@ public class CompanionGoalScreen extends Screen {
     public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
         super.extractRenderState(g, mouseX, mouseY, partialTick);                   // background + widgets
         int cx = this.width / 2;
-        g.centeredText(this.font, "Give a Goal", cx, py + 8, CompanionUi.TEXT_DARK);
-        String sub = "Amounts in the text work: 'bring me 12 iron'";
-        g.centeredText(this.font, this.font.plainSubstrByWidth(sub, iw - 8), cx, py + 18, CompanionUi.TEXT_MUTED);
+        // Shadowless 'clean' text like Appearance & Skins, lighter-grey title, no hint line (clutter).
+        String title = "Give a Goal";
+        g.text(this.font, title, cx - this.font.width(title) / 2, py + 8, CompanionUi.TEXT_MUTED, false);
 
         // Chips inside a scissor: ones that do not fit are CUT OFF at the well edge, never hidden.
         g.enableScissor(ix - 2, chipTop() - 2, ix + iw + 2, chipTop() + 22);
