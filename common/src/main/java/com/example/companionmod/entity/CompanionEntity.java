@@ -459,20 +459,36 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             case DROP, GIVE -> dropOneItem();
             // "find diamonds / coal" -> walk to the nearest matching block and mine it.
             case SEEK_BLOCK, MINE, FIND, SEEK, SEARCH -> {
-                String id = normalizeBlockId(target);
+                // Optional amount suffix from the Find & Mine screen: "iron_ore:12" -> mine 12 of them.
+                // Only splits when the part after the LAST ':' is pure digits, so namespaced ids like
+                // "aether:zanite_ore" pass through untouched. Blank amount = default want (16, diamonds 6).
+                String raw = target == null ? "" : target.trim();
+                int wantOverride = 0;
+                int c = raw.lastIndexOf(':');
+                if (c > 0 && c + 1 < raw.length()) {
+                    String tail = raw.substring(c + 1);
+                    boolean digits = !tail.isEmpty();
+                    for (int i = 0; i < tail.length(); i++) if (!Character.isDigit(tail.charAt(i))) { digits = false; break; }
+                    if (digits) {
+                        try { wantOverride = Math.max(1, Math.min(64, Integer.parseInt(tail))); } catch (NumberFormatException ignored) { }
+                        raw = raw.substring(0, c);
+                    }
+                }
+                String id = normalizeBlockId(raw);
                 if (id.isBlank()) {
                     // Not a block (or no target): fall back to scouting around instead of doing nothing.
                     setMoveMode(MoveMode.WANDER);
                     setAnchor(blockPosition());
-                    speak(target == null || target.isBlank()
+                    speak(raw.isBlank()
                             ? "What should I look for?"
-                            : "I don't know where to find " + target + ". I'll scout around.");
+                            : "I don't know where to find " + raw + ". I'll scout around.");
                 } else {
                     clearSeekBlock();
                     setSeekBlock(id);
+                    if (wantOverride > 0) mineTask.want = wantOverride;
                     setAnchor(blockPosition());
                     getNavigation().stop();
-                    speak("Looking for " + prettyBlockId(id) + ".");
+                    speak("Looking for " + (wantOverride > 0 ? wantOverride + " " : "") + prettyBlockId(id) + ".");
                 }
             }
             case SET_NAME -> {

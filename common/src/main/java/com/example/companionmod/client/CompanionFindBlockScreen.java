@@ -10,19 +10,37 @@ import net.minecraft.network.chat.Component;
 
 import java.nio.file.Path;
 
-/** Small chooser for "go and find/mine this block" orders. */
+/**
+ * "Go and find/mine this block" chooser in the mod's grey bevelled settings look (was a dark full-screen
+ * panel whose suggestion grid overflowed under the buttons). The amount field carries an explicit count
+ * (blank = default: 16, diamonds 6) which rides the target as "iron_ore:12"; the server splits the suffix
+ * (digits only after the last ':' - namespaced ids like aether:zanite_ore stay untouched). Suggestions sit
+ * in ONE horizontally wheel-scrollable chip row that rebuilds its buttons on scroll.
+ */
 public class CompanionFindBlockScreen extends Screen {
     private static final String[][] QUICK = {
             {"Diamond", "diamond_ore"}, {"Coal", "coal_ore"}, {"Iron", "iron_ore"},
             {"Gold", "gold_ore"}, {"Redstone", "redstone_ore"}, {"Lapis", "lapis_ore"},
             {"Emerald", "emerald_ore"}, {"Copper", "copper_ore"}, {"Ancient Debris", "ancient_debris"},
-            {"Wood", "log"}, {"Stone", "stone"}, {"Dirt", "dirt"}, {"Planks", "oak_planks"},
+            {"Wood", "log"}, {"Planks", "oak_planks"}, {"Stone", "stone"}, {"Cobblestone", "cobblestone"},
+            {"Dirt", "dirt"}, {"Gravel", "gravel"}, {"Sand", "sand"}, {"Clay", "clay"},
+            {"Tuff", "tuff"}, {"Deepslate", "deepslate"}, {"Basalt", "basalt"}, {"Moss", "moss"},
+            {"Ice", "ice"}, {"Amethyst", "amethyst_shard"}, {"Obsidian", "obsidian"},
     };
+
+    private static final int PANEL_W = 300, PAD = 12;
+    private static final int HEAD_H = 44, CONTENT_H = 96, FOOT_H = 56;
 
     private final VoiceConfig config;
     private final Path configFile;
-    private EditBox blockField;
+    private EditBox blockField, amountField;
     private String status = "";
+
+    // Values survive the chip-row rebuildWidgets() (scrolling re-runs init()).
+    private String blockValue = "", amountValue = "";
+    private int chipScroll;                       // horizontal wheel offset in pixels
+
+    private int px, py, panelW, panelH, ix, iw;   // geometry (recomputed in init)
 
     public CompanionFindBlockScreen(VoiceConfig config, Path configFile) {
         super(Component.literal("Find & Mine"));
@@ -30,59 +48,106 @@ public class CompanionFindBlockScreen extends Screen {
         this.configFile = configFile;
     }
 
+    private int chipTop() { return py + HEAD_H + 50; }
+
     @Override
     protected void init() {
-        super.init();
-        int cx = this.width / 2;
-        int y = 72;
+        panelW = Math.min(PANEL_W, this.width - 8);
+        panelH = HEAD_H + CONTENT_H + FOOT_H;
+        px = (this.width - panelW) / 2;
+        py = Math.max(4, (this.height - panelH) / 2);
+        ix = px + PAD;
+        iw = panelW - 2 * PAD;
 
-        this.blockField = new EditBox(this.font, cx - 150, y, 300, 20, Component.literal("Block"));
-        this.blockField.setHint(Component.literal("Block id or name (diamond_ore, coal, iron...)"));
-        this.blockField.setMaxLength(60);
-        this.addRenderableWidget(this.blockField);
-        y += 26;
+        blockField = new EditBox(this.font, ix, py + HEAD_H, iw, 20, Component.literal("Block"));
+        blockField.setHint(Component.literal("Block id or name (diamond_ore, coal, iron...)"));
+        blockField.setMaxLength(60);
+        blockField.setValue(blockValue);
+        blockField.setResponder(v -> blockValue = v);
+        this.addRenderableWidget(blockField);
 
-        int col = 0;
-        for (String[] entry : QUICK) {
-            int bw = 96;
-            int bx = cx - 150 + col * 102;
-            this.addRenderableWidget(Button.builder(Component.literal(entry[0]), b -> {
-                blockField.setValue(entry[1]);
-                status = "";
-            }).pos(bx, y).size(bw, 20).build());
-            col++;
-            if (col == 3) { col = 0; y += 24; }
+        amountField = new EditBox(this.font, ix, py + HEAD_H + 24, 56, 20, Component.literal("Amount"));
+        amountField.setHint(Component.literal("amount"));
+        amountField.setMaxLength(2);
+        amountField.setValue(amountValue);
+        // No setFilter on the common mapping set: strip anything that is not a digit in the responder.
+        amountField.setResponder(v -> {
+            String d = v.replaceAll("[^0-9]", "");
+            if (!d.equals(v)) { amountField.setValue(d); return; }   // re-entrant once, then stable
+            amountValue = d;
+        });
+        this.addRenderableWidget(amountField);
+
+        // One horizontally wheel-scrollable chip row: only the visible slice becomes buttons.
+        int cur = ix - chipScroll;
+        for (String[] e : QUICK) {
+            int bw = this.font.width(e[0]) + 14;
+            if (cur + bw > ix && cur < ix + iw) {
+                final String id = e[1];
+                this.addRenderableWidget(Button.builder(Component.literal(e[0]), b -> {
+                    blockValue = id;
+                    blockField.setValue(id);
+                    status = "";
+                }).pos(cur, chipTop()).size(bw, 20).build());
+            }
+            cur += bw + 4;
         }
-        y += 8;
 
         this.addRenderableWidget(Button.builder(Component.literal("Find & Mine"), b -> find())
-                .pos(cx - 150, y).size(300, 20).build());
-        y += 24;
+                .pos(ix, py + panelH - 52).size(iw, 20).build());
         this.addRenderableWidget(Button.builder(Component.literal("Back"), b -> {
             if (this.minecraft != null) this.minecraft.setScreen(new CompanionRadialScreen());
-        }).pos(cx - 150, y).size(300, 20).build());
+        }).pos(ix, py + panelH - 27).size(iw, 20).build());
+    }
+
+    private int chipTotalW() {
+        int w = -4;
+        for (String[] e : QUICK) w += this.font.width(e[0]) + 14 + 4;
+        return Math.max(0, w);
+    }
+
+    @Override
+    public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+        int top = chipTop();
+        int max = Math.max(0, chipTotalW() - iw);
+        if (max > 0 && mouseY >= top - 2 && mouseY <= top + 22) {
+            int next = (int) Math.max(0, Math.min(max, chipScroll - scrollY * 24));
+            if (next != chipScroll) { chipScroll = next; rebuildWidgets(); }
+            return true;
+        }
+        return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
     }
 
     private void find() {
-        String id = CompanionEntity.normalizeBlockId(blockField.getValue());
+        String id = CompanionEntity.normalizeBlockId(blockValue);
         if (id.isBlank()) {
             status = "Unknown block. Try diamond, coal, iron, gold, emerald...";
             return;
         }
-        ClientVoice.send("seek_block", "", id);
+        String amt = amountValue == null ? "" : amountValue.trim();
+        int count = 0;
+        if (!amt.isEmpty()) {
+            try { count = Integer.parseInt(amt); } catch (NumberFormatException ignored) { }
+            if (count < 1 || count > 64) { status = "Amount must be 1-64 (blank = default)."; return; }
+        }
+        ClientVoice.send("seek_block", "", count > 0 ? id + ":" + count : id);
         if (this.minecraft != null) this.minecraft.setScreen(null);
     }
 
     @Override
-    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
-        this.extractMenuBackground(g);
-        int cx = this.width / 2;
-        g.fill(cx - 162, 34, cx + 162, this.height - 28, 0xCC101216);
-        g.fill(cx - 162, 34, cx + 162, 35, 0xFF3D7BB8);
-        super.extractRenderState(g, mouseX, mouseY, partialTick);
+    public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        super.extractBackground(g, mouseX, mouseY, partialTick);
+        CompanionUi.panel(g, px, py, px + panelW, py + panelH);       // same bevelled panel as Settings
+    }
 
-        g.centeredText(this.font, "Find & Mine", cx, 42, 0xFFFFFFFF);
-        g.centeredText(this.font, "The companion walks to the nearest matching block and mines it.", cx, 54, 0xFF9AA6B2);
-        if (!status.isBlank()) g.centeredText(this.font, status, cx, this.height - 46, 0xFFFF7777);
+    @Override
+    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        super.extractRenderState(g, mouseX, mouseY, partialTick);      // background + widgets
+        int cx = this.width / 2;
+        g.centeredText(this.font, "Find & Mine", cx, py + 8, CompanionUi.TEXT_DARK);
+        g.centeredText(this.font, "Amount blank = default (16, diamonds 6) - wheel the row for more",
+                cx, py + 18, CompanionUi.TEXT_MUTED);
+        g.text(this.font, "Amount", ix + 62, py + HEAD_H + 30, CompanionUi.TEXT_DARK, true);
+        if (!status.isBlank()) g.centeredText(this.font, status, cx, py + 126, CompanionUi.TEXT_ERROR);
     }
 }
