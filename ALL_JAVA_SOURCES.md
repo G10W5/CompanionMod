@@ -5082,7 +5082,9 @@ public class CompanionSeekBlockGoal extends Goal {
 
         long now = level.getGameTime();
         if (oreTarget != null && !matches(t, level.getBlockState(oreTarget))) { oreTarget = null; nextScanAt = 0; }
-        if (oreTarget == null && now >= nextScanAt) {        // time based, and reset after every break/arrival
+        // DESCEND skips area rescans entirely: the stairwell goes through solid stone, nothing can show up
+        // on a surface scan, and the per-level rescan + its 10-tick gate was most of the "5 s per Y level" drag.
+        if (t.phase != MineTask.Phase.DESCEND && oreTarget == null && now >= nextScanAt) {
             nextScanAt = now + 10;
             oreTarget = scan(level, t);
             if (oreTarget != null) wanderTries = 0;
@@ -5755,8 +5757,8 @@ public class CompanionSeekBlockGoal extends Goal {
                 mob.getLookControl().setLookAt(w.getX() + 0.5, w.getY() + 1.0, w.getZ() + 0.5);
                 if (sdy > 0.3 && sdy <= 1.6 && mob.onGround()) mob.getJumpControl().jump();
                 mob.getMoveControl().setWantedPosition(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.15);
-            } else if (nav.isDone() && walkTicks % 20 == 0) {
-                nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.15);   // try the clean path again once a second
+            } else if (nav.isDone() && walkTicks % 10 == 0) {
+                nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.15);   // re-request the clean path twice a second
             }
             if (walkTicks > 240) {
                 failWalk();
