@@ -482,24 +482,30 @@ public class CompanionSeekBlockGoal extends Goal {
             return;
         }
         if (tryScaffold(level, t, target)) return;                   // high in a tree / on a cave ceiling: build up to it
-        // Surface target the pathfinder won't commit to (top of a cactus, a ledge): walk to a cell BESIDE
-        // its column first instead of tunnelling a trench to it - digging toward it produced one-block
-        // trenches with block-by-block teleports where a simple walk-around would do.
-        if (!t.deep() && target.getY() > mob.blockPosition().getY()) {
-            BlockPos base = groundBelow(level, t, target);
+        // The pathfinder refuses to plan INTO several target shapes (a cactus column gets damage malus, a
+        // tree top has no standable node) - that failure used to fall into tunnel mode and dig the infamous
+        // one-block trench. Walk to the nearest STANDABLE cell BESIDE the target instead; mining then
+        // starts by reach, exactly like a player would do it.
+        BlockPos base = target.getY() > mob.blockPosition().getY() ? groundBelow(level, t, target).above() : target;
+        BlockPos beside = null;
+        Path besidePath = null;
+        for (int dy = 0; dy >= -1 && besidePath == null; dy--) {
             for (Direction dir : Direction.Plane.HORIZONTAL) {
-                BlockPos stand = base.relative(dir).above();
-                if (!passable(level, stand)) continue;
-                Path fp = mob.getNavigation().createPath(stand, 1);
-                if (fp != null && fp.canReach()) {
-                    walkTo = stand;
-                    walkMode = WALK_FREE;
-                    walkTicks = 0;
-                    mob.getNavigation().moveTo(fp, 1.0);
-                    diag("walk-around to " + stand + " for target " + target);
-                    return;
-                }
+                BlockPos c = base.above(dy).relative(dir);
+                if (level.getBlockState(c.below()).isAir()) continue;               // nothing to stand on
+                if (!passable(level, c) || !passable(level, c.above())) continue;   // no headroom
+                if (matches(t, level.getBlockState(c))) continue;                   // never stand IN the material itself
+                Path fp = mob.getNavigation().createPath(c, 1);
+                if (fp != null && fp.canReach()) { beside = c.immutable(); besidePath = fp; break; }
             }
+        }
+        if (besidePath != null) {
+            walkTo = beside;
+            walkMode = WALK_FREE;
+            walkTicks = 0;
+            mob.getNavigation().moveTo(besidePath, 1.1);
+            diag("walking beside target " + target + " -> " + beside);
+            return;
         }
         tunnelToward(level, t, target);
     }
@@ -876,22 +882,23 @@ public class CompanionSeekBlockGoal extends Goal {
             return;
         }
         if (walkMode == WALK_STAND) {
-            // Tunnel steps: NATURAL movement only. The step cell is the adjacent one WE just cleared, so the
-            // block-by-block teleport ladder is removed: the pathfinder walks the cell like a player, the body
-            // HOPS onto a step-up it stalls against, and if it still cannot get in the walk FAILS (planning
-            // re-clears the step or turns the tunnel) instead of teleporting.
+            // Tunnel steps: natural movement only. A freshly cleared step is 1 cell ahead, where the
+            // pathfinder often refuses to plan (beside a cactus, tight tunnel corners) - the frozen
+            // "walking" state. Re-request the path while it works; if the body stalls, walk the step on
+            // direct move control and hop onto a step-up. No teleports anywhere.
             double sdx = w.getX() + 0.5 - mob.getX(), sdz = w.getZ() + 0.5 - mob.getZ();
             double sdy = w.getY() - mob.getY();
             boolean adjacent = Math.abs(sdx) <= 1.6 && Math.abs(sdz) <= 1.6;
             if (mob.position().distanceToSqr(standLast) > 0.01) standStall = 0; else standStall++;
             standLast = mob.position();
-            if (adjacent && standStall > 8 && sdy > 0.3 && sdy <= 1.6 && mob.onGround()) {
-                standStall = 0;                                     // one hop per stall, never a hop-spam ladder
-                diag("stand: hop onto step " + w);
+            if (adjacent && standStall > 5) {
+                if (standStall == 6) diag("stand: pathfinder refuses the step, direct walk onto " + w);
                 mob.getLookControl().setLookAt(w.getX() + 0.5, w.getY() + 1.0, w.getZ() + 0.5);
-                mob.getJumpControl().jump();
+                if (sdy > 0.3 && sdy <= 1.6 && mob.onGround()) mob.getJumpControl().jump();
+                mob.getMoveControl().setWantedPosition(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.15);
+            } else if (nav.isDone() && walkTicks % 20 == 0) {
+                nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.15);   // try the clean path again once a second
             }
-            if (walkTicks % 20 == 0) nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.15);
             if (walkTicks > 240) {
                 failWalk();
                 stuck++;
