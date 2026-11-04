@@ -945,9 +945,12 @@ public class CompanionSeekBlockGoal extends Goal {
         BlockPos me = mob.blockPosition();
         for (Direction d : order) {
             BlockPos stand = me.relative(d).above(dyStep);
-            List<BlockPos> cells = new ArrayList<>(5);
+            List<BlockPos> cells = new ArrayList<>(6);
             cells.add(stand);
             cells.add(stand.above());
+            // Strip-mining lanes are 3 TALL: one clear cell above the head, not just 2 (user request - the
+            // tunnel currently fits head + body with the ceiling right on top). Lanes only; stairs stay 2.
+            if (dyStep == 0 && t.phase == MineTask.Phase.BRANCH) cells.add(stand.above(2));
             if (dyStep < 0) cells.add(stand.above(2));                  // headroom to walk in before dropping
             if (dyStep > 0) {
                 // Stairing UP needs headroom above our OWN head first: the head rises through me.above(2)

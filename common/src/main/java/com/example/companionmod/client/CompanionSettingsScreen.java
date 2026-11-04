@@ -150,10 +150,8 @@ public class CompanionSettingsScreen extends Screen {
         toggle(rx, y, colW, "Autonomy", config.autonomyEnabled, v -> config.autonomyEnabled = v);
         y += ROW;
 
-        toggle(lx, y, iw, "Memory", config.memoryEnabled, v -> config.memoryEnabled = v);
-        y += ROW;
-
-        toggle(lx, y, iw, "Load Chunks", config.forceLoadChunks, v -> {
+        toggle(lx, y, colW, "Memory", config.memoryEnabled, v -> config.memoryEnabled = v);
+        toggle(rx, y, colW, "Load Chunks", config.forceLoadChunks, v -> {
             config.forceLoadChunks = v;
             ClientVoice.send("chunks", "", v ? "on" : "off");       // server keeps his 3x3 chunk area force-loaded
         });
@@ -525,7 +523,8 @@ public class CompanionSettingsScreen extends Screen {
         centered(g, this.title.getString(), cx, py + 8, CompanionUi.TEXT_DARK);
 
         switch (tab) {
-            case GENERAL -> centered(g, "V = talk   R = wheel   O = settings", cx, cy + 4 * ROW + 6, CompanionUi.TEXT_MUTED);
+            // "V = talk R = wheel O = settings" keybind hint removed: fixed y position collided with the
+            // widget rows (user: overlapping text, useless anyway).
             case AI -> {
                 text(g, "Server URL (Ollama or OpenAI-compatible)", ix, cy, CompanionUi.TEXT_DARK);
                 int sy = cy + 108;

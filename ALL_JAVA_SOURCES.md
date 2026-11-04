@@ -2527,10 +2527,8 @@ public class CompanionSettingsScreen extends Screen {
         toggle(rx, y, colW, "Autonomy", config.autonomyEnabled, v -> config.autonomyEnabled = v);
         y += ROW;
 
-        toggle(lx, y, iw, "Memory", config.memoryEnabled, v -> config.memoryEnabled = v);
-        y += ROW;
-
-        toggle(lx, y, iw, "Load Chunks", config.forceLoadChunks, v -> {
+        toggle(lx, y, colW, "Memory", config.memoryEnabled, v -> config.memoryEnabled = v);
+        toggle(rx, y, colW, "Load Chunks", config.forceLoadChunks, v -> {
             config.forceLoadChunks = v;
             ClientVoice.send("chunks", "", v ? "on" : "off");       // server keeps his 3x3 chunk area force-loaded
         });
@@ -2902,7 +2900,8 @@ public class CompanionSettingsScreen extends Screen {
         centered(g, this.title.getString(), cx, py + 8, CompanionUi.TEXT_DARK);
 
         switch (tab) {
-            case GENERAL -> centered(g, "V = talk   R = wheel   O = settings", cx, cy + 4 * ROW + 6, CompanionUi.TEXT_MUTED);
+            // "V = talk R = wheel O = settings" keybind hint removed: fixed y position collided with the
+            // widget rows (user: overlapping text, useless anyway).
             case AI -> {
                 text(g, "Server URL (Ollama or OpenAI-compatible)", ix, cy, CompanionUi.TEXT_DARK);
                 int sy = cy + 108;
@@ -5818,9 +5817,12 @@ public class CompanionSeekBlockGoal extends Goal {
         BlockPos me = mob.blockPosition();
         for (Direction d : order) {
             BlockPos stand = me.relative(d).above(dyStep);
-            List<BlockPos> cells = new ArrayList<>(5);
+            List<BlockPos> cells = new ArrayList<>(6);
             cells.add(stand);
             cells.add(stand.above());
+            // Strip-mining lanes are 3 TALL: one clear cell above the head, not just 2 (user request - the
+            // tunnel currently fits head + body with the ceiling right on top). Lanes only; stairs stay 2.
+            if (dyStep == 0 && t.phase == MineTask.Phase.BRANCH) cells.add(stand.above(2));
             if (dyStep < 0) cells.add(stand.above(2));                  // headroom to walk in before dropping
             if (dyStep > 0) {
                 // Stairing UP needs headroom above our OWN head first: the head rises through me.above(2)
