@@ -5320,20 +5320,23 @@ public class CompanionSeekBlockGoal extends Goal {
         if (pending.size() > 12) return;                    // don't bury the walk-ahead steps under tray work
         Direction cat = Direction.from2DDataValue(t.dirData);
         BlockPos me = mob.blockPosition();
+        int queued = 0;
         for (Direction side : new Direction[]{ cat.getClockWise(), cat.getCounterClockWise() }) {
             for (int depth = 1; depth <= 4; depth++) {
                 boolean open = true;
                 for (int h = 0; h <= 1; h++) {
                     BlockPos c = me.relative(side, depth).above(h);
                     if (pending.contains(c) || vein.contains(c)) continue;
+                    if (passable(level, c)) continue;               // already excavated: awareness of our own mining
                     if (matches(t, level.getBlockState(c))) { vein.add(c); continue; }   // ore: chased via the vein queue
                     if (!safeToBreak(level, c)) { open = false; break; }                // liquid edge: that tray stops here
                     pending.add(c);
+                    queued++;
                 }
                 if (!open) break;
             }
         }
-        diag("branch: digging side trays (3rd block, reach 4) at " + me);
+        if (queued > 0) diag("branch: digging side trays (" + queued + " new, 3rd block, reach 4) at " + me);
     }
 
     /**
@@ -5987,50 +5990,49 @@ public class CompanionSeekBlockGoal extends Goal {
             // Only a new BEST distance toward the target counts as movement; oscillation fills the stall clock.
             double hNow = Math.hypot(sdx, sdz);
             if (walkTicks <= 1 || hNow < bestH - 0.02) { bestH = hNow; standStall = 0; } else standStall++;
+            // CONTINUOUS DRIVE (log 19:59-20:02: THREE diag lines per single cell, hDist shrinking in
+            // bursts): the direct push used to engage only at stall>5 and switch OFF the moment progress
+            // reset the stall - a 50% duty cycle (6 dead ticks waiting for stall, 6 pushing) that is
+            // exactly the measured ~0.4 blocks/s crawl. The move target is set EVERY tick now; stall
+            // counts only drive the diag, the entity wait and the give-up.
+            double wcx = w.getX() + 0.5, wcz = w.getZ() + 0.5;
+            double hDist = hNow;
+            // Step-DOWN: when the target cell is essentially beneath us the wanted position equals our own
+            // center and the push has nothing to push toward (the stair-notch lip stalls). Extend the wanted
+            // position BEYOND the notch on the far side - walking there forces the body across the hole and
+            // gravity does the drop, same as a player stepping into a stair notch.
+            if (sdy < -0.3 && hDist < 0.9) {
+                double ox = mob.getX() - wcx, oz = mob.getZ() - wcz;
+                double ol = Math.sqrt(ox * ox + oz * oz);
+                if (ol > 0.05) {
+                    ox /= ol; oz /= ol;
+                    wcx -= ox * 0.6;
+                    wcz -= oz * 0.6;
+                }
+            }
+            mob.getMoveControl().setWantedPosition(wcx, w.getY(), wcz, 1.15);
+            if (adjacent && standStall == 6) {
+                BlockPos meP = mob.blockPosition();
+                var p = mob.getNavigation().createPath(wcx, w.getY(), wcz, 0);
+                diag("stand: pathfinder refuses the step, direct walk onto " + w
+                        + String.format(" | mob=(%.2f,%.2f,%.2f) hDist=%.2f sdy=%.2f onGround=%s path=%s navDone=%s mode=%s ownerD=%.1f",
+                                mob.getX(), mob.getY(), mob.getZ(), hDist, sdy, mob.onGround(),
+                                p == null ? "null" : "reach=" + p.canReach(), mob.getNavigation().isDone(),
+                                mob.moveMode(), mob.getOwner() == null ? -1 : Math.sqrt(mob.distanceToSqr(mob.getOwner())))
+                        + " | target floor=" + lvlName(level.getBlockState(w.below()).getBlock())
+                        + " cell=" + passable(level, w) + " head=" + passable(level, w.above())
+                        + " | me floor=" + lvlName(level.getBlockState(meP.below()).getBlock())
+                        + " cell=" + passable(level, meP) + " head=" + passable(level, meP.above())
+                        + "/" + passable(level, meP.above(2)) + "/" + passable(level, meP.above(3))
+                        + " | blockedBy=" + String.valueOf(corridorBlocker(level, w)));
+            }
             if (adjacent && standStall > 5) {
-                if (standStall == 6) {
-                    double hx = sdx, hz = sdz;
-                    BlockPos meP = mob.blockPosition();
-                    var p = mob.getNavigation().createPath(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 0);
-                    diag("stand: pathfinder refuses the step, direct walk onto " + w
-                            + String.format(" | mob=(%.2f,%.2f,%.2f) hDist=%.2f sdy=%.2f onGround=%s path=%s navDone=%s mode=%s ownerD=%.1f",
-                                    mob.getX(), mob.getY(), mob.getZ(), Math.hypot(hx, hz), sdy, mob.onGround(),
-                                    p == null ? "null" : "reach=" + p.canReach(), mob.getNavigation().isDone(),
-                                    mob.moveMode(), mob.getOwner() == null ? -1 : Math.sqrt(mob.distanceToSqr(mob.getOwner())))
-                            + " | target floor=" + lvlName(level.getBlockState(w.below()).getBlock())
-                            + " cell=" + passable(level, w) + " head=" + passable(level, w.above())
-                            + " | me floor=" + lvlName(level.getBlockState(meP.below()).getBlock())
-                            + " cell=" + passable(level, meP) + " head=" + passable(level, meP.above())
-                            + "/" + passable(level, meP.above(2)) + "/" + passable(level, meP.above(3))
-                            + " | blockedBy=" + String.valueOf(corridorBlocker(level, w)));
-                }
-                double wcx = w.getX() + 0.5, wcz = w.getZ() + 0.5;
-                double hDist = Math.sqrt(sdx * sdx + sdz * sdz);
-                // Step-DOWN stall: the target cell is essentially beneath us and the wanted position equals
-                // our own center, so the direct push has nothing to push toward - the mob stands on the lip
-                // of the dug stair notch forever (y=47 descent stall 14:13:20-14:14:00, wanted x falls
-                // 0.1/block, targets x=1865..1862 rotated on every recovery). Extend the wanted position
-                // BEYOND the notch on the far side: walking there forces the body across the hole and
-                // gravity does the drop - same as a player stepping into a stair notch.
-                if (sdy < -0.3 && hDist < 0.9) {
-                    double ox = mob.getX() - wcx, oz = mob.getZ() - wcz;
-                    double ol = Math.sqrt(ox * ox + oz * oz);
-                    if (ol > 0.05) {
-                        ox /= ol; oz /= ol;
-                        wcx -= ox * 0.6;
-                        wcz -= oz * 0.6;
-                    }
-                }
                 // No jump when the head is under a block: a blocked overhead makes the hop a head-thud loop.
+                // Hop only while stalled on a step-up - mid-walk jumping would bounce the body off course.
                 if (sdy > 0.3 && sdy <= 1.6 && mob.onGround()
                         && passable(level, mob.blockPosition().above(2)) && passable(level, mob.blockPosition().above(3))) {
                     mob.getJumpControl().jump();
                 }
-                mob.getMoveControl().setWantedPosition(wcx, w.getY(), wcz, 1.15);
-                // Re-issue the real path while pushing: blocks clear DURING a stall (trays, falling covers),
-                // but the old code only re-pathed when standStall <= 5, so a refused path was never retried
-                // until a full give-up cycle.
-                if (walkTicks % 20 == 0) nav.moveTo(wcx, w.getY(), wcz, 1.15);
                 if (standStall > 60) {
                     // An entity (the owner watching, a mob) standing in the last 0.5 blocks of the corridor
                     // is the difference between 'hDist 0.98 -> 0.86 oscillation' and walking in - paths
@@ -6049,9 +6051,8 @@ public class CompanionSeekBlockGoal extends Goal {
                         // and the 30 s outcome watchdog reports the wait to the user in words.
                     }
                 }
-            } else if (nav.isDone() && walkTicks % 10 == 0) {
-                nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.15);   // re-request the clean path twice a second
             }
+            if (nav.isDone() && walkTicks % 20 == 0) nav.moveTo(wcx, w.getY(), wcz, 1.15);
             if (walkTicks > 240) {
                 if (waitingFor != null) {              // blocked by an entity: waiting is not 'can't get through'
                     walkTicks = 200;                   // checked again in 2 s instead of failing to the pause
