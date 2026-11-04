@@ -5825,12 +5825,33 @@ public class CompanionSeekBlockGoal extends Goal {
             standLast = mob.position();
             if (adjacent && standStall > 5) {
                 if (standStall == 6) diag("stand: pathfinder refuses the step, direct walk onto " + w);
+                double wcx = w.getX() + 0.5, wcz = w.getZ() + 0.5;
+                double hDist = Math.sqrt(sdx * sdx + sdz * sdz);
+                // Step-DOWN stall: the target cell is essentially beneath us and the wanted position equals
+                // our own center, so the direct push has nothing to push toward - the mob stands on the lip
+                // of the dug stair notch forever (y=47 descent stall 14:13:20-14:14:00, wanted x falls
+                // 0.1/block, targets x=1865..1862 rotated on every recovery). Extend the wanted position
+                // BEYOND the notch on the far side: walking there forces the body across the hole and
+                // gravity does the drop - same as a player stepping into a stair notch.
+                if (sdy < -0.3 && hDist < 0.9) {
+                    double ox = mob.getX() - wcx, oz = mob.getZ() - wcz;
+                    double ol = Math.sqrt(ox * ox + oz * oz);
+                    if (ol > 0.05) {
+                        ox /= ol; oz /= ol;
+                        wcx -= ox * 0.6;
+                        wcz -= oz * 0.6;
+                    }
+                }
                 // No jump when the head is under a block: a blocked overhead makes the hop a head-thud loop.
                 if (sdy > 0.3 && sdy <= 1.6 && mob.onGround()
                         && passable(level, mob.blockPosition().above(2)) && passable(level, mob.blockPosition().above(3))) {
                     mob.getJumpControl().jump();
                 }
-                mob.getMoveControl().setWantedPosition(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.15);
+                mob.getMoveControl().setWantedPosition(wcx, w.getY(), wcz, 1.15);
+                if (standStall > 60) {
+                    diag("stand: giving up the step onto " + w + " after " + standStall + " stall ticks");
+                    failWalk();
+                }
             } else if (nav.isDone() && walkTicks % 10 == 0) {
                 nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.15);   // re-request the clean path twice a second
             }
@@ -9045,19 +9066,54 @@ public final class OllamaCatalog {
         return out;
     }
 
-    /** Voices for a speech model (GET /v1/audio/voices, then /api/voices). Blank model = every voice. Never null. */
+    /** Voices for a speech model (GET /v1/audio/voices, then /api/voices, then /api/show). Blank model = every voice. Never null. */
     public static List<String> voices(String host, String model) {
         String h = normalize(host);
         String m = model == null ? "" : model.trim();
         List<String[]> all = new ArrayList<>();                                   // {voiceId, model}
         collect(all, get(h + "/v1/audio/voices"), "data", "id");
         if (all.isEmpty()) collect(all, get(h + "/api/voices"), "voices", "name");
+        if (all.isEmpty() && !m.isEmpty()) collectShow(all, postShow(h, m));      // ollama omni models: voices live in /api/show
         List<String> matching = new ArrayList<>(), everything = new ArrayList<>();
         for (String[] v : all) {
             everything.add(v[0]);
             if (m.isEmpty() || matchesModel(v[1], m)) matching.add(v[0]);
         }
         return matching.isEmpty() ? everything : matching;                        // unsure filter: show everything, not nothing
+    }
+
+    /**
+     * POST /api/show fallback: lfm3-omni and other "omni" speech models advertise their TTS voices as a plain
+     * string array ("defaults + <lang>-female/male") in the show response - the /v1/audio/voices and /api/voices
+     * endpoints do not exist on Ollama for them (both 404).
+     */
+    private static void collectShow(List<String[]> out, String body) {
+        if (body == null || body.isBlank()) return;
+        try {
+            JsonElement arr = JsonParser.parseString(body).getAsJsonObject().get("voices");
+            if (arr == null || !arr.isJsonArray()) return;
+            for (JsonElement e : arr.getAsJsonArray()) {
+                String id = e.isJsonPrimitive() ? e.getAsString() : (!e.isJsonObject() ? null : str(e.getAsJsonObject(), "name"));
+                if (id != null && !id.isBlank()) out.add(new String[]{id, ""});
+            }
+        } catch (RuntimeException ignored) { }
+    }
+
+    private static String postShow(String host, String model) {
+        try {
+            HttpRequest r = HttpRequest.newBuilder(URI.create(host + "/api/show"))
+                    .timeout(Duration.ofSeconds(5))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString("{\"model\":\"" + model.replace("\"", "\\\"") + "\"}"))
+                    .build();
+            HttpResponse<String> res = HTTP.send(r, HttpResponse.BodyHandlers.ofString());
+            return res.statusCode() == 200 ? res.body() : null;
+        } catch (IOException | RuntimeException e) {
+            return null;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        }
     }
 
     private static boolean matchesModel(String entryModel, String model) {

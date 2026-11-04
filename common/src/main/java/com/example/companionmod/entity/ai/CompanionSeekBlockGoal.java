@@ -980,12 +980,33 @@ public class CompanionSeekBlockGoal extends Goal {
             standLast = mob.position();
             if (adjacent && standStall > 5) {
                 if (standStall == 6) diag("stand: pathfinder refuses the step, direct walk onto " + w);
+                double wcx = w.getX() + 0.5, wcz = w.getZ() + 0.5;
+                double hDist = Math.sqrt(sdx * sdx + sdz * sdz);
+                // Step-DOWN stall: the target cell is essentially beneath us and the wanted position equals
+                // our own center, so the direct push has nothing to push toward - the mob stands on the lip
+                // of the dug stair notch forever (y=47 descent stall 14:13:20-14:14:00, wanted x falls
+                // 0.1/block, targets x=1865..1862 rotated on every recovery). Extend the wanted position
+                // BEYOND the notch on the far side: walking there forces the body across the hole and
+                // gravity does the drop - same as a player stepping into a stair notch.
+                if (sdy < -0.3 && hDist < 0.9) {
+                    double ox = mob.getX() - wcx, oz = mob.getZ() - wcz;
+                    double ol = Math.sqrt(ox * ox + oz * oz);
+                    if (ol > 0.05) {
+                        ox /= ol; oz /= ol;
+                        wcx -= ox * 0.6;
+                        wcz -= oz * 0.6;
+                    }
+                }
                 // No jump when the head is under a block: a blocked overhead makes the hop a head-thud loop.
                 if (sdy > 0.3 && sdy <= 1.6 && mob.onGround()
                         && passable(level, mob.blockPosition().above(2)) && passable(level, mob.blockPosition().above(3))) {
                     mob.getJumpControl().jump();
                 }
-                mob.getMoveControl().setWantedPosition(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.15);
+                mob.getMoveControl().setWantedPosition(wcx, w.getY(), wcz, 1.15);
+                if (standStall > 60) {
+                    diag("stand: giving up the step onto " + w + " after " + standStall + " stall ticks");
+                    failWalk();
+                }
             } else if (nav.isDone() && walkTicks % 10 == 0) {
                 nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.15);   // re-request the clean path twice a second
             }
