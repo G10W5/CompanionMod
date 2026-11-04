@@ -5093,7 +5093,22 @@ public class CompanionSeekBlockGoal extends Goal {
         }
         if (breaking != null) { keepBreaking(level, t, now); return; }
         if (walkTo != null) { walk(level, now); return; }
-        if (!pending.isEmpty()) { startBreak(level, pending.poll()); return; }
+        if (!pending.isEmpty()) {
+            // Falling-block cover: if gravel/sand sits ANYWHERE above the queued cell (fell while we dug
+            // elsewhere, or hangs over a fresh notch), mining the cell first just re-buries the hole we
+            // opened - at deepslate levels the whole stub-tunnel direction collapses to "one block per
+            // direction". Mine the cover top-down BEFORE opening its cell (the real cell stays queued).
+            BlockPos head = pending.peek();
+            BlockPos up = head;
+            while (level.getBlockState(up.above()).getBlock() instanceof FallingBlock) up = up.above();
+            if (up != head) {
+                diag("falling cover: mining " + up + " first, or it lands in the " + head + " hole");
+                startBreak(level, up);
+                return;
+            }
+            startBreak(level, pending.poll());
+            return;
+        }
         if (pillarTarget != null) { pillarStep(level, t, now); return; }
         if (!mob.onGround() && !mob.isInWater()) return;        // wait for the landing: path requests fail in mid-air and used to mark good targets "unreachable"
         if (stepStand != null) {
@@ -5262,6 +5277,7 @@ public class CompanionSeekBlockGoal extends Goal {
         // Boxed in (lava pocket, bedrock wall): rotate the leg and mine at an angle to escape the pocket
         // instead of ending the leg - two rotations (90 then 180) before the leg really ends.
         if (branchBoxed++ < 2) {
+            diag("branch: all 4 directions refused at " + mob.blockPosition() + " (rotation " + branchBoxed + ")");
             t.dirData = d.getClockWise().get2DDataValue();
             return;
         }
