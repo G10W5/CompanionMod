@@ -94,6 +94,14 @@ public final class CompanionPlanner {
             case "wait" -> { }
             case "seek_block" -> {
                 String id = CompanionEntity.normalizeBlockId(current.arg());
+                // A small model answers "get wood" with a concrete tree block most of the time; a LEAVES
+                // target under a wood/log/timber goal is the "he collects leaves, not logs" bug: the goal
+                // text wins ('get 20 wood' -> the whole log family, never leaves).
+                if ((id.endsWith("_leaves") || id.equals("leaves")) && mentionsWood(goal)) {
+                    id = "log";
+                } else if (id.isBlank() && mentionsWood(goal)) {
+                    id = "log";
+                }
                 if (id.isBlank()) endTick = tick; else host.planCommand(CompanionCommand.SEEK_BLOCK, id);
             }
             case "pickup" -> host.planCommand(CompanionCommand.PICKUP, current.arg());
@@ -111,5 +119,14 @@ public final class CompanionPlanner {
             case "attack" -> tick >= endTick || (dt > 60 && !host.planFighting());
             default -> tick >= endTick;
         };
+    }
+
+    /** Whole-word wood words in the plan's goal text ("get 20 wood", "chop some logs", "collect timber"). */
+    private static boolean mentionsWood(String goal) {
+        String g = goal == null ? "" : goal.toLowerCase(java.util.Locale.ROOT);
+        for (String w : new String[]{"wood", "log", "timber", "lumber", "tree", "trunk"}) {
+            if (java.util.regex.Pattern.compile("(?<![a-z])" + java.util.regex.Pattern.quote(w) + "(?![a-z])").matcher(g).find()) return true;
+        }
+        return false;
     }
 }

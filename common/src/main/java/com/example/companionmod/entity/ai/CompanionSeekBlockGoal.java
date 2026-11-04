@@ -83,6 +83,8 @@ public class CompanionSeekBlockGoal extends Goal {
     private long lastDiagLog;
     private int lastTaskSerial;      // MineTask.serial at the last tick: a new order drops stale state same-tick
     private Vec3 lastHeartbeatPos = new Vec3(0, -10000, 0);   // movement-gated progress heartbeat
+    private Vec3 standLast = new Vec3(0, -10000, 0);   // tunnel-step stall detector (see WALK_STAND)
+    private int standStall;
     private boolean selected;        // goal selector has us running (see selected())
     private int lastDescendY = Integer.MIN_VALUE;   // DESCEND: only trust slope-walks while height is actually lost
     private long lastDescendDrop;
@@ -874,30 +876,27 @@ public class CompanionSeekBlockGoal extends Goal {
             return;
         }
         if (walkMode == WALK_STAND) {
-            // Tunnel steps: HOP the 1-block step first, and only teleport when the stand cell is right
-            // next to us (a step-up or tight corner the pathfinder cannot model). The old ladder
-            // teleported whenever a path finished in >5 ticks - even across open ground - which was the
-            // "tp block by block" trench behaviour. A far-away stand cell now fails the walk instead of teleporting.
+            // Tunnel steps: NATURAL movement only. The step cell is the adjacent one WE just cleared, so the
+            // block-by-block teleport ladder is removed: the pathfinder walks the cell like a player, the body
+            // HOPS onto a step-up it stalls against, and if it still cannot get in the walk FAILS (planning
+            // re-clears the step or turns the tunnel) instead of teleporting.
             double sdx = w.getX() + 0.5 - mob.getX(), sdz = w.getZ() + 0.5 - mob.getZ();
             double sdy = w.getY() - mob.getY();
-            boolean adjacent = Math.abs(sdx) <= 2.2 && Math.abs(sdz) <= 2.2;
-            if (adjacent && sdy > 0.3 && sdy <= 1.6 && mob.onGround() && walkTicks % 15 == 5) {
-                diag("stand: ledge hop to " + w);
+            boolean adjacent = Math.abs(sdx) <= 1.6 && Math.abs(sdz) <= 1.6;
+            if (mob.position().distanceToSqr(standLast) > 0.01) standStall = 0; else standStall++;
+            standLast = mob.position();
+            if (adjacent && standStall > 8 && sdy > 0.3 && sdy <= 1.6 && mob.onGround()) {
+                standStall = 0;                                     // one hop per stall, never a hop-spam ladder
+                diag("stand: hop onto step " + w);
+                mob.getLookControl().setLookAt(w.getX() + 0.5, w.getY() + 1.0, w.getZ() + 0.5);
                 mob.getJumpControl().jump();
             }
-            boolean canTp = adjacent && Math.abs(sdx) <= 3.5 && Math.abs(sdz) <= 3.5;
-            if (canTp && (walkTicks > 80 || (walkTicks > 10 && nav.isDone()))) {
-                diag("stand: teleport " + mob.blockPosition() + " -> " + w);
-                mob.setPos(w.getX() + 0.5, w.getY(), w.getZ() + 0.5);
-                mob.resetFallDistance();
-                nav.stop();
-                lastProgress = now;
-                nextScanAt = 0;
-                walkTo = null;
-                return;
+            if (walkTicks % 20 == 0) nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.15);
+            if (walkTicks > 240) {
+                failWalk();
+                stuck++;
+                if (stuck >= 4) { mob.mineTask().pause(); say(level, "I can't get through here. Move me and say 'continue'.", true); }
             }
-            if (!canTp && walkTicks > 160) { failWalk(); return; }   // far and unreachable: give up, never teleport across a gap
-            if (walkTicks % 20 == 0) nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
             return;
         }
         // Long walks use the pathfinder: re-request the path when it finished early or could not be made (airborne).

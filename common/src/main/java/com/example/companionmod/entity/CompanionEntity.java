@@ -1014,16 +1014,29 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     }
 
     /**
-     * Hostile mobs only smell players by default. Every so often the companion claims any monster that has no
-     * target yet and can see it, so zombies etc. proactively come hunting instead of ignoring it. Their own
-     * retargeting still wins whenever a player (or a fight) is available, and a downed/resting companion is left alone.
+     * Hostile mobs only smell players by default. The companion claims monsters that it can see and that have
+     * no target yet. In GUARD mode it also STEALS monsters that already picked the owner when it stands closer
+     * than the owner - "guarding" must mean the guard takes the hits, and that is exactly why the old version
+     * (no-target claims only, every 2 s) let every aggro'd zombie walk straight past the companion to the player.
+     * Their own retargeting still wins whenever a fight changes, and a downed/resting companion is left alone.
      */
     private void aggroMonsters() {
         if (isInjured() || isSitting() || stance() == Stance.PASSIVE) return;
         if (!(level() instanceof ServerLevel level)) return;
+        Player owner = getOwner();
+        boolean guard = stance() == Stance.GUARD || stance() == Stance.DEFENSIVE;
         int claimed = 0;
         for (Monster m : level.getEntitiesOfClass(Monster.class, getBoundingBox().inflate(16), e -> e.isAlive())) {
-            if (m.getTarget() != null || !m.getSensing().hasLineOfSight(this)) continue;
+            LivingEntity cur = m.getTarget();
+            boolean claim;
+            if (cur == null) {
+                claim = m.getSensing().hasLineOfSight(this);
+            } else if (guard && owner != null && cur == owner) {
+                claim = distanceToSqr(m) < owner.distanceToSqr(m);
+            } else {
+                claim = false;
+            }
+            if (!claim) continue;
             m.setTarget(this);
             if (++claimed >= 6) break;            // never pull a whole cave onto the companion in one pass
         }
@@ -1273,7 +1286,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             entityData.set(DATA_SPEECH, "");
         }
         if (tickCount % 20 == 0) refreshEquipment();
-        if (tickCount % 40 == 0) aggroMonsters();   // hostile mobs should see the companion as a target
+        if (tickCount % 20 == 0) aggroMonsters();   // hostile mobs should see the companion as a target
         // Drop an automatic target we cannot reach (so mining etc. resumes); player-forced targets persist.
         LivingEntity tgt = getTarget();
         if (tgt != null && tgt != forcedTarget && tgt.isAlive() && tickCount - targetSinceTick > 200

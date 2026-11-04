@@ -301,6 +301,14 @@ public final class ClientVoice {
             // "dig up to the surface" must never become a blind mining order: the model loves to invent an ore
             // target for it. Surface request with no material named -> the real SURFACE order (staircase up).
             if (command == CompanionCommand.SEEK_BLOCK && surfaceRequest(r.heard())) command = CompanionCommand.SURFACE;
+            // "Get wood" used to arrive with the model's oak_leaves choice: what the player actually NAMED in
+            // the sentence wins over the model's concrete block pick, so a family word stays a family order
+            // ("wood" -> any log) and "find me zanite ore" keeps the real id.
+            if (command == CompanionCommand.SEEK_BLOCK) {
+                String named = heardMaterial(r.heard());
+                if (named == null || named.isBlank()) named = heardBlockId(r.heard());
+                if (named != null && !named.isBlank()) target = named;
+            }
             LOG.info("[companionmod] voice decision: cmd={} target='{}'", command, target);
             if (!r.memory().isBlank()) CompanionMemory.remember(r.memory());
             if (command == CompanionCommand.REMEMBER)
@@ -4920,6 +4928,8 @@ public class CompanionSeekBlockGoal extends Goal {
     private long lastDiagLog;
     private int lastTaskSerial;      // MineTask.serial at the last tick: a new order drops stale state same-tick
     private Vec3 lastHeartbeatPos = new Vec3(0, -10000, 0);   // movement-gated progress heartbeat
+    private Vec3 standLast = new Vec3(0, -10000, 0);   // tunnel-step stall detector (see WALK_STAND)
+    private int standStall;
     private boolean selected;        // goal selector has us running (see selected())
     private int lastDescendY = Integer.MIN_VALUE;   // DESCEND: only trust slope-walks while height is actually lost
     private long lastDescendDrop;
@@ -5711,30 +5721,27 @@ public class CompanionSeekBlockGoal extends Goal {
             return;
         }
         if (walkMode == WALK_STAND) {
-            // Tunnel steps: HOP the 1-block step first, and only teleport when the stand cell is right
-            // next to us (a step-up or tight corner the pathfinder cannot model). The old ladder
-            // teleported whenever a path finished in >5 ticks - even across open ground - which was the
-            // "tp block by block" trench behaviour. A far-away stand cell now fails the walk instead of teleporting.
+            // Tunnel steps: NATURAL movement only. The step cell is the adjacent one WE just cleared, so the
+            // block-by-block teleport ladder is removed: the pathfinder walks the cell like a player, the body
+            // HOPS onto a step-up it stalls against, and if it still cannot get in the walk FAILS (planning
+            // re-clears the step or turns the tunnel) instead of teleporting.
             double sdx = w.getX() + 0.5 - mob.getX(), sdz = w.getZ() + 0.5 - mob.getZ();
             double sdy = w.getY() - mob.getY();
-            boolean adjacent = Math.abs(sdx) <= 2.2 && Math.abs(sdz) <= 2.2;
-            if (adjacent && sdy > 0.3 && sdy <= 1.6 && mob.onGround() && walkTicks % 15 == 5) {
-                diag("stand: ledge hop to " + w);
+            boolean adjacent = Math.abs(sdx) <= 1.6 && Math.abs(sdz) <= 1.6;
+            if (mob.position().distanceToSqr(standLast) > 0.01) standStall = 0; else standStall++;
+            standLast = mob.position();
+            if (adjacent && standStall > 8 && sdy > 0.3 && sdy <= 1.6 && mob.onGround()) {
+                standStall = 0;                                     // one hop per stall, never a hop-spam ladder
+                diag("stand: hop onto step " + w);
+                mob.getLookControl().setLookAt(w.getX() + 0.5, w.getY() + 1.0, w.getZ() + 0.5);
                 mob.getJumpControl().jump();
             }
-            boolean canTp = adjacent && Math.abs(sdx) <= 3.5 && Math.abs(sdz) <= 3.5;
-            if (canTp && (walkTicks > 80 || (walkTicks > 10 && nav.isDone()))) {
-                diag("stand: teleport " + mob.blockPosition() + " -> " + w);
-                mob.setPos(w.getX() + 0.5, w.getY(), w.getZ() + 0.5);
-                mob.resetFallDistance();
-                nav.stop();
-                lastProgress = now;
-                nextScanAt = 0;
-                walkTo = null;
-                return;
+            if (walkTicks % 20 == 0) nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.15);
+            if (walkTicks > 240) {
+                failWalk();
+                stuck++;
+                if (stuck >= 4) { mob.mineTask().pause(); say(level, "I can't get through here. Move me and say 'continue'.", true); }
             }
-            if (!canTp && walkTicks > 160) { failWalk(); return; }   // far and unreachable: give up, never teleport across a gap
-            if (walkTicks % 20 == 0) nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
             return;
         }
         // Long walks use the pathfinder: re-request the path when it finished early or could not be made (airborne).
@@ -7046,16 +7053,29 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     }
 
     /**
-     * Hostile mobs only smell players by default. Every so often the companion claims any monster that has no
-     * target yet and can see it, so zombies etc. proactively come hunting instead of ignoring it. Their own
-     * retargeting still wins whenever a player (or a fight) is available, and a downed/resting companion is left alone.
+     * Hostile mobs only smell players by default. The companion claims monsters that it can see and that have
+     * no target yet. In GUARD mode it also STEALS monsters that already picked the owner when it stands closer
+     * than the owner - "guarding" must mean the guard takes the hits, and that is exactly why the old version
+     * (no-target claims only, every 2 s) let every aggro'd zombie walk straight past the companion to the player.
+     * Their own retargeting still wins whenever a fight changes, and a downed/resting companion is left alone.
      */
     private void aggroMonsters() {
         if (isInjured() || isSitting() || stance() == Stance.PASSIVE) return;
         if (!(level() instanceof ServerLevel level)) return;
+        Player owner = getOwner();
+        boolean guard = stance() == Stance.GUARD || stance() == Stance.DEFENSIVE;
         int claimed = 0;
         for (Monster m : level.getEntitiesOfClass(Monster.class, getBoundingBox().inflate(16), e -> e.isAlive())) {
-            if (m.getTarget() != null || !m.getSensing().hasLineOfSight(this)) continue;
+            LivingEntity cur = m.getTarget();
+            boolean claim;
+            if (cur == null) {
+                claim = m.getSensing().hasLineOfSight(this);
+            } else if (guard && owner != null && cur == owner) {
+                claim = distanceToSqr(m) < owner.distanceToSqr(m);
+            } else {
+                claim = false;
+            }
+            if (!claim) continue;
             m.setTarget(this);
             if (++claimed >= 6) break;            // never pull a whole cave onto the companion in one pass
         }
@@ -7305,7 +7325,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             entityData.set(DATA_SPEECH, "");
         }
         if (tickCount % 20 == 0) refreshEquipment();
-        if (tickCount % 40 == 0) aggroMonsters();   // hostile mobs should see the companion as a target
+        if (tickCount % 20 == 0) aggroMonsters();   // hostile mobs should see the companion as a target
         // Drop an automatic target we cannot reach (so mining etc. resumes); player-forced targets persist.
         LivingEntity tgt = getTarget();
         if (tgt != null && tgt != forcedTarget && tgt.isAlive() && tickCount - targetSinceTick > 200
@@ -7696,6 +7716,14 @@ public final class CompanionPlanner {
             case "wait" -> { }
             case "seek_block" -> {
                 String id = CompanionEntity.normalizeBlockId(current.arg());
+                // A small model answers "get wood" with a concrete tree block most of the time; a LEAVES
+                // target under a wood/log/timber goal is the "he collects leaves, not logs" bug: the goal
+                // text wins ('get 20 wood' -> the whole log family, never leaves).
+                if ((id.endsWith("_leaves") || id.equals("leaves")) && mentionsWood(goal)) {
+                    id = "log";
+                } else if (id.isBlank() && mentionsWood(goal)) {
+                    id = "log";
+                }
                 if (id.isBlank()) endTick = tick; else host.planCommand(CompanionCommand.SEEK_BLOCK, id);
             }
             case "pickup" -> host.planCommand(CompanionCommand.PICKUP, current.arg());
@@ -7713,6 +7741,15 @@ public final class CompanionPlanner {
             case "attack" -> tick >= endTick || (dt > 60 && !host.planFighting());
             default -> tick >= endTick;
         };
+    }
+
+    /** Whole-word wood words in the plan's goal text ("get 20 wood", "chop some logs", "collect timber"). */
+    private static boolean mentionsWood(String goal) {
+        String g = goal == null ? "" : goal.toLowerCase(java.util.Locale.ROOT);
+        for (String w : new String[]{"wood", "log", "timber", "lumber", "tree", "trunk"}) {
+            if (java.util.regex.Pattern.compile("(?<![a-z])" + java.util.regex.Pattern.quote(w) + "(?![a-z])").matcher(g).find()) return true;
+        }
+        return false;
     }
 }
 ```

@@ -227,6 +227,14 @@ public final class ClientVoice {
             // "dig up to the surface" must never become a blind mining order: the model loves to invent an ore
             // target for it. Surface request with no material named -> the real SURFACE order (staircase up).
             if (command == CompanionCommand.SEEK_BLOCK && surfaceRequest(r.heard())) command = CompanionCommand.SURFACE;
+            // "Get wood" used to arrive with the model's oak_leaves choice: what the player actually NAMED in
+            // the sentence wins over the model's concrete block pick, so a family word stays a family order
+            // ("wood" -> any log) and "find me zanite ore" keeps the real id.
+            if (command == CompanionCommand.SEEK_BLOCK) {
+                String named = heardMaterial(r.heard());
+                if (named == null || named.isBlank()) named = heardBlockId(r.heard());
+                if (named != null && !named.isBlank()) target = named;
+            }
             LOG.info("[companionmod] voice decision: cmd={} target='{}'", command, target);
             if (!r.memory().isBlank()) CompanionMemory.remember(r.memory());
             if (command == CompanionCommand.REMEMBER)
