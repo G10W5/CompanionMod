@@ -5118,7 +5118,10 @@ public class CompanionSeekBlockGoal extends Goal {
                     // Slope-walks are only trusted while they actually lose height. A path that walks
                     // without descending used to refresh the progress heartbeat forever - the old
                     // "stuck on planning and walking" loop. After 5 s without losing height: dig stairs.
-                    if (now - lastDescendDrop < 100 && walkDownSlope(level)) {
+                    // Slope-walks only get 2 s of actual height loss to prove themselves - else dig the
+                    // stairs. The old 5 s window made every level ~8 s (5 s of futile slope wandering +
+                    // digging) = "descends one Y per ~8 s" in latest.log.
+                    if (now - lastDescendDrop < 40 && walkDownSlope(level)) {
                         diag("descending by walking (y=" + y + " -> ty=" + t.ty + ")");
                     } else if (!planStep(level, t, Direction.from2DDataValue(t.dirData), -1, true)) {
                         diag("cannot dig down at y=" + y + " dir=" + t.dirData + " stuck=" + stuck);
@@ -5610,10 +5613,17 @@ public class CompanionSeekBlockGoal extends Goal {
         BlockPos me = mob.blockPosition();
         for (Direction d : order) {
             BlockPos stand = me.relative(d).above(dyStep);
-            List<BlockPos> cells = new ArrayList<>(3);
+            List<BlockPos> cells = new ArrayList<>(5);
             cells.add(stand);
             cells.add(stand.above());
             if (dyStep < 0) cells.add(stand.above(2));                  // headroom to walk in before dropping
+            if (dyStep > 0) {
+                // Stairing UP needs headroom above our OWN head first: the head rises through me.above(2)
+                // and me.above(3) while jumping into the higher cell. Without these the jump thudded into
+                // the rock right overhead ("tries to jump but there's a block above him").
+                cells.add(me.above(2));
+                cells.add(me.above(3));
+            }
             boolean bridge = dyStep == 0 && t.deep() && bridgeRun < 12 && hasScaffoldBlock(t)
                     && level.getBlockState(stand.below()).isAir();      // gap in the floor while mining: bridge it
             if (!safe(level, stand, cells, bridge)) continue;
