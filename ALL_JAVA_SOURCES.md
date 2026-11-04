@@ -5176,7 +5176,12 @@ public class CompanionSeekBlockGoal extends Goal {
             t.dirData = d.getClockWise().get2DDataValue();
             return;
         }
-        if (planStep(level, t, d, 0, false)) { t.legLen++; branchBoxed = 0; return; }
+        if (planStep(level, t, d, 0, false)) {
+            t.legLen++;
+            branchBoxed = 0;
+            if (t.legLen % 3 == 0) probeSides(level, t, d);   // strip-mine probes: peek left/right every 3rd block
+            return;
+        }
         // Blocked ahead (lava pocket, bedrock bump): mine at a slight angle or step over it before ending the leg.
         // Without this one blocked cell ended the leg instantly, all 8 legs burned in seconds and the task paused.
         if (planStep(level, t, d.getClockWise(), 0, false)
@@ -5207,6 +5212,27 @@ public class CompanionSeekBlockGoal extends Goal {
         }
         branchBoxed = 0;
         t.legLen = len;                                                 // truly boxed in: end this leg early
+    }
+
+    /**
+     * Strip-mine probes: called every 3rd block of a tunnel leg. Peek through the tunnel walls (both sides,
+     * 2 deep, body and head level): a matching block hiding behind stone is added to the vein deque, and
+     * approach()/firstBlocker then digs the wall stone out to reach it - like a player peeking into the wall.
+     */
+    private void probeSides(ServerLevel level, MineTask t, Direction d) {
+        BlockPos me = mob.blockPosition();
+        for (Direction side : new Direction[]{ d.getClockWise(), d.getCounterClockWise() }) {
+            for (int depth = 1; depth <= 2; depth++) {
+                for (int h = 0; h <= 1; h++) {
+                    BlockPos c = me.relative(side, depth).above(h);
+                    if (vein.size() >= 24) return;
+                    if (!vein.contains(c) && matches(t, level.getBlockState(c))) {
+                        vein.add(c);
+                        diag("probe: " + t.blockId + " spotted " + depth + " behind the " + side + " wall at " + c);
+                    }
+                }
+            }
+        }
     }
 
     /** Surface search: first look far with the heightmap (trees show up as log columns), else explore somewhere new. */
@@ -5725,6 +5751,16 @@ public class CompanionSeekBlockGoal extends Goal {
         for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) for (int dz = -1; dz <= 1; dz++) {
             BlockPos n = pos.offset(dx, dy, dz);
             if (vein.size() < 24 && !vein.contains(n) && matches(t, level.getBlockState(n))) vein.add(n);
+        }
+        // Peek BEHIND the block just mined along all 6 axes: an ore 2 further along the axis ("see through the
+        // wall I broke") joins the vein; approach()/firstBlocker then digs the stone between us and it.
+        // Straight diagonals are already covered by the 3x3x3 growth above.
+        for (Direction axis : Direction.values()) {
+            BlockPos behind = pos.relative(axis, 2);
+            if (vein.size() < 24 && !vein.contains(behind) && matches(t, level.getBlockState(behind))) {
+                vein.add(behind);
+                diag("peek: " + t.blockId + " seen through the mined block, 2 further " + axis);
+            }
         }
         mob.noteMiningProgress();                 // keeps an AI plan step alive; progress is shown in the radial menu, not spoken
         // finishing (and climbing back down) is handled in decide()
