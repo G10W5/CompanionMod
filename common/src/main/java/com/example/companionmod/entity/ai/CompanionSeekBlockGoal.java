@@ -454,6 +454,15 @@ public class CompanionSeekBlockGoal extends Goal {
     // ------------------------------------------------------------------ approaching and tunnelling
 
     private void approach(ServerLevel level, MineTask t, BlockPos target) {
+        // Hard escape for the retarget stand-loop: targets that could not be walked to, scaffolded or
+        // tunnelled toward kept the goal cycling ("gave up after 16 tries", minutes of standing) because
+        // nothing marked them done. After 12 attempts we give up and let scan() pick the next target.
+        Integer triesN = approachTries.get(target.immutable());
+        if (triesN != null && triesN >= 12) {
+            diag("approach exhausted after " + triesN + " tries on " + target + ", giving up");
+            giveUp(target);
+            return;
+        }
         approachTarget = target;
         if (inReach(Vec3.atCenterOf(target))) {
             if (lineClear(level, target)) { startBreak(level, target); return; }

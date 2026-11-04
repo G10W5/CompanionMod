@@ -94,13 +94,20 @@ public final class CompanionPlanner {
             case "wait" -> { }
             case "seek_block" -> {
                 String id = CompanionEntity.normalizeBlockId(current.arg());
-                // A small model answers "get wood" with a concrete tree block most of the time; a LEAVES
-                // target under a wood/log/timber goal is the "he collects leaves, not logs" bug: the goal
-                // text wins ('get 20 wood' -> the whole log family, never leaves).
-                if ((id.endsWith("_leaves") || id.equals("leaves")) && mentionsWood(goal)) {
+                // What the PLAYER NAMED in the goal text always wins over the model's block pick:
+                // "get copper ore" is copper (never the model's coal), "get wood" is the log family
+                // (never oak_leaves or oak_sapling).
+                String fromGoal = goalMaterial(goal);
+                if (!fromGoal.isBlank()) {
+                    id = fromGoal;
+                } else if ((id.endsWith("_leaves") || id.equals("leaves")) && mentionsWood(goal)) {
                     id = "log";
                 } else if (id.isBlank() && mentionsWood(goal)) {
                     id = "log";
+                } else if (id.isBlank() && asksDigDown(goal)) {
+                    // "dig down" names no material: a deep mine job is the only honest reading,
+                    // so branch-mine the diamond level (targetY does the descent), not a random model pick.
+                    id = "diamond_ore";
                 }
                 if (id.isBlank()) endTick = tick; else host.planCommand(CompanionCommand.SEEK_BLOCK, id);
             }
@@ -126,6 +133,30 @@ public final class CompanionPlanner {
         String g = goal == null ? "" : goal.toLowerCase(java.util.Locale.ROOT);
         for (String w : new String[]{"wood", "log", "timber", "lumber", "tree", "trunk"}) {
             if (java.util.regex.Pattern.compile("(?<![a-z])" + java.util.regex.Pattern.quote(w) + "(?![a-z])").matcher(g).find()) return true;
+        }
+        return false;
+    }
+
+    /** The first block/family word the GOAL TEXT itself names ("get copper ore" -> copper_ore). "" when none. */
+    private static String goalMaterial(String goal) {
+        if (goal == null || goal.isBlank()) return "";
+        for (String tok : goal.toLowerCase(java.util.Locale.ROOT).replaceAll("[^a-z0-9 ]+", " ").split(" ")) {
+            if (tok.isBlank()) continue;
+            String id = CompanionEntity.normalizeBlockId(tok);
+            if (!id.isBlank()) return id;
+        }
+        return "";
+    }
+
+    /** Whole-word "dig down / dig deeper / go down" phrasing: the player wants depth, no material named. */
+    private static boolean asksDigDown(String goal) {
+        String g = goal == null ? "" : goal.toLowerCase(java.util.Locale.ROOT);
+        return words(g, "dig down", "dig deeper", "mine down", "go down", "dig a hole");
+    }
+
+    private static boolean words(String g, String... phrases) {
+        for (String p : phrases) {
+            if (java.util.regex.Pattern.compile("(?<![a-z])" + java.util.regex.Pattern.quote(p) + "(?![a-z])").matcher(g).find()) return true;
         }
         return false;
     }
