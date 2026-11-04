@@ -5818,6 +5818,13 @@ public class CompanionSeekBlockGoal extends Goal {
         return s.getCollisionShape(level, p).isEmpty() && s.getFluidState().isEmpty();
     }
 
+    /** Short block id for diagnostics ("minecraft:stone" -> "stone"). */
+    private static String lvlName(Block b) {
+        String s = b.toString();
+        int i = s.indexOf(':');
+        return i < 0 ? s : s.substring(i + 1);
+    }
+
     // ------------------------------------------------------------------ breaking and walking
 
     private void startBreak(ServerLevel level, BlockPos pos) {
@@ -5946,7 +5953,21 @@ public class CompanionSeekBlockGoal extends Goal {
             if (mob.position().distanceToSqr(standLast) > 0.01) standStall = 0; else standStall++;
             standLast = mob.position();
             if (adjacent && standStall > 5) {
-                if (standStall == 6) diag("stand: pathfinder refuses the step, direct walk onto " + w);
+                if (standStall == 6) {
+                    double hx = sdx, hz = sdz;
+                    BlockPos meP = mob.blockPosition();
+                    var p = mob.getNavigation().createPath(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 0);
+                    diag("stand: pathfinder refuses the step, direct walk onto " + w
+                            + String.format(" | mob=(%.2f,%.2f,%.2f) hDist=%.2f sdy=%.2f onGround=%s path=%s navDone=%s mode=%s ownerD=%.1f",
+                                    mob.getX(), mob.getY(), mob.getZ(), Math.hypot(hx, hz), sdy, mob.onGround(),
+                                    p == null ? "null" : "reach=" + p.canReach(), mob.getNavigation().isDone(),
+                                    mob.moveMode(), mob.getOwner() == null ? -1 : Math.sqrt(mob.distanceToSqr(mob.getOwner())))
+                            + " | target floor=" + lvlName(level.getBlockState(w.below()).getBlock())
+                            + " cell=" + passable(level, w) + " head=" + passable(level, w.above())
+                            + " | me floor=" + lvlName(level.getBlockState(meP.below()).getBlock())
+                            + " cell=" + passable(level, meP) + " head=" + passable(level, meP.above())
+                            + "/" + passable(level, meP.above(2)) + "/" + passable(level, meP.above(3)));
+                }
                 double wcx = w.getX() + 0.5, wcz = w.getZ() + 0.5;
                 double hDist = Math.sqrt(sdx * sdx + sdz * sdz);
                 // Step-DOWN stall: the target cell is essentially beneath us and the wanted position equals
@@ -5970,6 +5991,10 @@ public class CompanionSeekBlockGoal extends Goal {
                     mob.getJumpControl().jump();
                 }
                 mob.getMoveControl().setWantedPosition(wcx, w.getY(), wcz, 1.15);
+                // Re-issue the real path while pushing: blocks clear DURING a stall (trays, falling covers),
+                // but the old code only re-pathed when standStall <= 5, so a refused path was never retried
+                // until a full give-up cycle.
+                if (walkTicks % 20 == 0) nav.moveTo(wcx, w.getY(), wcz, 1.15);
                 if (standStall > 60) {
                     diag("stand: giving up the step onto " + w + " after " + standStall + " stall ticks");
                     failWalk();
