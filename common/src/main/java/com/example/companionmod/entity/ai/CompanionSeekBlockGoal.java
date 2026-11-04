@@ -11,6 +11,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.ai.goal.Goal;
 import net.minecraft.world.entity.ai.navigation.PathNavigation;
 import net.minecraft.world.item.BlockItem;
@@ -85,6 +86,7 @@ public class CompanionSeekBlockGoal extends Goal {
     private Vec3 lastHeartbeatPos = new Vec3(0, -10000, 0);   // movement-gated progress heartbeat
     private Vec3 standLast = new Vec3(0, -10000, 0);   // tunnel-step stall detector (see WALK_STAND)
     private int standStall;
+    private double bestH = Double.MAX_VALUE;           // best horizontal distance reached toward the current step cell
     private boolean selected;        // goal selector has us running (see selected())
     private int lastDescendY = Integer.MIN_VALUE;   // DESCEND: only trust slope-walks while height is actually lost
     private long lastDescendDrop;
@@ -93,6 +95,8 @@ public class CompanionSeekBlockGoal extends Goal {
     private Vec3 watchPos;
     private boolean taskWasPaused;                  // pause->'continue' detection: pay for one staircase-reuse walk
     private boolean descendResume;                  // next DESCEND decide tries walking down the EXISTING staircase first
+    private String waitingFor;                      // non-null: an entity physically stands in our 1-block walk corridor
+    private long lastWaitLog;
     private String lastDiag = "";    // change-gated diagnostic lines (one per real state change, never per frame)
 
     public CompanionSeekBlockGoal(CompanionEntity mob) {
@@ -218,13 +222,21 @@ public class CompanionSeekBlockGoal extends Goal {
             if (watchAt != 0 && !t.paused && t.mined == watchMined
                     && mob.position().distanceToSqr(watchPos) < 4.0) {
                 watchAt = now;                          // re-arm BEFORE pausing: 'continue' starts a fresh sample
-                t.pause();
-                say(level, "I'm stuck, something's blocking me. Say 'continue' when I'm free.", true);
-                cancelBreak(level);
-                pending.clear();
-                stepStand = walkTo = oreTarget = null;
-                mob.getNavigation().stop();
-                return;
+                if (waitingFor != null) {
+                    // Waiting for someone to step out of the tunnel is NOT 'stuck': keep the task alive and
+                    // say who is blocking - the moment they move, the walk resumes on its own.
+                    say(level, "I'm waiting for " + waitingFor + " to get out of the way.", false);
+                    watchMined = t.mined;
+                    watchPos = mob.position();
+                } else {
+                    t.pause();
+                    say(level, "I'm stuck, something's blocking me. Say 'continue' when I'm free.", true);
+                    cancelBreak(level);
+                    pending.clear();
+                    stepStand = walkTo = oreTarget = null;
+                    mob.getNavigation().stop();
+                    return;
+                }
             }
             watchAt = now;
             watchMined = t.mined;
@@ -969,6 +981,22 @@ public class CompanionSeekBlockGoal extends Goal {
         return i < 0 ? s : s.substring(i + 1);
     }
 
+    /**
+     * First living entity standing in the straight corridor between us and the walk target (the owner
+     * watching from inside the tunnel, another mob). Pathfinding IGNORES entities - it reports
+     * reach=true - but a direct move-control push physically cannot pass them: this is the classic
+     * "hDist 0.98 -> 0.86 oscillation while nothing blocks me" freeze, with the blocker sitting right
+     * at the far lip of the target cell. {@code null} = corridor is clear.
+     */
+    private String corridorBlocker(ServerLevel level, BlockPos w) {
+        double dx = w.getX() + 0.5 - mob.getX(), dz = w.getZ() + 0.5 - mob.getZ();
+        var box = mob.getBoundingBox().expandTowards(dx, 0, dz).inflate(0.2);
+        for (LivingEntity e : level.getEntitiesOfClass(LivingEntity.class, box, o -> o != mob && o.getBbWidth() > 0.35)) {
+            return e.getName().getString();
+        }
+        return null;
+    }
+
     // ------------------------------------------------------------------ breaking and walking
 
     private void startBreak(ServerLevel level, BlockPos pos) {
@@ -1041,7 +1069,7 @@ public class CompanionSeekBlockGoal extends Goal {
 
     private void walk(ServerLevel level, long now) {
         walkTicks++;
-        if (walkTicks == 1) walkRetries = 0;
+        if (walkTicks == 1) { walkRetries = 0; waitingFor = null; }   // new corridor: the blocker decision starts fresh
         // Progress heartbeat, but only for REAL movement: a mob pushing a wall in place (jam) must not keep
         // refreshing the idle timers, or the watchdogs can never fire and a step-loop stalls silently forever.
         if (walkTicks % 40 == 0 && mob.position().distanceToSqr(lastHeartbeatPos) > 0.25) {
@@ -1055,7 +1083,11 @@ public class CompanionSeekBlockGoal extends Goal {
             case WALK_FREE, WALK_EXPLORE -> mob.distanceToSqr(Vec3.atCenterOf(w)) < 4.0;
             // Must be standing IN the cell: the old 1.2 vertical tolerance let a mob pushing the wall BELOW a
             // 1-block step-up count as "arrived" (dy=1.0) without ever mounting it -> infinite plan-walk loop.
-            default -> Math.abs(mob.getX() - (w.getX() + 0.5)) < 0.7 && Math.abs(mob.getZ() - (w.getZ() + 0.5)) < 0.7
+            // The old 0.7 horizontal tolerance was just as lethal: from the center of the PREVIOUS cell
+            // (dx=0.7 at the border) the walk cleared early, planStep re-planned the SAME target and legLen
+            // grew while the mob never actually crossed - frozen 'destroying and not moving' with tray spam
+            // at one cell (log 19:41:03-04, mob=(1861.6-1861.7) vs target x=1862 forever).
+            default -> Math.abs(mob.getX() - (w.getX() + 0.5)) < 0.45 && Math.abs(mob.getZ() - (w.getZ() + 0.5)) < 0.45
                     && Math.abs(mob.getY() - w.getY()) < 0.5;
         };
         if (arrived) { walkTo = null; nextScanAt = 0; lastProgress = now; mob.getNavigation().stop(); return; }
@@ -1094,8 +1126,11 @@ public class CompanionSeekBlockGoal extends Goal {
             double sdx = w.getX() + 0.5 - mob.getX(), sdz = w.getZ() + 0.5 - mob.getZ();
             double sdy = w.getY() - mob.getY();
             boolean adjacent = Math.abs(sdx) <= 1.6 && Math.abs(sdz) <= 1.6;
-            if (mob.position().distanceToSqr(standLast) > 0.01) standStall = 0; else standStall++;
-            standLast = mob.position();
+            // Progress-based stall: the old positional jitter reset accepted 0.01 wiggles as progress, so an
+            // oscillating mob (hDist 0.98 <-> 0.86) never accumulated a stall and never gave up or waited.
+            // Only a new BEST distance toward the target counts as movement; oscillation fills the stall clock.
+            double hNow = Math.hypot(sdx, sdz);
+            if (walkTicks <= 1 || hNow < bestH - 0.02) { bestH = hNow; standStall = 0; } else standStall++;
             if (adjacent && standStall > 5) {
                 if (standStall == 6) {
                     double hx = sdx, hz = sdz;
@@ -1110,7 +1145,8 @@ public class CompanionSeekBlockGoal extends Goal {
                             + " cell=" + passable(level, w) + " head=" + passable(level, w.above())
                             + " | me floor=" + lvlName(level.getBlockState(meP.below()).getBlock())
                             + " cell=" + passable(level, meP) + " head=" + passable(level, meP.above())
-                            + "/" + passable(level, meP.above(2)) + "/" + passable(level, meP.above(3)));
+                            + "/" + passable(level, meP.above(2)) + "/" + passable(level, meP.above(3))
+                            + " | blockedBy=" + String.valueOf(corridorBlocker(level, w)));
                 }
                 double wcx = w.getX() + 0.5, wcz = w.getZ() + 0.5;
                 double hDist = Math.sqrt(sdx * sdx + sdz * sdz);
@@ -1140,16 +1176,35 @@ public class CompanionSeekBlockGoal extends Goal {
                 // until a full give-up cycle.
                 if (walkTicks % 20 == 0) nav.moveTo(wcx, w.getY(), wcz, 1.15);
                 if (standStall > 60) {
-                    diag("stand: giving up the step onto " + w + " after " + standStall + " stall ticks");
-                    failWalk();
+                    // An entity (the owner watching, a mob) standing in the last 0.5 blocks of the corridor
+                    // is the difference between 'hDist 0.98 -> 0.86 oscillation' and walking in - paths
+                    // IGNORE entities (reach=true) but direct pushes cannot pass them. Wait politely instead
+                    // of failing the walk 4x and telling the user to move the companion.
+                    String blocker = corridorBlocker(level, w);
+                    if (blocker == null) {
+                        diag("stand: giving up the step onto " + w + " after " + standStall + " stall ticks");
+                        failWalk();
+                    } else {
+                        waitingFor = blocker;
+                        if (standStall == 100 || standStall % 400 == 0) {
+                            diag("stand: waiting for '" + blocker + "' to move out of the corridor to " + w);
+                        }
+                        // standStall keeps counting (no reset): the throttled waiting log above relies on it,
+                        // and the 30 s outcome watchdog reports the wait to the user in words.
+                    }
                 }
             } else if (nav.isDone() && walkTicks % 10 == 0) {
                 nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.15);   // re-request the clean path twice a second
             }
             if (walkTicks > 240) {
-                failWalk();
-                stuck++;
-                if (stuck >= 4) { mob.mineTask().pause(); say(level, "I can't get through here. Move me and say 'continue'.", true); }
+                if (waitingFor != null) {              // blocked by an entity: waiting is not 'can't get through'
+                    walkTicks = 200;                   // checked again in 2 s instead of failing to the pause
+                    if (now - lastWaitLog >= 400) { lastWaitLog = now; diag("stand: still waiting for '" + waitingFor + "' to move aside"); }
+                } else {
+                    failWalk();
+                    stuck++;
+                    if (stuck >= 4) { mob.mineTask().pause(); say(level, "I can't get through here. Move me and say 'continue'.", true); }
+                }
             }
             return;
         }
