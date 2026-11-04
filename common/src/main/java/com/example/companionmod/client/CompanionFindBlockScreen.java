@@ -30,7 +30,7 @@ public class CompanionFindBlockScreen extends Screen {
     };
 
     private static final int PANEL_W = 300, PAD = 12;
-    private static final int HEAD_H = 44, CONTENT_H = 96, FOOT_H = 56;
+    private static final int HEAD_H = 26, CONTENT_H = 96, FOOT_H = 56;   // HEAD 26: title sits tight above the field (was a 44px void)
 
     private final VoiceConfig config;
     private final Path configFile;
@@ -207,17 +207,19 @@ public class CompanionFindBlockScreen extends Screen {
         }
         g.disableScissor();
 
-        // Visible horizontal scrollbar for the chip row.
-        int max = Math.max(0, chipTotalW() - iw);
+        // Visible horizontal scrollbar: white hover outline, thumb darkens while dragging.
+        int max = chipMax();
         if (max > 0) {
             int ty = chipTop() + 23;
+            boolean hot = mouseX >= ix && mouseX < ix + iw && mouseY >= ty - 2 && mouseY < ty + 6;
+            if (hot || barDrag) g.fill(ix - 1, ty - 1, ix + iw + 1, ty + 5, 0xFFFFFFFF);
             g.fill(ix, ty, ix + iw, ty + 4, 0xFF000000);
-            int tw = Math.max(24, iw * iw / Math.max(1, chipTotalW()));
+            int tw = thumbW();
             int tx = ix + (iw - tw) * chipScroll / max;
-            g.fill(tx + 1, ty, tx + tw - 1, ty + 4, 0xFFB0B0B0);
+            g.fill(tx + 1, ty, tx + tw - 1, ty + 4, barDrag ? 0xFF6C6C6C : 0xFFB0B0B0);
         }
         if (!status.isBlank()) {
-            g.text(this.font, status, cx - this.font.width(status) / 2, py + 126, CompanionUi.TEXT_ERROR, false);
+            g.text(this.font, status, cx - this.font.width(status) / 2, py + HEAD_H + 80, CompanionUi.TEXT_ERROR, false);
         }
     }
 }
