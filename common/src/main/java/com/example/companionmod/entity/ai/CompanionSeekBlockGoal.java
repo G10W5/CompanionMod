@@ -63,7 +63,7 @@ public class CompanionSeekBlockGoal extends Goal {
     private long lastProgress, lastSpeak;
 
     // --- surface search: time-based rescans, long-range heightmap "sight", exploration memory
-    private long nextScanAt, nextSightAt, nextExploreAt, lastUnreachableClear;
+    private long nextScanAt, nextSightAt, nextExploreAt, nextProbeAt, lastUnreachableClear;
     private final Deque<BlockPos> explored = new ArrayDeque<>();   // where we already looked (explore memory)
 
     // cache: does Block X match the current task? (replaces a registry lookup + string compare per scanned block)
@@ -91,6 +91,8 @@ public class CompanionSeekBlockGoal extends Goal {
     private int watchMined;                         // no-silent-stall watchdog sample (30 s outcome window)
     private long watchAt;
     private Vec3 watchPos;
+    private boolean taskWasPaused;                  // pause->'continue' detection: pay for one staircase-reuse walk
+    private boolean descendResume;                  // next DESCEND decide tries walking down the EXISTING staircase first
     private String lastDiag = "";    // change-gated diagnostic lines (one per real state change, never per frame)
 
     public CompanionSeekBlockGoal(CompanionEntity mob) {
@@ -159,6 +161,17 @@ public class CompanionSeekBlockGoal extends Goal {
             lastTaskSerial = t.serial;
             resetTransient();
         }
+        // Ambient peek-through-walls: the probe mechanic works during ANY phase of the task - search,
+        // descend, approach, branch - every 2 s from wherever we stand (was: only every 3rd branch block).
+        if (!t.paused && now >= nextProbeAt) {
+            nextProbeAt = now + 40;
+            probeAround(level, t);
+        }
+        // RESUME detection ('continue' after a pause): the next DESCEND decide must first try the existing
+        // staircase, because the height-drop trust window has long expired and the goal used to dig a
+        // brand-new staircase right beside the old one (lastDescendDrop is minutes stale after a pause).
+        if (t.paused) taskWasPaused = true;
+        else if (taskWasPaused) { taskWasPaused = false; descendResume = true; }
 
         long idle = now - lastProgress;
         if (idle > 200 && now - lastDiagLog > 200) {      // diagnostics FIRST: the watchdog branches below return early
@@ -302,7 +315,12 @@ public class CompanionSeekBlockGoal extends Goal {
                     // Slope-walks only get 2 s of actual height loss to prove themselves - else dig the
                     // stairs. The old 5 s window made every level ~8 s (5 s of futile slope wandering +
                     // digging) = "descends one Y per ~8 s" in latest.log.
-                    if (now - lastDescendDrop < 40 && walkDownSlope(level)) {
+                    // RESUME ('continue'): lastDescendDrop is minutes stale, so the trust window alone
+                    // never fired and the goal re-dug a brand-new staircase beside the old one. A resume
+                    // gets ONE free slope/staircase-reuse walk attempt, then normal descent rules apply.
+                    boolean trySlope = (now - lastDescendDrop < 40) || descendResume;
+                    descendResume = false;
+                    if (trySlope && walkDownSlope(level)) {
                         diag("descending by walking (y=" + y + " -> ty=" + t.ty + ")");
                     } else if (!planStep(level, t, Direction.from2DDataValue(t.dirData), -1, true)) {
                         diag("cannot dig down at y=" + y + " dir=" + t.dirData + " stuck=" + stuck);
@@ -401,8 +419,22 @@ public class CompanionSeekBlockGoal extends Goal {
      * approach()/firstBlocker then digs the wall stone out to reach it - like a player peeking into the wall.
      */
     private void probeSides(ServerLevel level, MineTask t, Direction d) {
+        probe(level, t, java.util.List.of(d.getClockWise(), d.getCounterClockWise()));
+    }
+
+    /**
+     * Ambient probes: same peek-through-walls as the tunnel probes, but in ALL 4 horizontal directions and
+     * running the whole time the seek task is active (every 2 s), not just while branch mining - the user
+     * asked for the peek mechanic to always work during any task. Cargo-culted from probeSides: hidden ore
+     * found near wherever we happen to stand joins the vein deque, approach()/firstBlocker digs through.
+     */
+    private void probeAround(ServerLevel level, MineTask t) {
+        probe(level, t, Direction.Plane.HORIZONTAL);
+    }
+
+    private void probe(ServerLevel level, MineTask t, Iterable<Direction> dirs) {
         BlockPos me = mob.blockPosition();
-        for (Direction side : new Direction[]{ d.getClockWise(), d.getCounterClockWise() }) {
+        for (Direction side : dirs) {
             for (int depth = 1; depth <= 2; depth++) {
                 for (int h = 0; h <= 1; h++) {
                     BlockPos c = me.relative(side, depth).above(h);
@@ -786,15 +818,21 @@ public class CompanionSeekBlockGoal extends Goal {
 
     /** True when a walkable way down exists (cave slope, natural staircase, pit edge) - navigation walks it, no digging. */
     private boolean walkDownSlope(ServerLevel level) {
-        BlockPos down = mob.blockPosition().below(6);
-        Path p = mob.getNavigation().createPath(down, 2);
-        if (p == null || !p.canReach()) return false;
-        walkTo = p.getTarget();
-        walkMode = WALK_FREE;
-        walkTicks = 0;
-        mob.getNavigation().moveTo(p, 1.0);
-        lastProgress = level.getGameTime();
-        return true;
+        BlockPos me = mob.blockPosition();
+        // Several depths: on RESUME the full existing staircase is often deeper than 6 - walking 32 down
+        // through the already-dug stairs saves re-descending level by level.
+        for (int depth : new int[]{6, 16, 32}) {
+            BlockPos down = me.below(depth);
+            Path p = mob.getNavigation().createPath(down, 2);
+            if (p == null || !p.canReach()) continue;
+            walkTo = p.getTarget();
+            walkMode = WALK_FREE;
+            walkTicks = 0;
+            mob.getNavigation().moveTo(p, 1.0);
+            lastProgress = level.getGameTime();
+            return true;
+        }
+        return false;
     }
 
     private void tunnelToward(ServerLevel level, MineTask t, BlockPos target) {
