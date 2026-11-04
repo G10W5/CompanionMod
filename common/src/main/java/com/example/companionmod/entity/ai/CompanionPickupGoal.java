@@ -19,6 +19,8 @@ public class CompanionPickupGoal extends Goal {
     private ItemEntity item;
     private int cooldown;
     private boolean storedAny;
+    private double lastDistSq = Double.MAX_VALUE;   // approach progress: unreachable items must not be chased forever
+    private int noApproachTicks;
 
     public CompanionPickupGoal(CompanionEntity mob) {
         this.mob = mob;
@@ -32,6 +34,7 @@ public class CompanionPickupGoal extends Goal {
         if (--cooldown > 0) return false;
         cooldown = 10;
         item = nearestItem();
+        if (item != null) { lastDistSq = Double.MAX_VALUE; noApproachTicks = 0; }
         return item != null;
     }
 
@@ -48,6 +51,8 @@ public class CompanionPickupGoal extends Goal {
     @Override
     public void start() {
         storedAny = false;
+        lastDistSq = Double.MAX_VALUE;
+        noApproachTicks = 0;
         if (item != null) mob.getNavigation().moveTo(item, 1.15);
     }
 
@@ -63,6 +68,8 @@ public class CompanionPickupGoal extends Goal {
         if (item == null || !item.isAlive() || item.getItem().isEmpty()) {
             item = nearestItem();
             if (item == null) return;
+            lastDistSq = Double.MAX_VALUE;
+            noApproachTicks = 0;
             mob.getNavigation().moveTo(item, 1.15);
             return;
         }
@@ -80,7 +87,21 @@ public class CompanionPickupGoal extends Goal {
                 return;
             }
             item = null;
+            lastDistSq = Double.MAX_VALUE;
+            noApproachTicks = 0;
             if (mob.isPickupRequested() && nearestItem() == null) mob.finishPickup(storedAny);
+            return;
+        }
+        // No closing in for 6 s (across water, against a wall, on a ledge): stop chasing THIS item -
+        // the old code re-pathed it forever while holding the MOVE goal flag and blocking every other job.
+        if (distSq + 0.05 < lastDistSq) {
+            lastDistSq = distSq;
+            noApproachTicks = 0;
+        } else if (++noApproachTicks > 120) {
+            item = null;
+            lastDistSq = Double.MAX_VALUE;
+            noApproachTicks = 0;
+            cooldown = 100;                 //3 s of hands off: other goals (follow, mine...) get to run
             return;
         }
         if (mob.getNavigation().isDone()) mob.getNavigation().moveTo(item, 1.15);

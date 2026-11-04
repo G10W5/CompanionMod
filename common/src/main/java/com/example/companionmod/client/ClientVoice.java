@@ -40,6 +40,7 @@ import java.util.function.Consumer;
  * and call renderHud() from their HUD hook.
  */
 public final class ClientVoice {
+    private static final org.slf4j.Logger LOG = com.mojang.logging.LogUtils.getLogger();
     private static KeyMapping talkKey;
     private static KeyMapping radialKey;
     private static KeyMapping settingsKey;
@@ -206,6 +207,8 @@ public final class ClientVoice {
     public static void onReply(VoiceReply r) {
         Minecraft mc = Minecraft.getInstance();
         mc.execute(() -> {
+            LOG.info("[companionmod] voice reply: heard='{}' jsonCmd={} target='{}'",
+                    r.heard(), r.command(), r.target());
             if (!r.heard().isBlank()) { subtitle = "You: " + r.heard(); subtitleUntil = System.currentTimeMillis() + 4000; }
             // Hard-stop phrases are deterministic. Safety/control must not depend on the LLM's JSON choice.
             CompanionCommand command = isHardStopPhrase(r.heard()) ? CompanionCommand.STOP : gateCommand(r.command(), r.heard());
@@ -224,6 +227,7 @@ public final class ClientVoice {
             // "dig up to the surface" must never become a blind mining order: the model loves to invent an ore
             // target for it. Surface request with no material named -> the real SURFACE order (staircase up).
             if (command == CompanionCommand.SEEK_BLOCK && surfaceRequest(r.heard())) command = CompanionCommand.SURFACE;
+            LOG.info("[companionmod] voice decision: cmd={} target='{}'", command, target);
             if (!r.memory().isBlank()) CompanionMemory.remember(r.memory());
             if (command == CompanionCommand.REMEMBER)
                 CompanionMemory.remember(target.isBlank() ? r.say() : target);

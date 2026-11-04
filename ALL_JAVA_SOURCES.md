@@ -114,6 +114,7 @@ import java.util.function.Consumer;
  * and call renderHud() from their HUD hook.
  */
 public final class ClientVoice {
+    private static final org.slf4j.Logger LOG = com.mojang.logging.LogUtils.getLogger();
     private static KeyMapping talkKey;
     private static KeyMapping radialKey;
     private static KeyMapping settingsKey;
@@ -280,6 +281,8 @@ public final class ClientVoice {
     public static void onReply(VoiceReply r) {
         Minecraft mc = Minecraft.getInstance();
         mc.execute(() -> {
+            LOG.info("[companionmod] voice reply: heard='{}' jsonCmd={} target='{}'",
+                    r.heard(), r.command(), r.target());
             if (!r.heard().isBlank()) { subtitle = "You: " + r.heard(); subtitleUntil = System.currentTimeMillis() + 4000; }
             // Hard-stop phrases are deterministic. Safety/control must not depend on the LLM's JSON choice.
             CompanionCommand command = isHardStopPhrase(r.heard()) ? CompanionCommand.STOP : gateCommand(r.command(), r.heard());
@@ -298,6 +301,7 @@ public final class ClientVoice {
             // "dig up to the surface" must never become a blind mining order: the model loves to invent an ore
             // target for it. Surface request with no material named -> the real SURFACE order (staircase up).
             if (command == CompanionCommand.SEEK_BLOCK && surfaceRequest(r.heard())) command = CompanionCommand.SURFACE;
+            LOG.info("[companionmod] voice decision: cmd={} target='{}'", command, target);
             if (!r.memory().isBlank()) CompanionMemory.remember(r.memory());
             if (command == CompanionCommand.REMEMBER)
                 CompanionMemory.remember(target.isBlank() ? r.say() : target);
@@ -610,10 +614,21 @@ public final class CompanionAutonomy {
 
     /** Spoken request that was not a direct order. Greetings, small talk and bare orders are NOT goals. */
     public static void onVoiceHeard(String heard) {
-        if (cfg == null || !cfg.dynamicGoals || heard == null || heard.isBlank()) return;
-        if (!plannable(heard)) return;
+        if (cfg == null) return;
+        if (!cfg.dynamicGoals) {
+            LOG.info("[companionmod] goals: spoken goal ignored - Dynamic Goals is OFF in settings");
+            return;
+        }
+        if (heard == null || heard.isBlank()) return;
+        if (!plannable(heard)) {
+            LOG.info("[companionmod] goals: not a goal: '{}'", heard);
+            return;
+        }
+        LOG.info("[companionmod] goals: planning from voice: '{}'", heard);
         requestGoal(heard, true);
     }
+
+    private static final org.slf4j.Logger LOG = com.mojang.logging.LogUtils.getLogger();
 
     private static final Set<String> GREETINGS = Set.of(
             "hello", "hi", "hey", "yo", "hiya", "howdy", "thanks", "thank you", "bye", "goodbye",
@@ -667,17 +682,20 @@ public final class CompanionAutonomy {
             try {
                 PlanParser.Plan plan = backend.planGoal(text, ctx);
                 if (plan.isEmpty()) {
-                    if (!quiet && isCurrent(ticket)) {
+                    // Spoken goals (quiet) used to fail SILENTLY - "voice goals never trigger" with no clue why.
+                    if (isCurrent(ticket)) {
                         mc.execute(() -> {
                             if (isCurrent(ticket)) chat(mc, "I'm not sure how to do that.");
                         });
                     }
                 } else {
+                    LOG.info("[companionmod] goals: plan accepted ({} steps)", plan.steps().size());
                     deliver(plan, false, ticket);
                 }
             } catch (Exception e) {
-                if (!quiet && isCurrent(ticket)) {
-                    String message = e.getMessage() == null ? "unknown error" : e.getMessage();
+                String message = e.getMessage() == null ? "unknown error" : e.getMessage();
+                LOG.warn("[companionmod] goals: planning FAILED: {}", message);
+                if (isCurrent(ticket)) {
                     mc.execute(() -> {
                         if (isCurrent(ticket)) chat(mc, "Planning failed: " + message);
                     });
@@ -4570,6 +4588,8 @@ public class CompanionPickupGoal extends Goal {
     private ItemEntity item;
     private int cooldown;
     private boolean storedAny;
+    private double lastDistSq = Double.MAX_VALUE;   // approach progress: unreachable items must not be chased forever
+    private int noApproachTicks;
 
     public CompanionPickupGoal(CompanionEntity mob) {
         this.mob = mob;
@@ -4583,6 +4603,7 @@ public class CompanionPickupGoal extends Goal {
         if (--cooldown > 0) return false;
         cooldown = 10;
         item = nearestItem();
+        if (item != null) { lastDistSq = Double.MAX_VALUE; noApproachTicks = 0; }
         return item != null;
     }
 
@@ -4599,6 +4620,8 @@ public class CompanionPickupGoal extends Goal {
     @Override
     public void start() {
         storedAny = false;
+        lastDistSq = Double.MAX_VALUE;
+        noApproachTicks = 0;
         if (item != null) mob.getNavigation().moveTo(item, 1.15);
     }
 
@@ -4614,6 +4637,8 @@ public class CompanionPickupGoal extends Goal {
         if (item == null || !item.isAlive() || item.getItem().isEmpty()) {
             item = nearestItem();
             if (item == null) return;
+            lastDistSq = Double.MAX_VALUE;
+            noApproachTicks = 0;
             mob.getNavigation().moveTo(item, 1.15);
             return;
         }
@@ -4631,7 +4656,21 @@ public class CompanionPickupGoal extends Goal {
                 return;
             }
             item = null;
+            lastDistSq = Double.MAX_VALUE;
+            noApproachTicks = 0;
             if (mob.isPickupRequested() && nearestItem() == null) mob.finishPickup(storedAny);
+            return;
+        }
+        // No closing in for 6 s (across water, against a wall, on a ledge): stop chasing THIS item -
+        // the old code re-pathed it forever while holding the MOVE goal flag and blocking every other job.
+        if (distSq + 0.05 < lastDistSq) {
+            lastDistSq = distSq;
+            noApproachTicks = 0;
+        } else if (++noApproachTicks > 120) {
+            item = null;
+            lastDistSq = Double.MAX_VALUE;
+            noApproachTicks = 0;
+            cooldown = 100;                 //3 s of hands off: other goals (follow, mine...) get to run
             return;
         }
         if (mob.getNavigation().isDone()) mob.getNavigation().moveTo(item, 1.15);
@@ -5278,6 +5317,25 @@ public class CompanionSeekBlockGoal extends Goal {
             return;
         }
         if (tryScaffold(level, t, target)) return;                   // high in a tree / on a cave ceiling: build up to it
+        // Surface target the pathfinder won't commit to (top of a cactus, a ledge): walk to a cell BESIDE
+        // its column first instead of tunnelling a trench to it - digging toward it produced one-block
+        // trenches with block-by-block teleports where a simple walk-around would do.
+        if (!t.deep() && target.getY() > mob.blockPosition().getY()) {
+            BlockPos base = groundBelow(level, t, target);
+            for (Direction dir : Direction.Plane.HORIZONTAL) {
+                BlockPos stand = base.relative(dir).above();
+                if (!passable(level, stand)) continue;
+                Path fp = mob.getNavigation().createPath(stand, 1);
+                if (fp != null && fp.canReach()) {
+                    walkTo = stand;
+                    walkMode = WALK_FREE;
+                    walkTicks = 0;
+                    mob.getNavigation().moveTo(fp, 1.0);
+                    diag("walk-around to " + stand + " for target " + target);
+                    return;
+                }
+            }
+        }
         tunnelToward(level, t, target);
     }
 
@@ -5653,11 +5711,20 @@ public class CompanionSeekBlockGoal extends Goal {
             return;
         }
         if (walkMode == WALK_STAND) {
-            // OG tunnel-step behaviour (restored): the pathfinder walks the 1-block step, re-issued every 20
-            // ticks; if the path is done/failed but we are not there yet (a step-up the pathfinder cannot
-            // model, a tight corner), teleport as the last resort so a tunnel step never deadlocks. The staged
-            // pathfinder -> move-control+jump -> teleport ladder circled on step-ups instead of advancing.
-            if (walkTicks > 80 || (walkTicks > 5 && nav.isDone())) {
+            // Tunnel steps: HOP the 1-block step first, and only teleport when the stand cell is right
+            // next to us (a step-up or tight corner the pathfinder cannot model). The old ladder
+            // teleported whenever a path finished in >5 ticks - even across open ground - which was the
+            // "tp block by block" trench behaviour. A far-away stand cell now fails the walk instead of teleporting.
+            double sdx = w.getX() + 0.5 - mob.getX(), sdz = w.getZ() + 0.5 - mob.getZ();
+            double sdy = w.getY() - mob.getY();
+            boolean adjacent = Math.abs(sdx) <= 2.2 && Math.abs(sdz) <= 2.2;
+            if (adjacent && sdy > 0.3 && sdy <= 1.6 && mob.onGround() && walkTicks % 15 == 5) {
+                diag("stand: ledge hop to " + w);
+                mob.getJumpControl().jump();
+            }
+            boolean canTp = adjacent && Math.abs(sdx) <= 3.5 && Math.abs(sdz) <= 3.5;
+            if (canTp && (walkTicks > 80 || (walkTicks > 10 && nav.isDone()))) {
+                diag("stand: teleport " + mob.blockPosition() + " -> " + w);
                 mob.setPos(w.getX() + 0.5, w.getY(), w.getZ() + 0.5);
                 mob.resetFallDistance();
                 nav.stop();
@@ -5666,6 +5733,7 @@ public class CompanionSeekBlockGoal extends Goal {
                 walkTo = null;
                 return;
             }
+            if (!canTp && walkTicks > 160) { failWalk(); return; }   // far and unreachable: give up, never teleport across a gap
             if (walkTicks % 20 == 0) nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
             return;
         }
@@ -6104,6 +6172,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     private com.example.companionmod.entity.ai.CompanionSeekBlockGoal seekGoal;
     // "pick this up from the ground" order (server side)
     private String pickupFilter = "";
+    private boolean pickupWasEnabled;   // transient: was the user's pickup toggle on before the current order
     private boolean pickupRequested;
 
     // Inventory: armor row, tool row, main storage.
@@ -6521,6 +6590,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     /** Explicit "pick this up" order: walk to the matching dropped item instead of opening the inventory. */
     public void requestPickup(String filter) {
+        pickupWasEnabled = isPickupEnabled();          // remember the user's own toggle: an order must not clobber it
         pickupFilter = filter == null ? "" : filter.trim();
         pickupRequested = true;
         setPickupEnabled(true);
@@ -6535,7 +6605,11 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         }
         pickupRequested = false;
         pickupFilter = "";
-        setPickupEnabled(false);
+        // Old behaviour force-disabled pickup after EVERY order - so one explicit "pick this up" silently
+        // killed the player's standing pickup toggle and items stopped being collected ("sometimes doesn't
+        // pick up items"). Only turn it off when it was off before the order.
+        if (!pickupWasEnabled) setPickupEnabled(false);
+        pickupWasEnabled = false;
     }
 
     /** True when a dropped item matching the words is on the ground nearby (so "collect" should loot, not mine). */
@@ -7964,6 +8038,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /** Server-side entry point for voice commands. The client is untrusted: validate, rate-limit, only touch the sender's own companion. */
 public final class CommandHandler {
+    private static final org.slf4j.Logger LOG = com.mojang.logging.LogUtils.getLogger();
     /**
      * Token bucket instead of a single 400 ms gap: the client legitimately sends bursts such as
      * "set_skin" + "feminine" in one tick, and the old single-gap limiter silently dropped the second
@@ -7982,6 +8057,8 @@ public final class CommandHandler {
 
     public static void handle(ServerPlayer player, CommandPayload payload) {
         CompanionCommand cmd = CompanionCommand.parse(payload.action());
+        LOG.info("[companionmod] server cmd: action='{}' -> {} target='{}' from {}",
+                payload.action(), cmd, payload.target(), player.getName().getString());
 
         // STOP is an emergency control, not optional background work. Never lose it to the token bucket.
         if (cmd != CompanionCommand.STOP) {

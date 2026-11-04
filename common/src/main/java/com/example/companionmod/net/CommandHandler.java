@@ -15,6 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /** Server-side entry point for voice commands. The client is untrusted: validate, rate-limit, only touch the sender's own companion. */
 public final class CommandHandler {
+    private static final org.slf4j.Logger LOG = com.mojang.logging.LogUtils.getLogger();
     /**
      * Token bucket instead of a single 400 ms gap: the client legitimately sends bursts such as
      * "set_skin" + "feminine" in one tick, and the old single-gap limiter silently dropped the second
@@ -33,6 +34,8 @@ public final class CommandHandler {
 
     public static void handle(ServerPlayer player, CommandPayload payload) {
         CompanionCommand cmd = CompanionCommand.parse(payload.action());
+        LOG.info("[companionmod] server cmd: action='{}' -> {} target='{}' from {}",
+                payload.action(), cmd, payload.target(), player.getName().getString());
 
         // STOP is an emergency control, not optional background work. Never lose it to the token bucket.
         if (cmd != CompanionCommand.STOP) {

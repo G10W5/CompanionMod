@@ -74,10 +74,21 @@ public final class CompanionAutonomy {
 
     /** Spoken request that was not a direct order. Greetings, small talk and bare orders are NOT goals. */
     public static void onVoiceHeard(String heard) {
-        if (cfg == null || !cfg.dynamicGoals || heard == null || heard.isBlank()) return;
-        if (!plannable(heard)) return;
+        if (cfg == null) return;
+        if (!cfg.dynamicGoals) {
+            LOG.info("[companionmod] goals: spoken goal ignored - Dynamic Goals is OFF in settings");
+            return;
+        }
+        if (heard == null || heard.isBlank()) return;
+        if (!plannable(heard)) {
+            LOG.info("[companionmod] goals: not a goal: '{}'", heard);
+            return;
+        }
+        LOG.info("[companionmod] goals: planning from voice: '{}'", heard);
         requestGoal(heard, true);
     }
+
+    private static final org.slf4j.Logger LOG = com.mojang.logging.LogUtils.getLogger();
 
     private static final Set<String> GREETINGS = Set.of(
             "hello", "hi", "hey", "yo", "hiya", "howdy", "thanks", "thank you", "bye", "goodbye",
@@ -131,17 +142,20 @@ public final class CompanionAutonomy {
             try {
                 PlanParser.Plan plan = backend.planGoal(text, ctx);
                 if (plan.isEmpty()) {
-                    if (!quiet && isCurrent(ticket)) {
+                    // Spoken goals (quiet) used to fail SILENTLY - "voice goals never trigger" with no clue why.
+                    if (isCurrent(ticket)) {
                         mc.execute(() -> {
                             if (isCurrent(ticket)) chat(mc, "I'm not sure how to do that.");
                         });
                     }
                 } else {
+                    LOG.info("[companionmod] goals: plan accepted ({} steps)", plan.steps().size());
                     deliver(plan, false, ticket);
                 }
             } catch (Exception e) {
-                if (!quiet && isCurrent(ticket)) {
-                    String message = e.getMessage() == null ? "unknown error" : e.getMessage();
+                String message = e.getMessage() == null ? "unknown error" : e.getMessage();
+                LOG.warn("[companionmod] goals: planning FAILED: {}", message);
+                if (isCurrent(ticket)) {
                     mc.execute(() -> {
                         if (isCurrent(ticket)) chat(mc, "Planning failed: " + message);
                     });

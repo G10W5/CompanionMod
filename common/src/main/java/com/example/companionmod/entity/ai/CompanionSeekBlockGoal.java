@@ -480,6 +480,25 @@ public class CompanionSeekBlockGoal extends Goal {
             return;
         }
         if (tryScaffold(level, t, target)) return;                   // high in a tree / on a cave ceiling: build up to it
+        // Surface target the pathfinder won't commit to (top of a cactus, a ledge): walk to a cell BESIDE
+        // its column first instead of tunnelling a trench to it - digging toward it produced one-block
+        // trenches with block-by-block teleports where a simple walk-around would do.
+        if (!t.deep() && target.getY() > mob.blockPosition().getY()) {
+            BlockPos base = groundBelow(level, t, target);
+            for (Direction dir : Direction.Plane.HORIZONTAL) {
+                BlockPos stand = base.relative(dir).above();
+                if (!passable(level, stand)) continue;
+                Path fp = mob.getNavigation().createPath(stand, 1);
+                if (fp != null && fp.canReach()) {
+                    walkTo = stand;
+                    walkMode = WALK_FREE;
+                    walkTicks = 0;
+                    mob.getNavigation().moveTo(fp, 1.0);
+                    diag("walk-around to " + stand + " for target " + target);
+                    return;
+                }
+            }
+        }
         tunnelToward(level, t, target);
     }
 
@@ -855,11 +874,20 @@ public class CompanionSeekBlockGoal extends Goal {
             return;
         }
         if (walkMode == WALK_STAND) {
-            // OG tunnel-step behaviour (restored): the pathfinder walks the 1-block step, re-issued every 20
-            // ticks; if the path is done/failed but we are not there yet (a step-up the pathfinder cannot
-            // model, a tight corner), teleport as the last resort so a tunnel step never deadlocks. The staged
-            // pathfinder -> move-control+jump -> teleport ladder circled on step-ups instead of advancing.
-            if (walkTicks > 80 || (walkTicks > 5 && nav.isDone())) {
+            // Tunnel steps: HOP the 1-block step first, and only teleport when the stand cell is right
+            // next to us (a step-up or tight corner the pathfinder cannot model). The old ladder
+            // teleported whenever a path finished in >5 ticks - even across open ground - which was the
+            // "tp block by block" trench behaviour. A far-away stand cell now fails the walk instead of teleporting.
+            double sdx = w.getX() + 0.5 - mob.getX(), sdz = w.getZ() + 0.5 - mob.getZ();
+            double sdy = w.getY() - mob.getY();
+            boolean adjacent = Math.abs(sdx) <= 2.2 && Math.abs(sdz) <= 2.2;
+            if (adjacent && sdy > 0.3 && sdy <= 1.6 && mob.onGround() && walkTicks % 15 == 5) {
+                diag("stand: ledge hop to " + w);
+                mob.getJumpControl().jump();
+            }
+            boolean canTp = adjacent && Math.abs(sdx) <= 3.5 && Math.abs(sdz) <= 3.5;
+            if (canTp && (walkTicks > 80 || (walkTicks > 10 && nav.isDone()))) {
+                diag("stand: teleport " + mob.blockPosition() + " -> " + w);
                 mob.setPos(w.getX() + 0.5, w.getY(), w.getZ() + 0.5);
                 mob.resetFallDistance();
                 nav.stop();
@@ -868,6 +896,7 @@ public class CompanionSeekBlockGoal extends Goal {
                 walkTo = null;
                 return;
             }
+            if (!canTp && walkTicks > 160) { failWalk(); return; }   // far and unreachable: give up, never teleport across a gap
             if (walkTicks % 20 == 0) nav.moveTo(w.getX() + 0.5, w.getY(), w.getZ() + 0.5, 1.0);
             return;
         }

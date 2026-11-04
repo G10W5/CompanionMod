@@ -140,6 +140,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     private com.example.companionmod.entity.ai.CompanionSeekBlockGoal seekGoal;
     // "pick this up from the ground" order (server side)
     private String pickupFilter = "";
+    private boolean pickupWasEnabled;   // transient: was the user's pickup toggle on before the current order
     private boolean pickupRequested;
 
     // Inventory: armor row, tool row, main storage.
@@ -557,6 +558,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
 
     /** Explicit "pick this up" order: walk to the matching dropped item instead of opening the inventory. */
     public void requestPickup(String filter) {
+        pickupWasEnabled = isPickupEnabled();          // remember the user's own toggle: an order must not clobber it
         pickupFilter = filter == null ? "" : filter.trim();
         pickupRequested = true;
         setPickupEnabled(true);
@@ -571,7 +573,11 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         }
         pickupRequested = false;
         pickupFilter = "";
-        setPickupEnabled(false);
+        // Old behaviour force-disabled pickup after EVERY order - so one explicit "pick this up" silently
+        // killed the player's standing pickup toggle and items stopped being collected ("sometimes doesn't
+        // pick up items"). Only turn it off when it was off before the order.
+        if (!pickupWasEnabled) setPickupEnabled(false);
+        pickupWasEnabled = false;
     }
 
     /** True when a dropped item matching the words is on the ground nearby (so "collect" should loot, not mine). */
