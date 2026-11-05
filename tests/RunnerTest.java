@@ -86,7 +86,8 @@ public class RunnerTest {
         var p0 = order.get(10); e3.world.put(FakeEnv.k(p0.dx(), p0.dy(), p0.dz()), Blk.of("minecraft:dirt"));
         var p1 = order.get(20); e3.unreachable.add(FakeEnv.k(p1.dx(), p1.dy(), p1.dz()));
         r = new BuildRunner(order, 0, 0, 0, e3); st = runToStop(r, 100000);
-        check(st == Status.DONE && r.skipped == 2 && r.unreachable == 1 && e3.placedCount == order.size() - 2, "occupied + unreachable cells skipped, rest built (skipped=" + r.skipped + ")");
+        check(st == Status.STALLED && r.skipped == 0 && e3.placedCount == order.size() - 2,
+                "occupied + unreachable cells are REPORTED as STALLED, never skipped (st=" + st + ", skipped=" + r.skipped + ")");
 
         // 4. creature standing in a cell for a few checks
         FakeEnv e4 = new FakeEnv(); e4.creative = true; e4.entityBlockedCalls = 3; var p2 = order.get(30); e4.entityCells.add(FakeEnv.k(p2.dx(), p2.dy(), p2.dz()));
@@ -97,8 +98,8 @@ public class RunnerTest {
         // 5. creature never leaves -> waits, then gives up without hanging
         FakeEnv e5 = new FakeEnv(); e5.creative = true; e5.entityBlockedCalls = Integer.MAX_VALUE; e5.entityCells.add(FakeEnv.k(p2.dx(), p2.dy(), p2.dz()));
         r = new BuildRunner(order, 0, 0, 0, e5); int waits = 0;
-        for (int i = 0; i < 100000; i++) { st = r.tick(3, 400); if (st == Status.WAITING_ENTITY) { waits++; r.resume(); } else if (st == Status.DONE) break; }
-        check(st == Status.DONE && waits == BuildRunner.MAX_ENTITY_RETRIES && e5.placedCount == order.size() - 1, "permanent blocker: " + waits + " retries then moves on");
+        for (int i = 0; i < 100000; i++) { st = r.tick(3, 400); if (st == Status.WAITING_ENTITY) { waits++; r.resume(); } else if (st == Status.DONE || st == Status.STALLED) break; }
+        check(st == Status.STALLED && waits == BuildRunner.MAX_ENTITY_RETRIES && e5.placedCount == order.size() - 1, "permanent blocker: " + waits + " retries then STALLED (cell kept, reported)");
 
         // 6. scan budget: an already-built structure is swept without placing, in many ticks, never one huge tick
         FakeEnv e6 = new FakeEnv(); e6.creative = true; for (var p : order) e6.world.put(FakeEnv.k(p.dx(), p.dy(), p.dz()), p.blk());

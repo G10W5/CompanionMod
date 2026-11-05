@@ -36,6 +36,8 @@ import java.util.Set;
 public class CompanionBlueprintGoal extends Goal {
     private static final int PLACE_PER_TICK = 3, SCAN_PER_TICK = 400;
     private static final double REACH = 5.5;
+    /** Stall attempts (walk away + come back) before the build is paused with a spoken report. */
+    private static final int MAX_STALLS = 6, REPOSITION_TICKS = 80;
 
     private final CompanionEntity mob;
     private final BlueprintSupply supply;
@@ -47,6 +49,8 @@ public class CompanionBlueprintGoal extends Goal {
     private long lastTarget = Long.MIN_VALUE;
     private int moveTicks;
     private BlockPos standTarget;
+    private int repositionTicks;                 // >0: walking away and back after a stall, sweep is paused
+    private int stallAttempts, seenPlaced = -1;  // attempt budget; any placement progress resets it
 
     public CompanionBlueprintGoal(CompanionEntity mob) {
         this.mob = mob;
@@ -66,6 +70,9 @@ public class CompanionBlueprintGoal extends Goal {
         waitTicks = 0;
         standTarget = null;
         lastTarget = Long.MIN_VALUE;
+        repositionTicks = 0;
+        stallAttempts = 0;
+        seenPlaced = -1;
     }
 
     @Override public void stop() { mob.getNavigation().stop(); }
@@ -88,6 +95,17 @@ public class CompanionBlueprintGoal extends Goal {
         }
         supply.beginTick(sl);
         BuildRunner r = job.runner;
+
+        // Stall recovery: walk away from the problem spot and come back for a fresh path/approach angle.
+        // While this runs the sweep is parked (runner is in STALLED until resume()).
+        if (repositionTicks > 0) {
+            if (--repositionTicks == 40 && lastTarget != Long.MIN_VALUE) {
+                BlockPos t = BlockPos.of(lastTarget);
+                mob.getNavigation().moveTo(t.getX() + 0.5, t.getY(), t.getZ() + 0.5, 1.25);
+            }
+            if (repositionTicks > 0) return;
+            r.resume();
+        }
 
         if (waiting != null) {
             if (--waitTicks > 0) return;
@@ -118,8 +136,72 @@ public class CompanionBlueprintGoal extends Goal {
                 waitTicks = 20;
                 mob.getNavigation().stop();
             }
+            case STALLED -> onStall(job, r);
             case DONE -> finish(job, r);
         }
+    }
+
+    // ------------------------------------------------------------------ stall handling (never a silent hole)
+
+    /**
+     * A full pass made no progress (unreachable cells, blocked cells, a creature that never moves). NEVER skip the
+     * cells: say WHY, walk away and come back for a fresh approach, and after {@link #MAX_STALLS} attempts pause the
+     * build and tell the owner exactly where things stand - resume with "continue" or /cbuild resume.
+     */
+    private void onStall(BuildJob job, BuildRunner r) {
+        if (r.placed != seenPlaced) {                   // real progress since the last stall: budget resets
+            seenPlaced = r.placed;
+            stallAttempts = 0;
+        }
+        stallAttempts++;
+        mob.getNavigation().stop();
+        if (stallAttempts > MAX_STALLS) {
+            job.pause();
+            mob.speak("I can't make progress on this build. I'll wait here.");
+            if (mob.getOwner() instanceof ServerPlayer sp) {
+                sp.sendSystemMessage(Component.literal("[Companion] Build paused at " + r.percent() + "% - "
+                        + stallWhy(r) + ". Say 'continue' (or /cbuild resume) to try again."));
+            }
+            return;
+        }
+        mob.speak(stallSpeak(r));
+        reposition();                                   // walk away, then back; resume() after REPOSITION_TICKS
+        repositionTicks = REPOSITION_TICKS;
+    }
+
+    private void reposition() {
+        BlockPos target = lastTarget == Long.MIN_VALUE ? mob.blockPosition() : BlockPos.of(lastTarget);
+        double dx = mob.getX() - (target.getX() + 0.5);
+        double dz = mob.getZ() - (target.getZ() + 0.5);
+        double len = Math.max(0.001, Math.sqrt(dx * dx + dz * dz));
+        BlockPos away = mob.blockPosition().offset((int) Math.round(4.0 * dx / len), 0, (int) Math.round(4.0 * dz / len));
+        mob.getNavigation().moveTo(away.getX() + 0.5, away.getY(), away.getZ() + 0.5, 1.25);
+    }
+
+    private static String stallSpeak(BuildRunner r) {
+        if (r.entityStalled) return "Something is standing in the way and won't move. Let me try again.";
+        if (r.reachStall > 0) return "I can't quite reach " + n(r.reachStall) + ". Trying another angle.";
+        if (r.blockedStall > 0) return "Something I can't move is blocking " + n(r.blockedStall) + ".";
+        if (r.protStall > 0) return n(r.protStall) + " are protected - I can't build there.";
+        return "I'm stuck on this build. Trying another way.";
+    }
+
+    private static String stallWhy(BuildRunner r) {
+        StringBuilder sb = new StringBuilder();
+        if (r.entityStalled) append(sb, "a creature won't move");
+        if (r.reachStall > 0) append(sb, "I can't reach " + n(r.reachStall));
+        if (r.blockedStall > 0) append(sb, n(r.blockedStall) + " blocked by un-replaceable blocks");
+        if (r.protStall > 0) append(sb, n(r.protStall) + " protected");
+        return sb.length() == 0 ? "no progress" : sb.toString();
+    }
+
+    private static void append(StringBuilder sb, String part) {
+        if (sb.length() > 0) sb.append(", ");
+        sb.append(part);
+    }
+
+    private static String n(int count) {
+        return count + " spot" + (count == 1 ? "" : "s");
     }
 
     // ------------------------------------------------------------------ messages
@@ -143,7 +225,7 @@ public class CompanionBlueprintGoal extends Goal {
 
     private void finish(BuildJob job, BuildRunner r) {
         String text = "Build finished! Placed " + r.placed + " blocks."
-                + (r.skipped > 0 ? " " + r.skipped + " spots were skipped (occupied or out of reach)." : "")
+                + (r.skipped > 0 ? " " + r.skipped + " cells could not be filled (unknown blocks in the design)." : "")
                 + (r.blocked > 0 ? " " + r.blocked + " spots are protected." : "");
         mob.speak("Build finished!");
         if (mob.getOwner() instanceof ServerPlayer sp) sp.sendSystemMessage(Component.literal("[Companion] " + text));
@@ -173,7 +255,7 @@ public class CompanionBlueprintGoal extends Goal {
             BlockPos pos = new BlockPos(x, y, z);
             if (!level.hasChunkAt(pos)) return BuildRunner.Inspect.UNLOADED;
             BlockState ws = state(want);
-            if (ws == null) return BuildRunner.Inspect.OCCUPIED;                 // unknown block: skip it
+            if (ws == null) return BuildRunner.Inspect.UNKNOWN_BLOCK;           // unknown block: design error, retire
             BlockState there = level.getBlockState(pos);
             if (there.getBlock() == ws.getBlock()) return BuildRunner.Inspect.ALREADY;
             if (!overwritable(level, pos, there)) return BuildRunner.Inspect.OCCUPIED;
