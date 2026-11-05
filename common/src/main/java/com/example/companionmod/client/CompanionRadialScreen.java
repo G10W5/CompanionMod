@@ -142,6 +142,8 @@ public final class CompanionRadialScreen extends Screen {
                 order("Pick up", "Grab a dropped item", "pickup", Items.HOPPER),
                 custom("Find & Mine", "Go mine a block", Items.DIAMOND_PICKAXE,
                         () -> open(new CompanionFindBlockScreen(cfg, ClientVoice.configFile()))),
+                custom("Build", "Design or import a structure", Items.BRICKS,
+                        () -> open(new com.example.companionmod.client.CompanionBuildScreen(cfg))),
                 order("Inventory", "Open its bag", "inventory", Items.CHEST),
                 order("Drop item", "Drop one item", "drop", Items.BONE),
                 order("Farm", "Harvest crops for 30s", "farm", Items.WHEAT),

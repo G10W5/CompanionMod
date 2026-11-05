@@ -1,6 +1,6 @@
 # All Java Sources
 
-Generated from 72 files. Paths are relative to the project root.
+Generated from 84 files. Paths are relative to the project root.
 
 ## common\src\main\java\com\example\companionmod\block\CompanionShrineBlock.java
 
@@ -783,6 +783,155 @@ public final class CompanionAutonomy {
     private static String context(Minecraft mc) {
         CompanionEntity mine = ClientVoice.findCompanion(mc);
         return CompanionWorldContext.build(mc, mine) + "\nMemory: " + CompanionMemory.summary();
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\client\CompanionBuildScreen.java
+
+```java
+package com.example.companionmod.client;
+
+import com.example.companionmod.build.BuildSpec;
+import com.example.companionmod.build.SpecParser;
+import com.example.companionmod.net.BuildOp;
+import com.example.companionmod.voice.BuildSpecBackend;
+import com.example.companionmod.voice.VoiceConfig;
+import com.example.companionmod.world.BuildSources;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.network.chat.Component;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * "Build" menu in the mod's grey bevelled panel look: describe a structure (the local model designs it) or pick
+ * an .nbt from config/companionmod/schematics. Either way the design goes to the server, which previews it with
+ * a particle outline that follows the player's aim; rotate / mirror / place are clickable chat controls.
+ */
+public class CompanionBuildScreen extends Screen {
+    private static final int PANEL_W = 340, PAD = 12;
+    private static final int HEAD_H = 26, CONTENT_H = 96, FOOT_H = 34;
+
+    private final VoiceConfig config;
+    private EditBox promptField;
+    private Button fileButton;
+    private List<String> files = List.of();
+    private int fileIndex;
+    private String status = "";
+    private boolean busy;
+
+    private int px, py, panelW, panelH, ix, iw;   // geometry (recomputed in init)
+
+    public CompanionBuildScreen(VoiceConfig config) {
+        super(Component.literal("Build"));
+        this.config = config;
+    }
+
+    @Override
+    protected void init() {
+        panelW = Math.min(PANEL_W, this.width - 8);
+        panelH = HEAD_H + CONTENT_H + FOOT_H;
+        px = (this.width - panelW) / 2;
+        py = Math.max(4, (this.height - panelH) / 2);
+        ix = px + PAD;
+        iw = panelW - 2 * PAD;
+
+        files = BuildSources.listFiles();
+        fileIndex = Math.min(fileIndex, Math.max(0, files.size() - 1));
+        int y = py + HEAD_H;
+
+        promptField = new EditBox(this.font, ix, y, iw, 20, Component.literal("Describe"));
+        promptField.setHint(Component.literal("e.g. a tall round stone tower"));
+        promptField.setMaxLength(160);
+        this.addRenderableWidget(promptField);
+        y += 26;
+
+        this.addRenderableWidget(Button.builder(Component.literal("Design with AI"), b -> design())
+                .pos(ix, y).size(iw, 20).build());
+        y += 26;
+
+        this.addRenderableWidget(Button.builder(Component.literal("<"), b -> cycle(-1)).pos(ix, y).size(24, 20).build());
+        fileButton = Button.builder(Component.literal(fileLabel()), b -> importFile()).pos(ix + 28, y).size(iw - 56, 20).build();
+        this.addRenderableWidget(fileButton);
+        this.addRenderableWidget(Button.builder(Component.literal(">"), b -> cycle(1)).pos(ix + iw - 24, y).size(24, 20).build());
+        y += 26;
+
+        int bw = (iw - 4) / 2;
+        int fy = py + panelH - 27;                  // one footer row, 7px pad at the bottom like the other panels
+        this.addRenderableWidget(Button.builder(Component.literal("Back"), b -> {
+            if (this.minecraft != null) this.minecraft.setScreen(new CompanionRadialScreen());
+        }).pos(ix, fy).size(bw, 20).build());
+    }
+
+    private String fileLabel() {
+        return files.isEmpty() ? "No .nbt files found" : "Import: " + files.get(fileIndex);
+    }
+
+    private void cycle(int d) {
+        if (files.isEmpty()) return;
+        fileIndex = Math.floorMod(fileIndex + d, files.size());
+        fileButton.setMessage(Component.literal(fileLabel()));
+    }
+
+    private void importFile() {
+        if (files.isEmpty()) {
+            status = "Put .nbt files in config/companionmod/schematics";
+            return;
+        }
+        ClientVoice.send(BuildOp.ACTION, "", BuildOp.file(files.get(fileIndex)));
+        if (this.minecraft != null) this.minecraft.setScreen(null);
+    }
+
+    private record Designed(BuildSpec spec, boolean usedModel) {}
+
+    private void design() {
+        String text = promptField.getValue().trim();
+        if (text.isEmpty()) { status = "Describe what to build first."; return; }
+        if (busy) return;
+        busy = true;
+        status = "Designing...";
+        var mc = this.minecraft;
+        CompletableFuture.supplyAsync(() -> {
+            String raw = null;
+            try {
+                raw = new BuildSpecBackend(config).design(text);
+            } catch (IOException | RuntimeException ignored) { }
+            boolean ok = raw != null && SpecParser.parse(raw).isPresent();
+            return new Designed(SpecParser.parseOrHeuristic(raw, text), ok);     // never fails: falls back to a keyword guess
+        }).thenAccept(d -> mc.execute(() -> {
+            busy = false;
+            ClientVoice.send(BuildOp.ACTION, "", BuildOp.spec(SpecParser.toJson(d.spec())));
+            if (!d.usedModel() && mc.player != null) {
+                mc.player.sendSystemMessage(Component.literal("[Build] The AI model was unavailable, so I used a basic guess from your words."));
+            }
+            if (mc.screen == this) mc.setScreen(null);
+        }));
+    }
+
+    @Override
+    public boolean isPauseScreen() { return false; }      // let the world (and the preview outline) keep running
+
+    @Override
+    public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        super.extractBackground(g, mouseX, mouseY, partialTick);
+        CompanionUi.panel(g, px, py, px + panelW, py + panelH);
+    }
+
+    @Override
+    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+        super.extractRenderState(g, mouseX, mouseY, partialTick);      // background + widgets
+        int cx = this.width / 2;
+        // Shadowless 'clean' text like the other panels; title in the lighter muted grey.
+        String title = "Build";
+        g.text(this.font, title, cx - this.font.width(title) / 2, py + 6, CompanionUi.TEXT_MUTED, false);
+        if (!status.isBlank()) {
+            g.text(this.font, status, cx - this.font.width(status) / 2, py + panelH - 6, CompanionUi.TEXT_ERROR, false);
+        }
     }
 }
 ```
@@ -2111,6 +2260,8 @@ public final class CompanionRadialScreen extends Screen {
                 order("Pick up", "Grab a dropped item", "pickup", Items.HOPPER),
                 custom("Find & Mine", "Go mine a block", Items.DIAMOND_PICKAXE,
                         () -> open(new CompanionFindBlockScreen(cfg, ClientVoice.configFile()))),
+                custom("Build", "Design or import a structure", Items.BRICKS,
+                        () -> open(new com.example.companionmod.client.CompanionBuildScreen(cfg))),
                 order("Inventory", "Open its bag", "inventory", Items.CHEST),
                 order("Drop item", "Drop one item", "drop", Items.BONE),
                 order("Farm", "Harvest crops for 30s", "farm", Items.WHEAT),
@@ -4222,6 +4373,289 @@ public final class CompanionMod {
     public static Path configDir() { return configDir; }
 
     public static void setConfigDir(Path dir) { if (dir != null) configDir = dir; }
+}
+```
+
+## common\src\main\java\com\example\companionmod\entity\ai\CompanionBlueprintGoal.java
+
+```java
+package com.example.companionmod.entity.ai;
+
+import com.example.companionmod.build.Blk;
+import com.example.companionmod.build.BlkState;
+import com.example.companionmod.build.BuildRunner;
+import com.example.companionmod.entity.BlueprintSupply;
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.entity.CompanionProtection;
+import com.example.companionmod.entity.task.BuildJob;
+import com.example.companionmod.world.BuildSources;
+import net.minecraft.core.BlockPos;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.ai.goal.Goal;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
+
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Builds the companion's {@link BuildJob}: sweeps the ordered block list (see BuildRunner), takes blocks from the
+ * bag / nearby chests, walks (or, when the next spot is out of reach, hops) to a safe standing place near each
+ * target, and places a few blocks per tick. All decisions live in BuildRunner (unit tested); this class is only the
+ * adapter to the real world.
+ */
+public class CompanionBlueprintGoal extends Goal {
+    private static final int PLACE_PER_TICK = 3, SCAN_PER_TICK = 400;
+    private static final double REACH = 5.5;
+
+    private final CompanionEntity mob;
+    private final BlueprintSupply supply;
+    private final McEnv env = new McEnv();
+    private ServerLevel level;
+
+    private BuildRunner.Status waiting;
+    private int waitTicks, speakCooldown;
+    private long lastTarget = Long.MIN_VALUE;
+    private int moveTicks;
+    private BlockPos standTarget;
+
+    public CompanionBlueprintGoal(CompanionEntity mob) {
+        this.mob = mob;
+        this.supply = new BlueprintSupply(mob);
+        setFlags(EnumSet.of(Flag.MOVE, Flag.LOOK));
+    }
+
+    @Override public boolean canUse() {
+        BuildJob j = mob.blueprint();
+        return j.running() && !mob.isSitting() && !mob.isInjured() && mob.getTarget() == null;
+    }
+
+    @Override public boolean canContinueToUse() { return canUse(); }
+
+    @Override public void start() {
+        waiting = null;
+        waitTicks = 0;
+        standTarget = null;
+        lastTarget = Long.MIN_VALUE;
+    }
+
+    @Override public void stop() { mob.getNavigation().stop(); }
+
+    @Override
+    public void tick() {
+        if (!(mob.level() instanceof ServerLevel sl)) return;
+        level = sl;
+        BuildJob job = mob.blueprint();
+
+        if (job.runner == null) {
+            if (!BuildSources.prepare(job)) {
+                mob.speak(job.error.isBlank() ? "I cannot read that design." : job.error);
+                job.cancel();
+                return;
+            }
+            supply.setCenter(job.center());
+            job.runner = new BuildRunner(job.list, job.cx, job.cy, job.cz, env);
+            job.runner.placed = job.placedTotal;
+        }
+        supply.beginTick(sl);
+        BuildRunner r = job.runner;
+
+        if (waiting != null) {
+            if (--waitTicks > 0) return;
+            if (waiting == BuildRunner.Status.WAITING_MATERIALS) {
+                if (!suppliesArrived(r)) {
+                    waitTicks = 40;
+                    announceMissing(r);
+                    return;
+                }
+            }
+            waiting = null;
+            r.resume();
+        }
+
+        BuildRunner.Status st = r.tick(PLACE_PER_TICK, SCAN_PER_TICK);
+        job.placedTotal = r.placed;
+        switch (st) {
+            case WORKING -> { }
+            case WAITING_MATERIALS -> {
+                waiting = st;
+                waitTicks = 40;
+                mob.getNavigation().stop();
+                speakCooldown = 0;
+                announceMissing(r);
+            }
+            case WAITING_ENTITY -> {
+                waiting = st;
+                waitTicks = 20;
+                mob.getNavigation().stop();
+            }
+            case DONE -> finish(job, r);
+        }
+    }
+
+    // ------------------------------------------------------------------ messages
+
+    private boolean suppliesArrived(BuildRunner r) {
+        for (String id : r.missing().keySet()) if (supply.have(id) > 0) return true;
+        return false;
+    }
+
+    private void announceMissing(BuildRunner r) {
+        if (--speakCooldown > 0) return;
+        speakCooldown = 15;                                           // x 40 ticks = every 30 s
+        StringBuilder sb = new StringBuilder();
+        int n = 0;
+        for (Map.Entry<String, Integer> e : r.missing().entrySet()) {
+            if (n++ == 3) { sb.append(", and more"); break; }
+            sb.append(n > 1 ? ", " : "").append(e.getValue()).append(' ').append(pretty(e.getKey()));
+        }
+        mob.speak("I need " + sb + " to finish. Put them in my bag or a chest nearby.");
+    }
+
+    private void finish(BuildJob job, BuildRunner r) {
+        String text = "Build finished! Placed " + r.placed + " blocks."
+                + (r.skipped > 0 ? " " + r.skipped + " spots were skipped (occupied or out of reach)." : "")
+                + (r.blocked > 0 ? " " + r.blocked + " spots are protected." : "");
+        mob.speak("Build finished!");
+        if (mob.getOwner() instanceof ServerPlayer sp) sp.sendSystemMessage(Component.literal("[Companion] " + text));
+        job.cancel();
+    }
+
+    private static String pretty(String id) {
+        return id.substring(id.indexOf(':') + 1).replace('_', ' ');
+    }
+
+    // ------------------------------------------------------------------ the world adapter
+
+    private final class McEnv implements BuildRunner.Env {
+
+        private BlockState state(Blk b) {
+            BuildJob job = mob.blueprint();
+            BlockState s = job.states.get(b);
+            if (s == null && !job.states.containsKey(b)) {
+                s = BlkState.toState(b);
+                job.states.put(b, s);
+            }
+            return s;
+        }
+
+        @Override
+        public BuildRunner.Inspect inspect(int x, int y, int z, Blk want) {
+            BlockPos pos = new BlockPos(x, y, z);
+            if (!level.hasChunkAt(pos)) return BuildRunner.Inspect.UNLOADED;
+            BlockState ws = state(want);
+            if (ws == null) return BuildRunner.Inspect.OCCUPIED;                 // unknown block: skip it
+            BlockState there = level.getBlockState(pos);
+            if (there.getBlock() == ws.getBlock()) return BuildRunner.Inspect.ALREADY;
+            if (!overwritable(there)) return BuildRunner.Inspect.OCCUPIED;
+            if (!CompanionProtection.canModify(level, mob, pos)) return BuildRunner.Inspect.PROTECTED;
+            List<LivingEntity> inside = level.getEntitiesOfClass(LivingEntity.class, new AABB(pos));
+            if (!inside.isEmpty()) {
+                if (inside.contains(mob)) relocate(pos);                         // never entomb ourselves
+                return BuildRunner.Inspect.ENTITY;
+            }
+            return BuildRunner.Inspect.FREE;
+        }
+
+        @Override
+        public boolean creative() {
+            return mob.getOwner() instanceof Player p && p.isCreative();
+        }
+
+        @Override public String itemId(Blk b) { return BlkState.itemId(b); }
+        @Override public int have(String itemId) { return supply.have(itemId); }
+        @Override public void take(String itemId, int count) { supply.take(itemId, count); }
+
+        @Override
+        public BuildRunner.Reach reach(int x, int y, int z) {
+            BlockPos pos = new BlockPos(x, y, z);
+            long key = pos.asLong();
+            if (key != lastTarget) {
+                lastTarget = key;
+                moveTicks = 0;
+                standTarget = null;
+            }
+            if (mob.distanceToSqr(x + 0.5, y + 0.5, z + 0.5) <= REACH * REACH) return BuildRunner.Reach.IN_REACH;
+            if (++moveTicks > 200) return BuildRunner.Reach.GAVE_UP;
+            if (standTarget == null) standTarget = findStand(pos);
+            if (standTarget == null) {
+                mob.getNavigation().moveTo(x + 0.5, y, z + 0.5, 1.15);          // nothing safe nearby: just walk toward it
+                return BuildRunner.Reach.MOVING;
+            }
+            boolean far = Math.abs(standTarget.getY() - mob.getY()) > 2.0 || mob.distanceToSqr(Vec3.atCenterOf(standTarget)) > 32 * 32;
+            if (far || moveTicks > 60) {
+                hopTo(standTarget);                                              // too high / too far / stuck: hop there
+            } else {
+                mob.getNavigation().moveTo(standTarget.getX() + 0.5, standTarget.getY(), standTarget.getZ() + 0.5, 1.2);
+            }
+            return BuildRunner.Reach.MOVING;
+        }
+
+        @Override
+        public void place(int x, int y, int z, Blk want) {
+            BlockState ws = state(want);
+            if (ws == null) return;
+            level.setBlock(new BlockPos(x, y, z), ws, 3);
+            mob.swing(InteractionHand.MAIN_HAND);
+        }
+    }
+
+    /** Natural, soft or replaceable terrain may be overwritten; anything the player built may not. */
+    private static boolean overwritable(BlockState s) {
+        return s.isAir() || s.canBeReplaced() || s.is(BlockTags.DIRT) || s.is(BlockTags.SAND)
+                || s.is(BlockTags.BASE_STONE_OVERWORLD) || s.is(BlockTags.LEAVES);
+    }
+
+    private void hopTo(BlockPos p) {
+        mob.getNavigation().stop();
+        mob.setPos(p.getX() + 0.5, p.getY(), p.getZ() + 0.5);                    // 26.1-CHECK: Entity.setPos(double,double,double)
+        mob.setDeltaMovement(Vec3.ZERO);
+    }
+
+    private void relocate(BlockPos around) {
+        BlockPos s = findStand(around);
+        if (s != null) hopTo(s);
+    }
+
+    /**
+     * A place to stand within ~3 blocks of the target: feet and head free, solid ground below, and NOT one of the
+     * cells that will become part of the building (so the builder never walls itself in).
+     */
+    private BlockPos findStand(BlockPos target) {
+        Set<Long> cells = mob.blueprint().cells;
+        BlockPos best = null;
+        double bestScore = Double.MAX_VALUE;
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -3; dx <= 3; dx++) {
+                for (int dz = -3; dz <= 3; dz++) {
+                    BlockPos c = target.offset(dx, dy, dz);
+                    if (cells.contains(c.asLong()) || cells.contains(c.above().asLong())) continue;
+                    if (!passable(c) || !passable(c.above())) continue;
+                    BlockPos below = c.below();
+                    if (passable(below) || !level.getFluidState(below).isEmpty()) continue;
+                    double score = c.distSqr(target) + 0.05 * c.distSqr(mob.blockPosition());
+                    if (score < bestScore) {
+                        bestScore = score;
+                        best = c.immutable();
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    private boolean passable(BlockPos p) {
+        return level.getBlockState(p).getCollisionShape(level, p).isEmpty() && level.getFluidState(p).isEmpty();
+    }
 }
 ```
 
@@ -6852,6 +7286,117 @@ public class CompanionWanderGoal extends Goal {
 }
 ```
 
+## common\src\main\java\com\example\companionmod\entity\BlueprintSupply.java
+
+```java
+package com.example.companionmod.entity;
+
+import com.example.companionmod.build.BlkState;
+import net.minecraft.core.BlockPos;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.Container;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.entity.BarrelBlockEntity;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.ChestBlockEntity;
+import net.minecraft.world.level.block.entity.ShulkerBoxBlockEntity;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Where a build gets its blocks: the companion's bag first, then chests / barrels / shulker boxes within
+ * {@link #RADIUS} blocks of the build site. Counts are cached (re-counted every second) so the build loop can ask
+ * "do I have 3 spruce stairs?" hundreds of times per tick without walking every slot.
+ */
+public final class BlueprintSupply {
+    private static final int RADIUS = 10, HEIGHT = 6, RESCAN_CONTAINERS_TICKS = 100, RECOUNT_TICKS = 20;
+
+    private final CompanionEntity mob;
+    private final List<BlockEntity> containers = new ArrayList<>();
+    private final Map<String, Integer> counts = new HashMap<>();
+    private BlockPos center = BlockPos.ZERO;
+    private boolean scanned, dirty = true;
+    private long scannedAt, countedAt;
+
+    public BlueprintSupply(CompanionEntity mob) { this.mob = mob; }
+
+    public void setCenter(BlockPos c) {
+        center = c;
+        scanned = false;
+        dirty = true;
+    }
+
+    /** Call once per tick before asking for counts. */
+    public void beginTick(ServerLevel level) {
+        long now = level.getGameTime();
+        if (!scanned || now - scannedAt >= RESCAN_CONTAINERS_TICKS) {
+            scanned = true;
+            scannedAt = now;
+            containers.clear();
+            for (BlockPos p : BlockPos.betweenClosed(center.offset(-RADIUS, -HEIGHT, -RADIUS), center.offset(RADIUS, HEIGHT, RADIUS))) {
+                if (!level.hasChunkAt(p)) continue;        // 26.1-CHECK: Level.hasChunkAt(BlockPos)
+                BlockEntity be = level.getBlockEntity(p);
+                if (be instanceof ChestBlockEntity || be instanceof BarrelBlockEntity || be instanceof ShulkerBoxBlockEntity) {
+                    containers.add(be);
+                }
+            }
+            dirty = true;
+        }
+        if (dirty || now - countedAt >= RECOUNT_TICKS) {
+            countedAt = now;
+            dirty = false;
+            counts.clear();
+            for (int i = CompanionEntity.MAIN_START; i < CompanionEntity.MAIN_START + CompanionEntity.MAIN_SIZE; i++) add(mob.storage().getItem(i));
+            for (BlockEntity be : containers) {
+                if (be.isRemoved() || !(be instanceof Container c)) continue;
+                for (int i = 0; i < c.getContainerSize(); i++) add(c.getItem(i));
+            }
+        }
+    }
+
+    private void add(ItemStack s) {
+        if (!s.isEmpty()) counts.merge(BlkState.itemId(s.getItem()), s.getCount(), Integer::sum);
+    }
+
+    public int have(String itemId) { return counts.getOrDefault(itemId, 0); }
+
+    /** Fresh copy of everything available (bag + chests), keyed by item id. */
+    public Map<String, Integer> snapshot() { return new HashMap<>(counts); }
+
+    /** Removes {@code n} of the item: bag first, then chests. Only decrements what was actually available. */
+    public void take(String itemId, int n) {
+        int taken = 0;
+        while (taken < n && takeOne(itemId)) taken++;
+        if (taken > 0) counts.merge(itemId, -taken, Integer::sum);
+    }
+
+    private boolean takeOne(String itemId) {
+        for (int i = CompanionEntity.MAIN_START; i < CompanionEntity.MAIN_START + CompanionEntity.MAIN_SIZE; i++) {
+            ItemStack s = mob.storage().getItem(i);
+            if (!s.isEmpty() && BlkState.itemId(s.getItem()).equals(itemId)) {
+                mob.storage().removeItem(i, 1);
+                return true;
+            }
+        }
+        for (BlockEntity be : containers) {
+            if (be.isRemoved() || !(be instanceof Container c)) continue;
+            for (int i = 0; i < c.getContainerSize(); i++) {
+                ItemStack s = c.getItem(i);
+                if (!s.isEmpty() && BlkState.itemId(s.getItem()).equals(itemId)) {
+                    c.removeItem(i, 1);
+                    c.setChanged();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+}
+```
+
 ## common\src\main\java\com\example\companionmod\entity\CompanionEntity.java
 
 ```java
@@ -6872,6 +7417,7 @@ import com.example.companionmod.entity.ai.CompanionTargetGoal;
 import com.example.companionmod.entity.ai.CompanionWanderGoal;
 import com.example.companionmod.entity.plan.CompanionPlanner;
 import com.example.companionmod.entity.task.MineTask;
+import com.example.companionmod.entity.task.BuildJob;
 import com.example.companionmod.inventory.CompanionInventoryMenu;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -7071,6 +7617,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         goalSelector.addGoal(2, new CompanionMeleeGoal(this, 1.25, true));   // + creeper hit-and-run (attack - retreat - attack)
         seekGoal = new com.example.companionmod.entity.ai.CompanionSeekBlockGoal(this);
         goalSelector.addGoal(2, seekGoal);                           // explicit "find diamonds" pre-empts walking
+        goalSelector.addGoal(3, new com.example.companionmod.entity.ai.CompanionBlueprintGoal(this));   // beats farm/wander/patrol (4)
         goalSelector.addGoal(3, new CompanionPickupGoal(this));      // explicit "pick this up" pre-empts walking
         goalSelector.addGoal(4, new CompanionFarmGoal(this));
         goalSelector.addGoal(4, new CompanionPlantGoal(this));        // time-boxed jobs (farm / fish / build)
@@ -7114,6 +7661,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         out.putBoolean("Pickup", isPickupEnabled());
         out.putString("PickupFilter", pickupFilter);
         mineTask.save(out);
+        blueprint.save(out);
         out.store("Storage", ItemStack.OPTIONAL_CODEC.listOf(), storage.getItems());
         out.putBoolean("Injured", isInjured());
         out.putInt("InjuredLeft", injuredLeftTicks);
@@ -7135,6 +7683,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         setPickupEnabled(in.getBooleanOr("Pickup", false));
         pickupFilter = in.getStringOr("PickupFilter", "");
         mineTask.load(in);
+        blueprint.load(in);
         in.read("Storage", ItemStack.OPTIONAL_CODEC.listOf()).ifPresent(list -> {
             for (int i = 0; i < Math.min(list.size(), storage.getContainerSize()); i++) {
                 storage.setItem(i, list.get(i));
@@ -7192,6 +7741,21 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     public String buildSchematic() { return buildSchematic; }
     /** Clears the current build job (called by the build goal when it finishes). */
     public void clearBuild() { buildSchematic = ""; }
+
+    // ------------------------------------------------------------------ blueprint build job
+
+    private final BuildJob blueprint = new BuildJob();      // "build this design" job, saved with the entity
+
+    public BuildJob blueprint() { return blueprint; }
+
+    public void startBlueprint(String label, String type, String data, BlockPos corner, int turns, boolean mirror, String subs) {
+        clearSeekBlock();
+        blueprint.start(label, type, data, corner.getX(), corner.getY(), corner.getZ(), turns, mirror, subs);
+        setAnchor(corner);
+        speak("Building " + label + ".");
+    }
+
+    public void cancelBlueprint() { blueprint.cancel(); getNavigation().stop(); }
 
     public String seekBlock() { return mineTask.exists() ? mineTask.blockId : ""; }
     /** Starts (or restarts) a mining job; a blank id cancels it. Re-issuing the SAME id never resets progress. */
@@ -7367,6 +7931,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
                 // Resume whatever was interrupted: a paused AI plan first, then a stuck/paused mining job,
                 // then (last resort) the last plan JSON the model gave us.
                 if (planner.resume(tickCount)) speak("Continuing the plan.");
+                else if (blueprint.exists() && blueprint.paused) { blueprint.resume(); speak("Back to building."); }
                 else if (mineTask().running() || mineTask().resume()) speak("Back to work.");
                 else if (!lastPlanJson.isBlank() && planner.accept(lastPlanJson, this, tickCount)) speak("Restarting the plan.");
                 else speak("There is nothing to continue.");
@@ -7395,9 +7960,13 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
                 fishUntil = level().getGameTime() + 600; setAnchor(blockPosition()); speak("Going fishing.");
             }
             case BUILD -> {
-                String name = target == null ? "" : target.trim().toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9_\\-]", "_");
-                if (name.isEmpty()) speak("Build what? Give me a schematic name.");
-                else { clearSeekBlock(); buildSchematic = name; setAnchor(blockPosition()); speak("Building " + name + "."); }
+                String raw = target == null ? "" : target.trim();
+                String name = raw.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9_\\-]", "_");
+                if (raw.isEmpty()) speak("Build what? Describe it, or open Work > Build.");
+                else if (from != null && com.example.companionmod.world.BuildManager.startFromText(from, raw)) {
+                    clearSeekBlock();
+                    speak("Let me plan that.");
+                } else { clearSeekBlock(); buildSchematic = name; setAnchor(blockPosition()); speak("Building " + name + "."); }
             }
             case REMEMBER, FORGET -> { /* handled client-side by CompanionMemory */ }
             default -> { }
@@ -7424,6 +7993,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         plantUntil = 0;
         fishUntil = 0;
         clearBuild();
+        blueprint.pause();      // STOP pauses the build (blocks stay); "continue" resumes; /cbuild cancel discards
         forcedTarget = null;
         forcedTargetUntil = 0;
         setStance(Stance.PASSIVE);
@@ -8251,6 +8821,9 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             if (!claimRegistry()) return;       // stale duplicate: it dropped its bag and removed itself
         }
         if (tickCount % 10 == 0) refreshTaskText();
+        if (tickCount % 5 == 0 && getOwner() instanceof ServerPlayer sp) {
+            com.example.companionmod.world.BuildManager.tick(sp);   // aim-following preview outline while a design is pending
+        }
         // Combat chaining bookkeeping: when our target dies, open a window in which chooseTarget keeps
         // picking the next nearby hostile (wider radius, no "must be attacking us" filter) instead of
         // wandering back to the owner between kills.
@@ -8402,6 +8975,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         } else if (plantUntil > now) s = "Planting";
         else if (farmUntil > now) s = "Farming";
         else if (fishUntil > now) s = "Fishing";
+        else if (blueprint.exists()) s = blueprint.describe();
         else if (!buildSchematic.isBlank()) s = "Building";
         if (!s.equals(entityData.get(DATA_TASK))) entityData.set(DATA_TASK, s);
     }
@@ -8822,6 +9396,120 @@ public interface PlanActions {
 }
 ```
 
+## common\src\main\java\com\example\companionmod\entity\task\BuildJob.java
+
+```java
+package com.example.companionmod.entity.task;
+
+import com.example.companionmod.build.Blk;
+import com.example.companionmod.build.BuildPlan;
+import com.example.companionmod.build.BuildRunner;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.storage.ValueInput;
+import net.minecraft.world.level.storage.ValueOutput;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * The companion's current "build this design" job, saved with the entity like MineTask. Only the SOURCE is saved
+ * (the design spec JSON or the .nbt file name, plus where / how it is placed and which materials were swapped),
+ * never the block list: after a reload the plan is regenerated and the sweep simply skips what is already built.
+ */
+public final class BuildJob {
+    public String type = "";          // "spec" | "file"; blank = no job
+    public String data = "";          // spec JSON or file name
+    public String label = "", subs = "";
+    public int cx, cy, cz, turns, placedTotal;
+    public boolean mirror, paused;
+
+    // transient, rebuilt by BuildSources.prepare
+    public List<BuildPlan.Placement> list = new ArrayList<>();
+    public final Set<Long> cells = new HashSet<>();
+    public final Map<Blk, BlockState> states = new HashMap<>();
+    public BuildRunner runner;
+    public int sx, sy, sz;
+    public String error = "";
+
+    public boolean exists() { return !type.isEmpty(); }
+    public boolean running() { return exists() && !paused; }
+    public BlockPos corner() { return new BlockPos(cx, cy, cz); }
+    public BlockPos center() { return new BlockPos(cx + sx / 2, cy, cz + sz / 2); }
+
+    public void start(String label, String type, String data, int cx, int cy, int cz, int turns, boolean mirror, String subs) {
+        cancel();
+        this.label = label;
+        this.type = type;
+        this.data = data;
+        this.cx = cx;
+        this.cy = cy;
+        this.cz = cz;
+        this.turns = turns;
+        this.mirror = mirror;
+        this.subs = subs == null ? "" : subs;
+    }
+
+    public void pause() { if (exists()) paused = true; }
+    public boolean resume() { if (!exists()) return false; paused = false; return true; }
+
+    public void cancel() {
+        type = "";
+        data = "";
+        label = "";
+        subs = "";
+        paused = false;
+        placedTotal = 0;
+        list = new ArrayList<>();
+        cells.clear();
+        states.clear();
+        runner = null;
+        error = "";
+    }
+
+    public String describe() {
+        String n = label.isBlank() ? "build" : label;
+        if (paused) return "Build paused (" + n + ") || say 'continue'";
+        return runner == null ? "Building " + n : "Building " + n + " " + runner.percent() + "%";
+    }
+
+    public void save(ValueOutput out) {
+        if (!exists()) return;
+        out.putString("BpType", type);
+        out.putString("BpData", data);
+        out.putString("BpLabel", label);
+        out.putString("BpSubs", subs);
+        out.putInt("BpX", cx);
+        out.putInt("BpY", cy);
+        out.putInt("BpZ", cz);
+        out.putInt("BpTurns", turns);
+        out.putBoolean("BpMirror", mirror);
+        out.putBoolean("BpPaused", paused);
+        out.putInt("BpPlaced", placedTotal);
+    }
+
+    public void load(ValueInput in) {
+        type = in.getStringOr("BpType", "");
+        data = in.getStringOr("BpData", "");
+        label = in.getStringOr("BpLabel", "");
+        subs = in.getStringOr("BpSubs", "");
+        cx = in.getIntOr("BpX", 0);
+        cy = in.getIntOr("BpY", 0);
+        cz = in.getIntOr("BpZ", 0);
+        turns = in.getIntOr("BpTurns", 0);
+        mirror = in.getBooleanOr("BpMirror", false);
+        paused = in.getBooleanOr("BpPaused", false);
+        placedTotal = in.getIntOr("BpPlaced", 0);
+        runner = null;
+        if (type.isEmpty() || data.isEmpty()) type = "";
+    }
+}
+```
+
 ## common\src\main\java\com\example\companionmod\entity\task\MineTask.java
 
 ```java
@@ -9098,6 +9786,40 @@ public class CompanionInventoryMenu extends AbstractContainerMenu {
 }
 ```
 
+## common\src\main\java\com\example\companionmod\net\BuildOp.java
+
+```java
+package com.example.companionmod.net;
+
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+/**
+ * Build requests ride on the EXISTING CommandPayload (action = ACTION, target = a small JSON object), so no new
+ * packet type has to be registered in either loader. The server intercepts ACTION in CommandHandler.
+ */
+public final class BuildOp {
+    private BuildOp() {}
+
+    public static final String ACTION = "build_op";
+
+    /** @param specJson output of SpecParser.toJson (about 300-400 chars) */
+    public static String spec(String specJson) {
+        JsonObject o = new JsonObject();
+        o.addProperty("op", "spec");
+        o.add("spec", JsonParser.parseString(specJson));
+        return o.toString();
+    }
+
+    public static String file(String name) {
+        JsonObject o = new JsonObject();
+        o.addProperty("op", "file");
+        o.addProperty("name", name);
+        return o.toString();
+    }
+}
+```
+
 ## common\src\main\java\com\example\companionmod\net\CommandHandler.java
 
 ```java
@@ -9136,6 +9858,10 @@ public final class CommandHandler {
     private CommandHandler() {}
 
     public static void handle(ServerPlayer player, CommandPayload payload) {
+        if (BuildOp.ACTION.equals(payload.action())) {          // build design/import: BuildManager has its own rate limit
+            com.example.companionmod.world.BuildManager.handlePacket(player, payload.target());
+            return;
+        }
         CompanionCommand cmd = CompanionCommand.parse(payload.action());
         // STOP is an emergency control, not optional background work. Never lose it to the token bucket.
         if (cmd != CompanionCommand.STOP) {
@@ -9421,6 +10147,103 @@ public class AudioRecorder {
             e.printStackTrace();
             return new byte[0];
         }
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\voice\BuildSpecBackend.java
+
+```java
+package com.example.companionmod.voice;
+
+import com.example.companionmod.build.BuildSpecSchema;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+
+/**
+ * Asks the local model for a BuildSpec (a few small, bounded choices; never coordinates). Mirrors PlanningBackend:
+ * same host/model/timeouts, OpenAI-compatible endpoint, blocking (call from a worker thread).
+ * Tries strict JSON-schema output first, then plain json_object, then no format; SpecParser copes with anything.
+ */
+public final class BuildSpecBackend {
+    private static final class HttpStatus extends IOException {
+        final int status;
+        HttpStatus(int status, String body) { super("Ollama HTTP " + status + ": " + (body.length() > 120 ? body.substring(0, 120) : body)); this.status = status; }
+    }
+
+    private enum Mode { SCHEMA, JSON_OBJECT, PLAIN }
+
+    private final VoiceConfig cfg;
+    private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
+
+    public BuildSpecBackend(VoiceConfig cfg) { this.cfg = cfg; }
+
+    /** @return raw model text (ideally one JSON object) */
+    public String design(String request) throws IOException {
+        IOException last = null;
+        for (Mode m : Mode.values()) {
+            try {
+                return post(request, m);
+            } catch (HttpStatus e) {
+                last = e;
+                if (e.status != 400 && e.status != 422) throw e;      // only "format not supported" is worth retrying
+            }
+        }
+        throw last == null ? new IOException("no reply") : last;
+    }
+
+    private String post(String request, Mode mode) throws IOException {
+        JsonObject body = new JsonObject();
+        body.addProperty("model", cfg.chatModel);
+        body.addProperty("stream", false);
+        body.addProperty("temperature", 0.2);
+        body.addProperty("max_tokens", 400);
+        JsonArray msgs = new JsonArray();
+        msgs.add(msg("system", BuildSpecSchema.SYSTEM_PROMPT));
+        msgs.add(msg("user", request));
+        body.add("messages", msgs);
+        if (mode == Mode.SCHEMA) {
+            JsonObject js = new JsonObject();
+            js.addProperty("name", "build_spec");
+            js.addProperty("strict", true);
+            js.add("schema", JsonParser.parseString(BuildSpecSchema.SCHEMA));
+            JsonObject rf = new JsonObject();
+            rf.addProperty("type", "json_schema");
+            rf.add("json_schema", js);
+            body.add("response_format", rf);
+        } else if (mode == Mode.JSON_OBJECT) {
+            JsonObject rf = new JsonObject();
+            rf.addProperty("type", "json_object");
+            body.add("response_format", rf);
+        }
+        try {
+            HttpResponse<String> r = http.send(HttpRequest.newBuilder(URI.create(cfg.host + "/v1/chat/completions"))
+                    .timeout(Duration.ofSeconds(cfg.timeoutSeconds)).header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(body.toString())).build(), HttpResponse.BodyHandlers.ofString());
+            if (r.statusCode() != 200) throw new HttpStatus(r.statusCode(), r.body());
+            return JsonParser.parseString(r.body()).getAsJsonObject().getAsJsonArray("choices").get(0)
+                    .getAsJsonObject().getAsJsonObject("message").get("content").getAsString();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted");
+        } catch (RuntimeException e) {
+            throw new IOException("Unexpected reply from Ollama");
+        }
+    }
+
+    private static JsonObject msg(String role, String content) {
+        JsonObject o = new JsonObject();
+        o.addProperty("role", role);
+        o.addProperty("content", content);
+        return o;
     }
 }
 ```
@@ -10486,7 +11309,7 @@ public final class PlanningBackend {
           .append("seek_block (arg = a VANILLA BLOCK ID such as oak_log, log, stone, cobblestone, coal_ore, iron_ore, diamond_ore - use it whenever the task is 'get wood/stone/coal/diamonds'; never a colloquial word); ")
           .append("pickup (arg = optional item name; ONLY for items already dropped on the ground); ")
           .append("farm (harvests ripe crops nearby); fish (fishes at nearby water); plant (arg = sapling name such as birch_sapling; plants saplings from the bag on nearby soil; use pickup first only if saplings lie on the ground); ")
-          .append("build (arg = schematic name, places it from the schematics folder); say (arg = one short in-character sentence); wait (seconds).\n")
+          .append("build (arg = a short description such as \"stone tower\", or a schematic file name); say (arg = one short in-character sentence); wait (seconds).\n")
           .append("Ground choices in observations: use pickup only for listed drops, attack/hunt only for listed hostiles, seek_block only for a requested resource (an exact observed block ID is best), and avoid repeating an already active task. The executor will navigate, switch tools, swing, collect drops, fight and speak; do not output code or pretend unsupported actions exist.\n")
           .append("Reply with ONE JSON object and nothing else: {\"goal\":\"get wood\",\"steps\":[{\"op\":\"seek_block\",\"arg\":\"log\",\"seconds\":90},{\"op\":\"come\",\"arg\":\"\",\"seconds\":10}]}\n");
         if (auto) {
@@ -11370,6 +12193,612 @@ public final class WavUtil {
 }
 ```
 
+## common\src\main\java\com\example\companionmod\world\BuildCommands.java
+
+```java
+package com.example.companionmod.world;
+
+import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.arguments.BoolArgumentType;
+import com.mojang.brigadier.context.CommandContext;
+import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.commands.Commands;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerPlayer;
+
+import java.util.function.Consumer;
+
+/**
+ * /cbuild rotate | mirror | up | down | place | cancel | info | stop | resume | subst <true|false>
+ * Open to every player (the clickable chat buttons run these), unlike the op-only /companion tree.
+ * Register with BuildCommands.register(dispatcher) from ModCommands.register.
+ */
+public final class BuildCommands {
+    private BuildCommands() {}
+
+    public static void register(CommandDispatcher<CommandSourceStack> d) {
+        d.register(Commands.literal("cbuild")
+                .then(Commands.literal("rotate").executes(c -> run(c, BuildManager::rotate)))
+                .then(Commands.literal("mirror").executes(c -> run(c, BuildManager::mirror)))
+                .then(Commands.literal("up").executes(c -> run(c, p -> BuildManager.shift(p, 1))))
+                .then(Commands.literal("down").executes(c -> run(c, p -> BuildManager.shift(p, -1))))
+                .then(Commands.literal("place").executes(c -> run(c, BuildManager::place)))
+                .then(Commands.literal("cancel").executes(c -> run(c, BuildManager::cancel)))
+                .then(Commands.literal("info").executes(c -> run(c, BuildManager::info)))
+                .then(Commands.literal("stop").executes(c -> run(c, BuildManager::stop)))
+                .then(Commands.literal("resume").executes(c -> run(c, BuildManager::resume)))
+                .then(Commands.literal("subst")
+                        .then(Commands.argument("on", BoolArgumentType.bool())
+                                .executes(c -> {
+                                    boolean on = BoolArgumentType.getBool(c, "on");
+                                    return run(c, p -> BuildManager.substitute(p, on));
+                                }))));
+    }
+
+    private static int run(CommandContext<CommandSourceStack> ctx, Consumer<ServerPlayer> action) {
+        try {
+            action.accept(ctx.getSource().getPlayerOrException());
+            return 1;
+        } catch (Exception e) {
+            ctx.getSource().sendFailure(Component.literal("Run this as a player."));
+            return 0;
+        }
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\world\BuildManager.java
+
+```java
+package com.example.companionmod.world;
+
+import com.example.companionmod.build.BlkState;
+import com.example.companionmod.build.BuildSpec;
+import com.example.companionmod.build.Schematic;
+import com.example.companionmod.build.SpecParser;
+import com.example.companionmod.build.Substitution;
+import com.example.companionmod.build.Transform;
+import com.example.companionmod.entity.BlueprintSupply;
+import com.example.companionmod.entity.CompanionEntity;
+import com.example.companionmod.entity.CompanionProtection;
+import com.example.companionmod.net.BuildOp;
+import com.example.companionmod.registry.ModContent;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import net.minecraft.ChatFormatting;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.particles.ParticleOptions;
+import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.network.chat.ClickEvent;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+import java.util.TreeMap;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Server side of the build feature.
+ *
+ * Flow: a design arrives (generator spec from the client's AI call, an .nbt file name, or a voice order) and
+ * becomes the player's PENDING design. While it is pending, an outline of its footprint follows where the player
+ * is looking (particles, so no client rendering code and it works on both loaders). The player rotates / mirrors /
+ * raises it with the clickable /cbuild controls and finally presses [Place], which checks the materials, applies
+ * material swaps and hands a BuildJob to the companion.
+ */
+public final class BuildManager {
+    private BuildManager() {}
+
+    private static final int MAX_DISTANCE = 160;
+    private static final int PENDING_TTL_TICKS = 20 * 60 * 10;
+
+    private static final Map<UUID, Pending> PENDING = new ConcurrentHashMap<>();
+    private static final Map<UUID, Long> LAST_OP = new ConcurrentHashMap<>();
+
+    private static final class Pending {
+        final String label, type, data;
+        final Schematic base;
+        final boolean hasFront;
+        final int created;
+        int turns = -1;                 // -1 = choose so the front faces the player
+        boolean mirror, substitute = true;
+        int dy;
+        BlockPos anchor;
+        int lastDraw = -100;
+        private Schematic cache;
+        private int cacheTurns = -2;
+        private boolean cacheMirror;
+
+        Pending(String label, String type, String data, Schematic base, int created) {
+            this.label = label;
+            this.type = type;
+            this.data = data;
+            this.base = base;
+            this.hasFront = "spec".equals(type);
+            this.created = created;
+        }
+
+        Schematic transformed() {
+            if (cache == null || cacheTurns != turns || cacheMirror != mirror) {
+                cache = Transform.apply(base, Math.max(0, turns), mirror);
+                cacheTurns = turns;
+                cacheMirror = mirror;
+            }
+            return cache;
+        }
+    }
+
+    // ------------------------------------------------------------------ incoming design (packet / voice)
+
+    /** Called from CommandHandler for action "build_op". The client is untrusted: everything is re-validated. */
+    public static void handlePacket(ServerPlayer p, String json) {
+        long now = System.currentTimeMillis();
+        Long last = LAST_OP.put(p.getUUID(), now);
+        if (last != null && now - last < 400) return;
+        JsonObject o;
+        try {
+            o = JsonParser.parseString(json).getAsJsonObject();
+        } catch (RuntimeException e) {
+            return;
+        }
+        String op = o.has("op") && o.get("op").isJsonPrimitive() ? o.get("op").getAsString() : "";
+        switch (op) {
+            case "spec" -> {
+                JsonElement se = o.get("spec");
+                if (se == null || !se.isJsonObject()) { tell(p, "That design was empty."); return; }
+                begin(p, "spec", se.toString());
+            }
+            case "file" -> begin(p, "file", o.has("name") && o.get("name").isJsonPrimitive() ? o.get("name").getAsString() : "");
+            default -> { }
+        }
+    }
+
+    /**
+     * "build a stone tower" by voice / plan step. Returns false when the words name an old JSON schematic, so the
+     * existing CompanionBuildGoal keeps handling those.
+     */
+    public static boolean startFromText(ServerPlayer p, String text) {
+        String name = BuildSources.sanitize(text);
+        if (BuildSources.hasFile(name)) { begin(p, "file", name); return true; }
+        if (BuildSources.hasLegacyJson(name)) return false;
+        BuildSpec spec = SpecParser.heuristic(text);
+        begin(p, "spec", SpecParser.toJson(spec));
+        return true;
+    }
+
+    private static void begin(ServerPlayer p, String type, String data) {
+        BuildSources.Loaded l = BuildSources.load(type, data);
+        if (l.schematic() == null) { tell(p, l.error()); return; }
+        Pending pd = new Pending(l.label(), type, l.data(), l.schematic(), p.tickCount);
+        PENDING.put(p.getUUID(), pd);
+        Schematic base = pd.base.normalized();
+        MutableComponent m = Component.literal("[Build] " + pd.label + ": " + base.sizeX() + "x" + base.sizeY() + "x" + base.sizeZ()
+                + ", " + base.count() + " blocks. Look at the spot: an outline follows your aim. ");
+        m.append(controls());
+        p.sendSystemMessage(m);
+    }
+
+    // ------------------------------------------------------------------ preview (called from the companion's tick)
+
+    public static void tick(ServerPlayer p) {
+        Pending pd = PENDING.get(p.getUUID());
+        if (pd == null) return;
+        if (p.tickCount - pd.created > PENDING_TTL_TICKS) {
+            PENDING.remove(p.getUUID());
+            tell(p, "The design expired.");
+            return;
+        }
+        if (p.tickCount - pd.lastDraw < 8) return;
+        pd.lastDraw = p.tickCount;
+        if (!(p.level() instanceof ServerLevel level)) return;
+        if (pd.turns < 0) pd.turns = autoTurns(p);
+        HitResult hit = p.pick(30.0, 1.0f, false);                                // 26.1-CHECK: Entity.pick(double,float,boolean)
+        if (hit instanceof BlockHitResult bh && bh.getType() == HitResult.Type.BLOCK) pd.anchor = bh.getBlockPos().immutable();
+        if (pd.anchor == null) return;
+        drawOutline(level, pd);
+    }
+
+    private static final Direction[] CW = {Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST};
+
+    /** The generators put the door on the north face; rotate so it faces the player. */
+    private static int autoTurns(ServerPlayer p) {
+        Direction front = p.getDirection().getOpposite();
+        for (int i = 0; i < 4; i++) if (CW[i] == front) return i;
+        return 0;
+    }
+
+    private static BlockPos corner(Pending pd, Schematic t) {
+        return new BlockPos(pd.anchor.getX() - t.sizeX() / 2, pd.anchor.getY() + pd.dy, pd.anchor.getZ() - t.sizeZ() / 2);
+    }
+
+    private static void drawOutline(ServerLevel level, Pending pd) {
+        Schematic t = pd.transformed();
+        BlockPos c = corner(pd, t);
+        double x0 = c.getX(), y0 = c.getY(), z0 = c.getZ();
+        double x1 = x0 + t.sizeX(), y1 = y0 + t.sizeY(), z1 = z0 + t.sizeZ();
+        double step = Math.max(1.0, 4.0 * (t.sizeX() + t.sizeY() + t.sizeZ()) / 300.0);
+        ParticleOptions pt = ParticleTypes.END_ROD;
+        for (double[] e : new double[][]{
+                {x0, y0, z0, x1, y0, z0}, {x0, y0, z1, x1, y0, z1}, {x0, y1, z0, x1, y1, z0}, {x0, y1, z1, x1, y1, z1},
+                {x0, y0, z0, x0, y0, z1}, {x1, y0, z0, x1, y0, z1}, {x0, y1, z0, x0, y1, z1}, {x1, y1, z0, x1, y1, z1},
+                {x0, y0, z0, x0, y1, z0}, {x1, y0, z0, x1, y1, z0}, {x0, y0, z1, x0, y1, z1}, {x1, y0, z1, x1, y1, z1}}) {
+            line(level, pt, e[0], e[1], e[2], e[3], e[4], e[5], step);
+        }
+        if (pd.hasFront) {                                                        // green marker = the door side
+            Direction f = CW[Math.floorMod(pd.turns, 4)];
+            double mx = f == Direction.EAST ? x1 : f == Direction.WEST ? x0 : (x0 + x1) / 2;
+            double mz = f == Direction.SOUTH ? z1 : f == Direction.NORTH ? z0 : (z0 + z1) / 2;
+            for (int i = 0; i < 4; i++) level.sendParticles(ParticleTypes.HAPPY_VILLAGER, mx, y0 + 0.5 + i * 0.6, mz, 1, 0, 0, 0, 0.0);
+        }
+    }
+
+    private static void line(ServerLevel l, ParticleOptions pt, double x0, double y0, double z0, double x1, double y1, double z1, double step) {
+        double len = Math.max(Math.abs(x1 - x0), Math.max(Math.abs(y1 - y0), Math.abs(z1 - z0)));
+        int n = (int) Math.max(1, Math.ceil(len / step));
+        for (int i = 0; i <= n; i++) {
+            double f = (double) i / n;
+            l.sendParticles(pt, x0 + (x1 - x0) * f, y0 + (y1 - y0) * f, z0 + (z1 - z0) * f, 1, 0, 0, 0, 0.0);   // 26.1-CHECK: sendParticles(options,x,y,z,count,dx,dy,dz,speed)
+        }
+    }
+
+    // ------------------------------------------------------------------ controls (/cbuild ...)
+
+    public static void rotate(ServerPlayer p) {
+        Pending pd = need(p);
+        if (pd == null) return;
+        if (pd.turns < 0) pd.turns = autoTurns(p);
+        pd.turns = (pd.turns + 1) & 3;
+        pd.lastDraw = -100;
+        tell(p, "Rotated.");
+    }
+
+    public static void mirror(ServerPlayer p) {
+        Pending pd = need(p);
+        if (pd == null) return;
+        pd.mirror = !pd.mirror;
+        pd.lastDraw = -100;
+        tell(p, "Mirrored.");
+    }
+
+    public static void shift(ServerPlayer p, int dy) {
+        Pending pd = need(p);
+        if (pd == null) return;
+        pd.dy += dy;
+        pd.lastDraw = -100;
+        tell(p, "Height offset " + (pd.dy >= 0 ? "+" : "") + pd.dy + ".");
+    }
+
+    public static void substitute(ServerPlayer p, boolean on) {
+        Pending pd = need(p);
+        if (pd == null) return;
+        pd.substitute = on;
+        tell(p, on ? "I will swap missing materials for similar ones." : "I will only use the exact blocks.");
+    }
+
+    public static void cancel(ServerPlayer p) {
+        boolean had = PENDING.remove(p.getUUID()) != null;
+        CompanionEntity c = ModContent.findCompanion(p.level().getServer(), p.getUUID());
+        if (c != null && c.blueprint().exists()) {
+            c.cancelBlueprint();
+            tell(p, "Build cancelled. Blocks already placed stay.");
+        } else if (had) {
+            tell(p, "Design discarded.");
+        } else {
+            tell(p, "Nothing to cancel.");
+        }
+    }
+
+    public static void stop(ServerPlayer p) {
+        CompanionEntity c = ModContent.findCompanion(p.level().getServer(), p.getUUID());
+        if (c == null || !c.blueprint().exists()) { tell(p, "Your companion is not building."); return; }
+        c.blueprint().pause();
+        c.getNavigation().stop();
+        tell(p, "Build paused. Use /cbuild resume or say continue.");
+    }
+
+    public static void resume(ServerPlayer p) {
+        CompanionEntity c = ModContent.findCompanion(p.level().getServer(), p.getUUID());
+        if (c == null || !c.blueprint().exists()) { tell(p, "Your companion is not building."); return; }
+        c.blueprint().resume();
+        tell(p, "Back to building.");
+    }
+
+    public static void info(ServerPlayer p) {
+        CompanionEntity c = ModContent.findCompanion(p.level().getServer(), p.getUUID());
+        Pending pd = PENDING.get(p.getUUID());
+        if (pd == null) {
+            if (c != null && c.blueprint().exists()) tell(p, "[Build] " + c.blueprint().describe());
+            else tell(p, "[Build] No design. Open the radial menu: Work > Build.");
+            return;
+        }
+        Schematic t = pd.transformed();
+        Map<String, Integer> need = needs(t);
+        tell(p, "[Build] " + pd.label + ": " + t.sizeX() + "x" + t.sizeY() + "x" + t.sizeZ() + ", " + t.count() + " blocks.");
+        Map<String, Integer> have = null;
+        if (c != null && pd.anchor != null) {
+            BlueprintSupply sup = new BlueprintSupply(c);
+            sup.setCenter(corner(pd, t).offset(t.sizeX() / 2, 0, t.sizeZ() / 2));
+            sup.beginTick((ServerLevel) p.level());
+            have = sup.snapshot();
+        }
+        tell(p, "Needs: " + list(need, 8));
+        if (have != null) {
+            Map<String, Integer> short_ = shortage(need, have);
+            tell(p, short_.isEmpty() ? "I have everything." : "Short on: " + list(short_, 8));
+        }
+    }
+
+    // ------------------------------------------------------------------ place
+
+    public static void place(ServerPlayer p) {
+        Pending pd = need(p);
+        if (pd == null) return;
+        if (!(p.level() instanceof ServerLevel level)) return;
+        if (pd.anchor == null) { tell(p, "Look at the ground where it should go first."); return; }
+        CompanionEntity c = ModContent.findCompanion(level.getServer(), p.getUUID());
+        if (c == null) { tell(p, "You have no companion nearby. Activate a Companion Shrine."); return; }
+        if (c.blueprint().exists()) { tell(p, "Your companion is already building. Use /cbuild cancel first."); return; }
+
+        Schematic t = pd.transformed();
+        BlockPos corner = corner(pd, t);
+        if (corner.getY() < level.getMinY() || corner.getY() + t.sizeY() > level.getMaxY()) { tell(p, "That does not fit between the world's bottom and top."); return; }
+        if (corner.distSqr(p.blockPosition()) > (double) MAX_DISTANCE * MAX_DISTANCE) { tell(p, "That is too far away."); return; }
+        if (t.count() > BuildSources.MAX_BLOCKS) { tell(p, "That design is too big."); return; }
+        if (!level.mayInteract(p, corner)) { tell(p, "You are not allowed to build there."); return; }      // 26.1-CHECK
+
+        BlockPos center = corner.offset(t.sizeX() / 2, 0, t.sizeZ() / 2);
+        Map<String, Integer> need = needs(t);
+        BlueprintSupply sup = new BlueprintSupply(c);
+        sup.setCenter(center);
+        sup.beginTick(level);
+        Map<String, Integer> have = sup.snapshot();
+        boolean creative = p.isCreative();
+
+        Map<String, String> remap = new TreeMap<>();
+        Map<String, Integer> missing = new TreeMap<>();
+        if (!creative) {
+            if (pd.substitute) {
+                Substitution.Result r = Substitution.plan(need, have);
+                remap = new TreeMap<>(r.remap());
+                missing = r.missing();
+            } else {
+                missing = shortage(need, have);
+            }
+        }
+
+        c.startBlueprint(pd.label, pd.type, pd.data, corner, Math.max(0, pd.turns), pd.mirror, Substitution.serialize(remap));
+        PENDING.remove(p.getUUID());
+
+        tell(p, "[Build] Starting " + pd.label + " (" + t.count() + " blocks)" + (creative ? " - creative mode, no materials needed." : "."));
+        if (!remap.isEmpty()) {
+            StringBuilder sb = new StringBuilder();
+            for (var e : remap.entrySet()) sb.append(sb.length() > 0 ? ", " : "").append(pretty(e.getKey())).append(" -> ").append(pretty(e.getValue()));
+            tell(p, "Swapping: " + sb);
+        }
+        if (!missing.isEmpty()) {
+            tell(p, "Short on: " + list(missing, 8) + ". I will build what I can, then ask. Put materials in my bag or a chest within 10 blocks.");
+        }
+    }
+
+    // ------------------------------------------------------------------ helpers
+
+    private static Pending need(ServerPlayer p) {
+        Pending pd = PENDING.get(p.getUUID());
+        if (pd == null) tell(p, "No design yet. Open the radial menu: Work > Build.");
+        return pd;
+    }
+
+    /** item id -> count the schematic needs. */
+    private static Map<String, Integer> needs(Schematic t) {
+        Map<String, Integer> m = new TreeMap<>();
+        Map<com.example.companionmod.build.Blk, String> idCache = new HashMap<>();
+        for (var b : t.blocks().values()) {
+            int n = b.itemsNeeded();
+            if (n == 0) continue;
+            String id = idCache.computeIfAbsent(b, BlkState::itemId);
+            if (id != null) m.merge(id, n, Integer::sum);
+        }
+        return m;
+    }
+
+    private static Map<String, Integer> shortage(Map<String, Integer> need, Map<String, Integer> have) {
+        Map<String, Integer> m = new TreeMap<>();
+        for (var e : need.entrySet()) {
+            int d = e.getValue() - have.getOrDefault(e.getKey(), 0);
+            if (d > 0) m.put(e.getKey(), d);
+        }
+        return m;
+    }
+
+    private static String list(Map<String, Integer> m, int max) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        for (var e : m.entrySet()) {
+            if (i++ == max) { sb.append(", +").append(m.size() - max).append(" more"); break; }
+            sb.append(i > 1 ? ", " : "").append(e.getValue()).append(' ').append(pretty(e.getKey()));
+        }
+        return sb.length() == 0 ? "nothing" : sb.toString();
+    }
+
+    private static String pretty(String id) {
+        return id.substring(id.indexOf(':') + 1).replace('_', ' ');
+    }
+
+    private static void tell(ServerPlayer p, String text) {
+        p.sendSystemMessage(Component.literal(text));
+    }
+
+    private static MutableComponent controls() {
+        MutableComponent m = Component.literal("");
+        String[][] b = {{"Rotate", "/cbuild rotate"}, {"Mirror", "/cbuild mirror"}, {"Up", "/cbuild up"}, {"Down", "/cbuild down"},
+                {"Place", "/cbuild place"}, {"Cancel", "/cbuild cancel"}};
+        for (String[] e : b) m.append(button(e[0], e[1])).append(Component.literal(" "));
+        return m;
+    }
+
+    /** 26.1-CHECK: ClickEvent became a set of records in 1.21.5 (ClickEvent.RunCommand). */
+    private static Component button(String label, String command) {
+        return Component.literal("[" + label + "]")
+                .withStyle(s -> s.withClickEvent(new ClickEvent.RunCommand(command)).withColor(ChatFormatting.AQUA));
+    }
+
+    // ------------------------------------------------------------------ lifecycle
+
+    public static void forget(UUID player) {
+        PENDING.remove(player);
+        LAST_OP.remove(player);
+    }
+
+    public static void forgetAll() {
+        PENDING.clear();
+        LAST_OP.clear();
+    }
+
+    /** For tests / the screen: is there a pending design? */
+    public static Optional<String> pendingLabel(UUID player) {
+        Pending pd = PENDING.get(player);
+        return pd == null ? Optional.empty() : Optional.of(pd.label);
+    }
+}
+```
+
+## common\src\main\java\com\example\companionmod\world\BuildSources.java
+
+```java
+package com.example.companionmod.world;
+
+import com.example.companionmod.CompanionMod;
+import com.example.companionmod.build.BlkState;
+import com.example.companionmod.build.BuildPlan;
+import com.example.companionmod.build.BuildSpec;
+import com.example.companionmod.build.Generators;
+import com.example.companionmod.build.Schematic;
+import com.example.companionmod.build.SchematicNbt;
+import com.example.companionmod.build.SpecParser;
+import com.example.companionmod.build.Substitution;
+import com.example.companionmod.build.Transform;
+import com.example.companionmod.entity.task.BuildJob;
+import net.minecraft.core.BlockPos;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
+import java.util.stream.Stream;
+
+/** Loads a design from its saved source: a generator spec (JSON) or an .nbt file in config/companionmod/schematics. */
+public final class BuildSources {
+    private BuildSources() {}
+
+    public static final int MAX_BLOCKS = 40_000;
+    private static final long MAX_FILE_BYTES = 4L * 1024 * 1024;
+
+    /** @param data canonical source (clamped spec JSON, or the sanitised file name) */
+    public record Loaded(Schematic schematic, String error, String data, String label) {
+        static Loaded fail(String msg) { return new Loaded(null, msg, "", ""); }
+    }
+
+    public static Path dir() {
+        return CompanionMod.configDir().resolve("companionmod").resolve("schematics");
+    }
+
+    public static String sanitize(String name) {
+        String s = name == null ? "" : name.trim().replaceAll("(?i)\\.nbt$", "");
+        s = s.replaceAll("[^A-Za-z0-9_\\- ]", "_").trim();
+        return s.length() > 60 ? s.substring(0, 60) : s;
+    }
+
+    /** File names (without .nbt) in the schematics folder, sorted. */
+    public static List<String> listFiles() {
+        Path d = dir();
+        if (!Files.isDirectory(d)) return Collections.emptyList();
+        List<String> out = new ArrayList<>();
+        try (Stream<Path> s = Files.list(d)) {
+            s.filter(Files::isRegularFile).forEach(p -> {
+                String n = p.getFileName().toString();
+                if (n.toLowerCase().endsWith(".nbt")) out.add(n.substring(0, n.length() - 4));
+            });
+        } catch (IOException ignored) { }
+        Collections.sort(out);
+        return out;
+    }
+
+    public static boolean hasFile(String name) {
+        return !name.isBlank() && Files.isRegularFile(dir().resolve(name + ".nbt"));
+    }
+
+    /** The older block-by-block JSON schematics handled by CompanionBuildGoal. */
+    public static boolean hasLegacyJson(String name) {
+        return !name.isBlank() && Files.isRegularFile(dir().resolve(name + ".json"));
+    }
+
+    public static Loaded load(String type, String data) {
+        return "file".equals(type) ? fromFile(data) : fromSpec(data);
+    }
+
+    public static Loaded fromSpec(String specJson) {
+        Optional<BuildSpec> spec = SpecParser.parse(specJson);
+        if (spec.isEmpty()) return Loaded.fail("I could not understand that design.");
+        BuildSpec s = spec.get();
+        Schematic sch = Generators.generate(s, BlkState.POLICY);
+        return new Loaded(sch, "", SpecParser.toJson(s), s.name());
+    }
+
+    public static Loaded fromFile(String rawName) {
+        String name = sanitize(rawName);
+        if (name.isEmpty()) return Loaded.fail("Which schematic file?");
+        Path base = dir().toAbsolutePath().normalize();
+        Path f = base.resolve(name + ".nbt").normalize();
+        if (!f.startsWith(base) || !Files.isRegularFile(f)) {
+            return Loaded.fail("No schematic named " + name + ". Put " + name + ".nbt in config/companionmod/schematics.");
+        }
+        try {
+            if (Files.size(f) > MAX_FILE_BYTES) return Loaded.fail("That schematic file is too big.");
+            Schematic sch = SchematicNbt.read(f);
+            if (sch.count() == 0) return Loaded.fail("That schematic has no blocks.");
+            if (sch.count() > MAX_BLOCKS) return Loaded.fail("That schematic has more than " + MAX_BLOCKS + " blocks.");
+            return new Loaded(sch, "", name, name);
+        } catch (IOException | RuntimeException e) {
+            return Loaded.fail("I could not read " + name + ".nbt.");
+        }
+    }
+
+    /**
+     * Rebuilds the job's transient plan from its saved source: load, mirror/rotate, apply the saved material
+     * swaps, order for placing. Returns false (with job.error set) when the source cannot be loaded any more.
+     */
+    public static boolean prepare(BuildJob job) {
+        Loaded l = load(job.type, job.data);
+        if (l.schematic() == null) {
+            job.error = l.error();
+            return false;
+        }
+        Schematic t = Transform.apply(l.schematic(), job.turns, job.mirror);
+        job.list = BuildPlan.order(t, Substitution.parse(job.subs));
+        job.sx = t.sizeX();
+        job.sy = t.sizeY();
+        job.sz = t.sizeZ();
+        job.cells.clear();
+        for (BuildPlan.Placement p : job.list) job.cells.add(BlockPos.asLong(job.cx + p.dx(), job.cy + p.dy(), job.cz + p.dz()));
+        job.states.clear();
+        job.error = "";
+        return true;
+    }
+}
+```
+
 ## common\src\main\java\com\example\companionmod\world\CompanionRegistry.java
 
 ```java
@@ -11485,6 +12914,7 @@ public final class ModCommands {
     private ModCommands() {}
 
     public static void register(CommandDispatcher<CommandSourceStack> d) {
+        BuildCommands.register(d);          // /cbuild ... (open to every player; the chat buttons run these)
         d.register(Commands.literal("companion")
                 .requires(Commands.hasPermission(Commands.LEVEL_GAMEMASTERS))   // 26.1-CHECK: permission API was reworked in 1.21.11; older form: src -> src.hasPermission(2)
                 .then(Commands.literal("shrine").executes(ctx -> {
@@ -11596,11 +13026,15 @@ public final class ServerHooks {
 
     public static void onPlayerJoin(ServerPlayer player) { ShrinePlacer.onPlayerJoin(player); }
 
-    public static void onPlayerLeave(ServerPlayer player) { CommandHandler.forget(player.getUUID()); }
+    public static void onPlayerLeave(ServerPlayer player) {
+        CommandHandler.forget(player.getUUID());
+        BuildManager.forget(player.getUUID());
+    }
 
     public static void onServerStopped() {
         CompanionRegistry.reset();
         CommandHandler.forgetAll();
+        BuildManager.forgetAll();
     }
 }
 ```
@@ -12060,6 +13494,270 @@ public class CompanionModNeoForgeClient {
         modBus.addListener(RegisterGuiLayersEvent.class, e ->
                 e.registerAboveAll(CompanionMod.id("voice_hud"), (graphics, deltaTracker) -> ClientVoice.renderHud(graphics, deltaTracker)));
         NeoForge.EVENT_BUS.addListener(ClientTickEvent.Post.class, e -> ClientVoice.tick(Minecraft.getInstance()));
+    }
+}
+```
+
+## tests\RunnerTest.java
+
+```java
+import com.example.companionmod.build.*;
+import com.example.companionmod.build.BuildPlan.Placement;
+import com.example.companionmod.build.BuildRunner.*;
+import java.util.*;
+
+public class RunnerTest {
+    static int fails = 0;
+    static void check(boolean ok, String what) { System.out.println((ok ? "PASS  " : "FAIL  ") + what); if (!ok) fails++; }
+
+    static class FakeEnv implements Env {
+        final Map<String, Blk> world = new HashMap<>();
+        final Map<String, Integer> items = new HashMap<>();
+        boolean creative; int entityBlockedCalls = 0; Set<String> entityCells = new HashSet<>(); boolean slowReach; int reachCalls = 0;
+        Set<String> unreachable = new HashSet<>(); int placedCount;
+        static String k(int x, int y, int z) { return x + "," + y + "," + z; }
+        public Inspect inspect(int x, int y, int z, Blk want) {
+            Blk b = world.get(k(x,y,z));
+            if (b != null) return b.id().equals(want.id()) ? Inspect.ALREADY : Inspect.OCCUPIED;
+            if (entityCells.contains(k(x,y,z)) && entityBlockedCalls-- > 0) return Inspect.ENTITY;
+            return Inspect.FREE;
+        }
+        public boolean creative() { return creative; }
+        public String itemId(Blk b) { return b.id(); }
+        public int have(String id) { return items.getOrDefault(id, 0); }
+        public void take(String id, int n) { items.merge(id, -n, Integer::sum); }
+        String lastTarget = ""; boolean arrived;
+        public Reach reach(int x, int y, int z) {
+            reachCalls++;
+            String t = k(x,y,z);
+            if (unreachable.contains(t)) return Reach.GAVE_UP;
+            if (slowReach && !t.equals(lastTarget)) { lastTarget = t; return Reach.MOVING; }
+            lastTarget = "";
+            return Reach.IN_REACH;
+        }
+        public void place(int x, int y, int z, Blk w) { world.put(k(x,y,z), w); placedCount++; }
+    }
+
+    static Status runToStop(BuildRunner r, int maxTicks) {
+        Status s = Status.WORKING;
+        for (int t = 0; t < maxTicks; t++) { s = r.tick(3, 400); if (s != Status.WORKING) return s; }
+        return s;
+    }
+
+    public static void main(String[] a) {
+        BuildSpec spec = new BuildSpec("house","manor",11,9,16,2,"gable","square",Map.of());
+        Schematic s = Generators.generate(spec, BlockPolicy.ANY);
+        List<Placement> order = BuildPlan.order(s, Map.of());
+        System.out.println("blocks=" + s.count() + " order=" + order.size());
+
+        // order checks
+        int firstAttach = -1; for (int i = 0; i < order.size(); i++) if (Schematic.isAttachment(order.get(i).blk())) { firstAttach = i; break; }
+        boolean allAfter = true; for (int i = firstAttach; i < order.size(); i++) if (!Schematic.isAttachment(order.get(i).blk())) allAfter = false;
+        check(firstAttach > 0 && allAfter, "attachments (doors/lanterns) are placed after all structure");
+        boolean bottomUp = true; for (int i = 1; i < firstAttach; i++) if (order.get(i).dy() < order.get(i-1).dy()) bottomUp = false;
+        check(bottomUp, "structure placed bottom-up");
+        int lowerDoor=-1, upperDoor=-1; for (int i=0;i<order.size();i++){ var b=order.get(i).blk(); if(b.path().endsWith("_door")) { if(b.props().get("half").equals("lower")) lowerDoor=i; else upperDoor=i; } }
+        check(lowerDoor >= 0 && lowerDoor < upperDoor, "lower door half before upper half");
+        // serpentine adjacency within a layer: average step distance small
+        long sum = 0; int n = 0; for (int i = 1; i < firstAttach; i++) { var p=order.get(i-1); var q=order.get(i); if (p.dy()==q.dy()) { sum += Math.abs(p.dx()-q.dx())+Math.abs(p.dz()-q.dz()); n++; } }
+        System.out.printf("avg walk step in a layer: %.2f blocks%n", (double) sum / n);
+        check((double) sum / n < 3.0, "serpentine keeps consecutive blocks close");
+
+        // 1. creative, full build, slow reach
+        FakeEnv e = new FakeEnv(); e.creative = true; e.slowReach = true;
+        BuildRunner r = new BuildRunner(order, 100, 64, 100, e);
+        Status st = runToStop(r, 100000);
+        check(st == Status.DONE && e.placedCount == order.size() && r.placed == order.size(), "creative build places every block (" + e.placedCount + "/" + order.size() + ")");
+
+        // 2. limited materials then refill
+        Map<String,Integer> need = s.itemCounts();
+        FakeEnv e2 = new FakeEnv(); for (var en : need.entrySet()) e2.items.put(en.getKey(), en.getValue());
+        e2.items.put("minecraft:stone_bricks", need.get("minecraft:stone_bricks") / 2);
+        r = new BuildRunner(order, 0, 0, 0, e2);
+        st = runToStop(r, 100000);
+        int short_ = need.get("minecraft:stone_bricks") - need.get("minecraft:stone_bricks") / 2;
+        check(st == Status.WAITING_MATERIALS && r.missing().getOrDefault("minecraft:stone_bricks", 0) == short_,
+              "ran out of stone bricks -> waiting, missing=" + r.missing());
+        check(e2.placedCount == order.size() - short_, "everything else was still built while waiting (" + e2.placedCount + ")");
+        e2.items.put("minecraft:stone_bricks", short_);
+        r.resume(); st = runToStop(r, 100000);
+        check(st == Status.DONE && e2.placedCount == order.size() && e2.world.size() == order.size(), "refill + resume finishes the build");
+        check(e2.items.values().stream().allMatch(v -> v == 0), "exact material accounting (door/slab rules) leaves zero items: " + e2.items);
+
+        // 3. occupied cell + unreachable cell
+        FakeEnv e3 = new FakeEnv(); e3.creative = true;
+        var p0 = order.get(10); e3.world.put(FakeEnv.k(p0.dx(), p0.dy(), p0.dz()), Blk.of("minecraft:dirt"));
+        var p1 = order.get(20); e3.unreachable.add(FakeEnv.k(p1.dx(), p1.dy(), p1.dz()));
+        r = new BuildRunner(order, 0, 0, 0, e3); st = runToStop(r, 100000);
+        check(st == Status.DONE && r.skipped == 2 && r.unreachable == 1 && e3.placedCount == order.size() - 2, "occupied + unreachable cells skipped, rest built (skipped=" + r.skipped + ")");
+
+        // 4. creature standing in a cell for a few checks
+        FakeEnv e4 = new FakeEnv(); e4.creative = true; e4.entityBlockedCalls = 3; var p2 = order.get(30); e4.entityCells.add(FakeEnv.k(p2.dx(), p2.dy(), p2.dz()));
+        r = new BuildRunner(order, 0, 0, 0, e4); int w4 = 0;
+        for (int i = 0; i < 100000; i++) { st = r.tick(3, 400); if (st == Status.WAITING_ENTITY) { w4++; r.resume(); } else if (st == Status.DONE) break; }
+        check(st == Status.DONE && e4.placedCount == order.size() && w4 >= 1, "a cell blocked by a creature waits, is retried, then placed (waits=" + w4 + ")");
+
+        // 5. creature never leaves -> waits, then gives up without hanging
+        FakeEnv e5 = new FakeEnv(); e5.creative = true; e5.entityBlockedCalls = Integer.MAX_VALUE; e5.entityCells.add(FakeEnv.k(p2.dx(), p2.dy(), p2.dz()));
+        r = new BuildRunner(order, 0, 0, 0, e5); int waits = 0;
+        for (int i = 0; i < 100000; i++) { st = r.tick(3, 400); if (st == Status.WAITING_ENTITY) { waits++; r.resume(); } else if (st == Status.DONE) break; }
+        check(st == Status.DONE && waits == BuildRunner.MAX_ENTITY_RETRIES && e5.placedCount == order.size() - 1, "permanent blocker: " + waits + " retries then moves on");
+
+        // 6. scan budget: an already-built structure is swept without placing, in many ticks, never one huge tick
+        FakeEnv e6 = new FakeEnv(); e6.creative = true; for (var p : order) e6.world.put(FakeEnv.k(p.dx(), p.dy(), p.dz()), p.blk());
+        r = new BuildRunner(order, 0, 0, 0, e6); int ticks = 0; do { st = r.tick(3, 400); ticks++; } while (st == Status.WORKING && ticks < 1000);
+        check(st == Status.DONE && ticks >= order.size() / 400 && e6.placedCount == 0, "already-built sweep spread over " + ticks + " ticks, places nothing");
+
+        // 7. substitution
+        Map<String,Integer> nd = new HashMap<>(Map.of("minecraft:stone_bricks", 300, "minecraft:spruce_stairs", 80, "minecraft:oak_door", 1, "minecraft:lantern", 2));
+        Map<String,Integer> hv = new HashMap<>(Map.of("minecraft:stone_bricks", 20, "minecraft:cobblestone", 500, "minecraft:oak_stairs", 100, "minecraft:spruce_stairs", 10, "minecraft:dirt", 999));
+        var res = Substitution.plan(nd, hv);
+        System.out.println("remap=" + res.remap() + " missing=" + res.missing());
+        check("minecraft:cobblestone".equals(res.remap().get("minecraft:stone_bricks")), "stone bricks -> cobblestone (not dirt)");
+        check("minecraft:oak_stairs".equals(res.remap().get("minecraft:spruce_stairs")), "spruce stairs -> oak stairs");
+        check(res.missing().containsKey("minecraft:oak_door") && res.missing().containsKey("minecraft:lantern") && res.missing().size() == 2, "no door/lantern on hand -> reported missing, never swapped for random items");
+        check(Substitution.parse(Substitution.serialize(res.remap())).equals(res.remap()), "remap survives save/load string");
+        var res2 = Substitution.plan(Map.of("minecraft:stone_bricks", 300), Map.of("minecraft:stone_bricks", 20, "minecraft:cobblestone", 100));
+        check(res2.remap().isEmpty() && res2.missing().get("minecraft:stone_bricks") == 280, "alternative too small -> no swap, honest shortage");
+
+        // 8. remap applied by ordering
+        List<Placement> sub = BuildPlan.order(s, res.remap());
+        check(sub.stream().noneMatch(p -> p.blk().id().equals("minecraft:stone_bricks")) && sub.stream().anyMatch(p -> p.blk().id().equals("minecraft:cobblestone")), "remap replaces ids in the plan");
+        check(sub.stream().filter(p -> p.blk().path().endsWith("stairs")).allMatch(p -> p.blk().props().containsKey("facing")), "stairs keep their facing after remap");
+
+        // 9. transform.apply: mirror then rotate, door survives
+        Schematic t = Transform.apply(s, 3, true);
+        check(t.count() == s.count(), "apply() keeps every block");
+        System.out.println(fails == 0 ? "\nALL PASSED" : "\nFAILURES: " + fails);
+    }
+}
+```
+
+## tests\SelfTest.java
+
+```java
+import com.example.companionmod.build.*;
+import java.util.*;
+
+public class SelfTest {
+    static char sym(Blk b) {
+        if (b == null || b.isAir()) return '.';
+        String p = b.path();
+        if (p.endsWith("_stairs")) switch (b.props().get("facing")) { case "north": return '^'; case "south": return 'v'; case "east": return '>'; default: return '<'; }
+        if (p.endsWith("_door")) return b.props().get("half").equals("lower") ? 'D' : 'd';
+        if (p.endsWith("_pane") || p.equals("iron_bars")) return '|';
+        if (p.endsWith("lantern") || p.endsWith("torch")) return 'L';
+        if (p.equals("ladder")) return 'H';
+        if (p.endsWith("_log")) return 'T';
+        if (p.endsWith("_slab")) return '_';
+        if (p.endsWith("_planks") && !p.equals("spruce_planks")) return '=';
+        if (p.equals("cobblestone")) return 'c';
+        return '#';
+    }
+    static void layer(Schematic s, int y) {
+        System.out.println("-- y=" + y);
+        for (int z = 0; z < s.sizeZ(); z++) { StringBuilder sb = new StringBuilder();
+            for (int x = 0; x < s.sizeX(); x++) sb.append(sym(s.blocks().get(new Schematic.Pos(x, y, z)))); System.out.println(sb); }
+    }
+    static void sliceX(Schematic s, int x) {
+        System.out.println("-- section x=" + x + " (rows top->bottom, cols z)");
+        for (int y = s.sizeY() - 1; y >= 0; y--) { StringBuilder sb = new StringBuilder();
+            for (int z = 0; z < s.sizeZ(); z++) sb.append(sym(s.blocks().get(new Schematic.Pos(x, y, z)))); System.out.println(String.format("%2d ", y) + sb); }
+    }
+    static int disconnected(Schematic s) {
+        Set<Schematic.Pos> seen = new HashSet<>(); Deque<Schematic.Pos> q = new ArrayDeque<>();
+        for (var p : s.blocks().keySet()) if (p.y() == 0) { seen.add(p); q.add(p); }
+        int[][] d = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+        while (!q.isEmpty()) { var p = q.poll(); for (int[] v : d) { var n = new Schematic.Pos(p.x()+v[0], p.y()+v[1], p.z()+v[2]);
+            if (s.blocks().containsKey(n) && seen.add(n)) q.add(n); } }
+        return s.count() - seen.size();
+    }
+    static boolean air(Schematic s, int x, int y, int z) { return !s.blocks().containsKey(new Schematic.Pos(x,y,z)) || Schematic.isAttachment(s.get(x,y,z)) && !s.get(x,y,z).path().endsWith("_door") && false; }
+    static boolean free(Schematic s, int x, int y, int z) { Blk b = s.get(x,y,z); return b.isAir() || b.path().endsWith("lantern") || b.path().endsWith("torch"); }
+    static boolean solid(Schematic s, int x, int y, int z) { Blk b = s.get(x,y,z); return !b.isAir() && !free(s,x,y,z) && !b.path().equals("ladder"); }
+    /** BFS from just inside the door; returns highest standing y reached. */
+    static int reachMaxY(Schematic s, int sx, int sy, int sz) {
+        Set<List<Integer>> seen = new HashSet<>(); Deque<int[]> q = new ArrayDeque<>(); q.add(new int[]{sx,sy,sz}); seen.add(List.of(sx,sy,sz)); int max = sy;
+        int[][] d = {{1,0},{-1,0},{0,1},{0,-1}};
+        while (!q.isEmpty()) { int[] p = q.poll(); max = Math.max(max, p[1]);
+            for (int[] v : d) { int nx = p[0]+v[0], nz = p[2]+v[1];
+                for (int dy = 1; dy >= -3; dy--) { int ny = p[1]+dy;
+                    if (dy == 1 && !(free(s,p[0],p[1]+2,p[2]))) continue;
+                    if (free(s,nx,ny,nz) && free(s,nx,ny+1,nz) && solid(s,nx,ny-1,nz) && nx>=0&&nz>=0&&nx<s.sizeX()&&nz<s.sizeZ()) {
+                        if (seen.add(List.of(nx,ny,nz))) q.add(new int[]{nx,ny,nz}); break; } } } }
+        return max;
+    }
+    public static void main(String[] a) {
+        Map<String,String> mats = Map.of("wall","stone_bricks","roof","spruce_planks","trim","dark_oak_log","floor","oak_planks");
+        BuildSpec h1 = new BuildSpec("house","cottage",9,7,16,1,"gable","square",mats);
+        BuildSpec h2 = new BuildSpec("house","manor",11,9,16,3,"gable","square",mats);
+        BuildSpec h3 = new BuildSpec("house","flat",7,7,16,2,"flat","square",Map.of());
+        BuildSpec h4 = new BuildSpec("house","even",8,8,16,2,"gable","square",Map.of());
+        BuildSpec t1 = new BuildSpec("tower","keep",7,7,22,1,"gable","square",Map.of("wall","cobblestone"));
+        BuildSpec t2 = new BuildSpec("tower","round",9,9,26,1,"gable","round",Map.of("wall","stone_bricks","window","iron_bars"));
+        BuildSpec junk = new BuildSpec("castle","$$ !!",1000,-5,999,99,"pyramid","hex",Map.of("wall","unobtainium","roof","glass","window","<script>"));
+        for (BuildSpec sp : List.of(h1,h2,h3,h4,t1,t2,junk)) {
+            Schematic s = Generators.generate(sp, id -> !id.contains("unobtainium") && !id.equals("minecraft:glass_stairs") && !id.equals("minecraft:glass_slab"));
+            BuildSpec c = sp.clamped();
+            int doorX = c.type().equals("house") ? c.width()/2 : c.width()/2;
+            // door x in normalised coords is offset by overhang for gable houses
+            int off = c.type().equals("house") && c.roof().equals("gable") ? 1 : 0;
+            int zOff = off;
+            System.out.printf("%s %s: size %dx%dx%d blocks=%d disconnected=%d items=%s%n", c.type(), c.name(), s.sizeX(), s.sizeY(), s.sizeZ(), s.count(), disconnected(s), s.itemCounts());
+            if (c.type().equals("house")) {
+                int top = c.floors()*4;
+                int reach = reachMaxY(s, doorX+off, 1, 1+zOff);
+                System.out.println("   walkable up to y=" + reach + " (storey base y of top floor = " + (4*(c.floors()-1)+1) + ")  -> " + (reach >= 4*(c.floors()-1)+1 ? "OK" : "FAIL"));
+            }
+        }
+        // visual dumps
+        Schematic s = Generators.generate(h2, BlockPolicy.ANY);
+        for (int y : new int[]{0,1,2,3,4,5,8,12,13,14}) if (y < s.sizeY()) layer(s, y);
+        sliceX(s, 5);
+        sliceX(s, 1);
+        Schematic t = Generators.generate(t2, BlockPolicy.ANY);
+        for (int y : new int[]{0,1,3,6,26,27}) layer(t, y);
+        sliceX(t, 4);
+    }
+}
+```
+
+## tests\SelfTest2.java
+
+```java
+import com.example.companionmod.build.*;
+import com.google.gson.*;
+import java.util.*;
+
+public class SelfTest2 {
+    public static void main(String[] a) {
+        // 1. schema is valid JSON
+        JsonObject schema = JsonParser.parseString(BuildSpecSchema.SCHEMA).getAsJsonObject();
+        System.out.println("schema ok, props=" + schema.getAsJsonObject("properties").keySet());
+
+        // 2. parser: clean, fenced, junk, garbage
+        String clean = "{\"type\":\"house\",\"name\":\"cabin\",\"width\":7,\"depth\":7,\"height\":10,\"floors\":1,\"roof\":\"gable\",\"shape\":\"square\",\"materials\":{\"wall\":\"spruce_planks\",\"roof\":\"dark_oak_planks\"}}";
+        System.out.println("clean  -> " + SpecParser.parse(clean).orElse(null));
+        System.out.println("fenced -> " + SpecParser.parse("Sure!\n```json\n" + clean + "\n```").map(BuildSpec::name).orElse("EMPTY"));
+        System.out.println("junk   -> " + SpecParser.parse("{\"type\":\"castle\",\"name\":\"big keep\",\"width\":\"12\",\"floors\":null,\"materials\":[1,2]}").orElse(null));
+        System.out.println("garbage-> " + SpecParser.parse("I cannot do that").isPresent() + " / " + SpecParser.parse("{broken").isPresent());
+        for (String t : List.of("a small wooden cabin", "a tall round stone watchtower", "a big two story brick mansion with a dark oak roof", "modern flat roof house"))
+            System.out.println("heur '" + t + "' -> " + SpecParser.heuristic(t));
+        System.out.println("fallback -> " + SpecParser.parseOrHeuristic("nonsense", "tiny sandstone tower").type());
+
+        // 3. rotation: 4 turns == identity; facing rotates; walking path survives
+        BuildSpec sp = new BuildSpec("house","m",11,9,16,2,"gable","square",Map.of());
+        Schematic s = Generators.generate(sp, BlockPolicy.ANY);
+        Schematic r4 = Transform.rotate(s, 4), r1 = Transform.rotate(s, 1), r2 = Transform.rotate(Transform.rotate(s,1),1);
+        System.out.println("rot x4 identical: " + s.blocks().equals(r4.blocks()) + "  rot(1)+rot(1)==rot(2): " + r2.blocks().equals(Transform.rotate(s,2).blocks()));
+        System.out.printf("size %dx%dx%d -> rot1 %dx%dx%d%n", s.sizeX(), s.sizeY(), s.sizeZ(), r1.sizeX(), r1.sizeY(), r1.sizeZ());
+        for (var e : r1.blocks().entrySet()) if (e.getValue().path().endsWith("_door") && e.getValue().props().get("half").equals("lower"))
+            System.out.println("door after 1 CW turn at " + e.getKey() + " " + e.getValue());
+        Schematic m = Transform.mirrorX(s);
+        System.out.println("mirror x2 identical: " + s.blocks().equals(Transform.mirrorX(m).blocks()));
+        // pane connections after rotation
+        for (var e : r1.blocks().entrySet()) if (e.getValue().path().equals("glass_pane")) { System.out.println("pane after rot: " + e.getValue() + " at " + e.getKey()); break; }
+        System.out.println("BOM keys: " + s.itemCounts().keySet());
     }
 }
 ```

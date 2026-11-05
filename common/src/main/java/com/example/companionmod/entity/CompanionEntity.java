@@ -15,6 +15,7 @@ import com.example.companionmod.entity.ai.CompanionTargetGoal;
 import com.example.companionmod.entity.ai.CompanionWanderGoal;
 import com.example.companionmod.entity.plan.CompanionPlanner;
 import com.example.companionmod.entity.task.MineTask;
+import com.example.companionmod.entity.task.BuildJob;
 import com.example.companionmod.inventory.CompanionInventoryMenu;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -214,6 +215,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         goalSelector.addGoal(2, new CompanionMeleeGoal(this, 1.25, true));   // + creeper hit-and-run (attack - retreat - attack)
         seekGoal = new com.example.companionmod.entity.ai.CompanionSeekBlockGoal(this);
         goalSelector.addGoal(2, seekGoal);                           // explicit "find diamonds" pre-empts walking
+        goalSelector.addGoal(3, new com.example.companionmod.entity.ai.CompanionBlueprintGoal(this));   // beats farm/wander/patrol (4)
         goalSelector.addGoal(3, new CompanionPickupGoal(this));      // explicit "pick this up" pre-empts walking
         goalSelector.addGoal(4, new CompanionFarmGoal(this));
         goalSelector.addGoal(4, new CompanionPlantGoal(this));        // time-boxed jobs (farm / fish / build)
@@ -257,6 +259,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         out.putBoolean("Pickup", isPickupEnabled());
         out.putString("PickupFilter", pickupFilter);
         mineTask.save(out);
+        blueprint.save(out);
         out.store("Storage", ItemStack.OPTIONAL_CODEC.listOf(), storage.getItems());
         out.putBoolean("Injured", isInjured());
         out.putInt("InjuredLeft", injuredLeftTicks);
@@ -278,6 +281,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         setPickupEnabled(in.getBooleanOr("Pickup", false));
         pickupFilter = in.getStringOr("PickupFilter", "");
         mineTask.load(in);
+        blueprint.load(in);
         in.read("Storage", ItemStack.OPTIONAL_CODEC.listOf()).ifPresent(list -> {
             for (int i = 0; i < Math.min(list.size(), storage.getContainerSize()); i++) {
                 storage.setItem(i, list.get(i));
@@ -335,6 +339,21 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
     public String buildSchematic() { return buildSchematic; }
     /** Clears the current build job (called by the build goal when it finishes). */
     public void clearBuild() { buildSchematic = ""; }
+
+    // ------------------------------------------------------------------ blueprint build job
+
+    private final BuildJob blueprint = new BuildJob();      // "build this design" job, saved with the entity
+
+    public BuildJob blueprint() { return blueprint; }
+
+    public void startBlueprint(String label, String type, String data, BlockPos corner, int turns, boolean mirror, String subs) {
+        clearSeekBlock();
+        blueprint.start(label, type, data, corner.getX(), corner.getY(), corner.getZ(), turns, mirror, subs);
+        setAnchor(corner);
+        speak("Building " + label + ".");
+    }
+
+    public void cancelBlueprint() { blueprint.cancel(); getNavigation().stop(); }
 
     public String seekBlock() { return mineTask.exists() ? mineTask.blockId : ""; }
     /** Starts (or restarts) a mining job; a blank id cancels it. Re-issuing the SAME id never resets progress. */
@@ -510,6 +529,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
                 // Resume whatever was interrupted: a paused AI plan first, then a stuck/paused mining job,
                 // then (last resort) the last plan JSON the model gave us.
                 if (planner.resume(tickCount)) speak("Continuing the plan.");
+                else if (blueprint.exists() && blueprint.paused) { blueprint.resume(); speak("Back to building."); }
                 else if (mineTask().running() || mineTask().resume()) speak("Back to work.");
                 else if (!lastPlanJson.isBlank() && planner.accept(lastPlanJson, this, tickCount)) speak("Restarting the plan.");
                 else speak("There is nothing to continue.");
@@ -538,9 +558,13 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
                 fishUntil = level().getGameTime() + 600; setAnchor(blockPosition()); speak("Going fishing.");
             }
             case BUILD -> {
-                String name = target == null ? "" : target.trim().toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9_\\-]", "_");
-                if (name.isEmpty()) speak("Build what? Give me a schematic name.");
-                else { clearSeekBlock(); buildSchematic = name; setAnchor(blockPosition()); speak("Building " + name + "."); }
+                String raw = target == null ? "" : target.trim();
+                String name = raw.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9_\\-]", "_");
+                if (raw.isEmpty()) speak("Build what? Describe it, or open Work > Build.");
+                else if (from != null && com.example.companionmod.world.BuildManager.startFromText(from, raw)) {
+                    clearSeekBlock();
+                    speak("Let me plan that.");
+                } else { clearSeekBlock(); buildSchematic = name; setAnchor(blockPosition()); speak("Building " + name + "."); }
             }
             case REMEMBER, FORGET -> { /* handled client-side by CompanionMemory */ }
             default -> { }
@@ -567,6 +591,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         plantUntil = 0;
         fishUntil = 0;
         clearBuild();
+        blueprint.pause();      // STOP pauses the build (blocks stay); "continue" resumes; /cbuild cancel discards
         forcedTarget = null;
         forcedTargetUntil = 0;
         setStance(Stance.PASSIVE);
@@ -1394,6 +1419,9 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
             if (!claimRegistry()) return;       // stale duplicate: it dropped its bag and removed itself
         }
         if (tickCount % 10 == 0) refreshTaskText();
+        if (tickCount % 5 == 0 && getOwner() instanceof ServerPlayer sp) {
+            com.example.companionmod.world.BuildManager.tick(sp);   // aim-following preview outline while a design is pending
+        }
         // Combat chaining bookkeeping: when our target dies, open a window in which chooseTarget keeps
         // picking the next nearby hostile (wider radius, no "must be attacking us" filter) instead of
         // wandering back to the owner between kills.
@@ -1545,6 +1573,7 @@ public class CompanionEntity extends PathfinderMob implements com.example.compan
         } else if (plantUntil > now) s = "Planting";
         else if (farmUntil > now) s = "Farming";
         else if (fishUntil > now) s = "Fishing";
+        else if (blueprint.exists()) s = blueprint.describe();
         else if (!buildSchematic.isBlank()) s = "Building";
         if (!s.equals(entityData.get(DATA_TASK))) entityData.set(DATA_TASK, s);
     }

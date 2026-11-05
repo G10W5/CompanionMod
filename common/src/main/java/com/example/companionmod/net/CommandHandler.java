@@ -33,6 +33,10 @@ public final class CommandHandler {
     private CommandHandler() {}
 
     public static void handle(ServerPlayer player, CommandPayload payload) {
+        if (BuildOp.ACTION.equals(payload.action())) {          // build design/import: BuildManager has its own rate limit
+            com.example.companionmod.world.BuildManager.handlePacket(player, payload.target());
+            return;
+        }
         CompanionCommand cmd = CompanionCommand.parse(payload.action());
         // STOP is an emergency control, not optional background work. Never lose it to the token bucket.
         if (cmd != CompanionCommand.STOP) {

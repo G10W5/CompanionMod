@@ -23,6 +23,7 @@ public final class ModCommands {
     private ModCommands() {}
 
     public static void register(CommandDispatcher<CommandSourceStack> d) {
+        BuildCommands.register(d);          // /cbuild ... (open to every player; the chat buttons run these)
         d.register(Commands.literal("companion")
                 .requires(Commands.hasPermission(Commands.LEVEL_GAMEMASTERS))   // 26.1-CHECK: permission API was reworked in 1.21.11; older form: src -> src.hasPermission(2)
                 .then(Commands.literal("shrine").executes(ctx -> {

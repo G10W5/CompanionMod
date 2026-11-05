@@ -9,10 +9,14 @@ public final class ServerHooks {
 
     public static void onPlayerJoin(ServerPlayer player) { ShrinePlacer.onPlayerJoin(player); }
 
-    public static void onPlayerLeave(ServerPlayer player) { CommandHandler.forget(player.getUUID()); }
+    public static void onPlayerLeave(ServerPlayer player) {
+        CommandHandler.forget(player.getUUID());
+        BuildManager.forget(player.getUUID());
+    }
 
     public static void onServerStopped() {
         CompanionRegistry.reset();
         CommandHandler.forgetAll();
+        BuildManager.forgetAll();
     }
 }

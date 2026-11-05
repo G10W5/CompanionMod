@@ -1,6 +1,7 @@
-# Gradle
+# Gradle (build/ ignores all gradle output dirs; the source package build/ under src/main/java is re-included)
 .gradle/
 build/
+!**/src/main/java/**/build/
 !gradle/wrapper/gradle-wrapper.jar
 
 # IDE

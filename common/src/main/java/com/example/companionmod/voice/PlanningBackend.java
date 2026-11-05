@@ -52,7 +52,7 @@ public final class PlanningBackend {
           .append("seek_block (arg = a VANILLA BLOCK ID such as oak_log, log, stone, cobblestone, coal_ore, iron_ore, diamond_ore - use it whenever the task is 'get wood/stone/coal/diamonds'; never a colloquial word); ")
           .append("pickup (arg = optional item name; ONLY for items already dropped on the ground); ")
           .append("farm (harvests ripe crops nearby); fish (fishes at nearby water); plant (arg = sapling name such as birch_sapling; plants saplings from the bag on nearby soil; use pickup first only if saplings lie on the ground); ")
-          .append("build (arg = schematic name, places it from the schematics folder); say (arg = one short in-character sentence); wait (seconds).\n")
+          .append("build (arg = a short description such as \"stone tower\", or a schematic file name); say (arg = one short in-character sentence); wait (seconds).\n")
           .append("Ground choices in observations: use pickup only for listed drops, attack/hunt only for listed hostiles, seek_block only for a requested resource (an exact observed block ID is best), and avoid repeating an already active task. The executor will navigate, switch tools, swing, collect drops, fight and speak; do not output code or pretend unsupported actions exist.\n")
           .append("Reply with ONE JSON object and nothing else: {\"goal\":\"get wood\",\"steps\":[{\"op\":\"seek_block\",\"arg\":\"log\",\"seconds\":90},{\"op\":\"come\",\"arg\":\"\",\"seconds\":10}]}\n");
         if (auto) {
