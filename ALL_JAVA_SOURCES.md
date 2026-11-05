@@ -4403,6 +4403,7 @@ import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -4556,7 +4557,7 @@ public class CompanionBlueprintGoal extends Goal {
             if (ws == null) return BuildRunner.Inspect.OCCUPIED;                 // unknown block: skip it
             BlockState there = level.getBlockState(pos);
             if (there.getBlock() == ws.getBlock()) return BuildRunner.Inspect.ALREADY;
-            if (!overwritable(there)) return BuildRunner.Inspect.OCCUPIED;
+            if (!overwritable(level, pos, there)) return BuildRunner.Inspect.OCCUPIED;
             if (!CompanionProtection.canModify(level, mob, pos)) return BuildRunner.Inspect.PROTECTED;
             List<LivingEntity> inside = level.getEntitiesOfClass(LivingEntity.class, new AABB(pos));
             if (!inside.isEmpty()) {
@@ -4585,14 +4586,18 @@ public class CompanionBlueprintGoal extends Goal {
                 standTarget = null;
             }
             if (mob.distanceToSqr(x + 0.5, y + 0.5, z + 0.5) <= REACH * REACH) return BuildRunner.Reach.IN_REACH;
-            if (++moveTicks > 200) return BuildRunner.Reach.GAVE_UP;
+            // Give the walk/hop a REAL window (15 s) before declaring the cell unreachable: the old 200-tick
+            // limit hit while he was still climbing, and the cell was then skipped permanently (tower tops never
+            // finished - user report). Unreachable cells are now also retried once by BuildRunner.
+            if (++moveTicks > 300) return BuildRunner.Reach.GAVE_UP;
             if (standTarget == null) standTarget = findStand(pos);
             if (standTarget == null) {
                 mob.getNavigation().moveTo(x + 0.5, y, z + 0.5, 1.15);          // nothing safe nearby: just walk toward it
                 return BuildRunner.Reach.MOVING;
             }
-            boolean far = Math.abs(standTarget.getY() - mob.getY()) > 2.0 || mob.distanceToSqr(Vec3.atCenterOf(standTarget)) > 32 * 32;
-            if (far || moveTicks > 60) {
+            // Hop soon when walking clearly cannot do it: the support spot is above us, or the path is far.
+            boolean far = Math.abs(standTarget.getY() - mob.getY()) > 2.0 || mob.distanceToSqr(Vec3.atCenterOf(standTarget)) > 16 * 16;
+            if (far || moveTicks > 80) {
                 hopTo(standTarget);                                              // too high / too far / stuck: hop there
             } else {
                 mob.getNavigation().moveTo(standTarget.getX() + 0.5, standTarget.getY(), standTarget.getZ() + 0.5, 1.2);
@@ -4609,10 +4614,21 @@ public class CompanionBlueprintGoal extends Goal {
         }
     }
 
-    /** Natural, soft or replaceable terrain may be overwritten; anything the player built may not. */
-    private static boolean overwritable(BlockState s) {
-        return s.isAir() || s.canBeReplaced() || s.is(BlockTags.DIRT) || s.is(BlockTags.SAND)
-                || s.is(BlockTags.BASE_STONE_OVERWORLD) || s.is(BlockTags.LEAVES);
+    /**
+     * Natural, soft or replaceable terrain may be overwritten; anything solid the player built may not.
+     * The collision-empty catch-all covers everything the tags miss: grass tufts, ferns, flowers, vines, snow
+     * layers - blocks with no collision box have no business blocking a build cell ("he's not replacing grass").
+     * Fluids and block entities (chests, signs, furnaces) are never touched; logs count as natural (trees in
+     * the footprint are common) - the plan can only place ONE block per cell anyway, so a player chest that
+     * happens to sit in the footprint survives as a hole rather than being destroyed.
+     */
+    private static boolean overwritable(ServerLevel level, BlockPos pos, BlockState s) {
+        if (s.isAir() || s.canBeReplaced()) return true;
+        if (s.is(BlockTags.DIRT) || s.is(BlockTags.SAND) || s.is(BlockTags.BASE_STONE_OVERWORLD)
+                || s.is(BlockTags.LEAVES) || s.is(BlockTags.LOGS)) return true;
+        if (!s.getFluidState().isEmpty()) return false;
+        if (s.hasBlockEntity()) return false;
+        return s.getCollisionShape(level, pos).isEmpty();                 // grass tufts, ferns, flowers, snow...
     }
 
     private void hopTo(BlockPos p) {
@@ -4627,10 +4643,21 @@ public class CompanionBlueprintGoal extends Goal {
     }
 
     /**
-     * A place to stand within ~3 blocks of the target: feet and head free, solid ground below, and NOT one of the
-     * cells that will become part of the building (so the builder never walls itself in).
+     * A place to stand within ~3 blocks of the target: feet and head free, solid ground below.
+     *
+     * <p>STRICT first (never on the building's own cells, so he never walls himself in). That returns NOTHING
+     * for a tower above standing height: the only supported spots up there are the top of the ring below, which
+     * IS a future cell - which is exactly why he "couldn't reach up" and never hopped (the hop only fired when
+     * a stand spot existed). RELAXED drops the cell filters (cell positions are still ranked lower): standing on
+     * the just-placed ring is the correct builder behaviour, and if a future block lands on him, McEnv.inspect
+     * relocates him out before placing.</p>
      */
     private BlockPos findStand(BlockPos target) {
+        BlockPos strict = findStand(target, true);
+        return strict != null ? strict : findStand(target, false);
+    }
+
+    private BlockPos findStand(BlockPos target, boolean strict) {
         Set<Long> cells = mob.blueprint().cells;
         BlockPos best = null;
         double bestScore = Double.MAX_VALUE;
@@ -4638,11 +4665,12 @@ public class CompanionBlueprintGoal extends Goal {
             for (int dx = -3; dx <= 3; dx++) {
                 for (int dz = -3; dz <= 3; dz++) {
                     BlockPos c = target.offset(dx, dy, dz);
-                    if (cells.contains(c.asLong()) || cells.contains(c.above().asLong())) continue;
+                    if (strict && (cells.contains(c.asLong()) || cells.contains(c.above().asLong()))) continue;
                     if (!passable(c) || !passable(c.above())) continue;
                     BlockPos below = c.below();
                     if (passable(below) || !level.getFluidState(below).isEmpty()) continue;
-                    double score = c.distSqr(target) + 0.05 * c.distSqr(mob.blockPosition());
+                    double score = c.distSqr(target) + 0.05 * c.distSqr(mob.blockPosition())
+                            + (cells.contains(c.asLong()) ? 4.0 : 0.0);      // prefer off-plan spots when relaxed
                     if (score < bestScore) {
                         bestScore = score;
                         best = c.immutable();
